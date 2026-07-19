@@ -4,6 +4,25 @@
   "description": "The external third-party verifier for agent-first APIs. Discovery from published machine surfaces, contract-derived deterministic checks, attested public grade reports.",
   "license": "MIT",
   "type": "module",
+  "keywords": [
+    "api",
+    "qa",
+    "verification",
+    "agent",
+    "mcp",
+    "openapi",
+    "llms.txt",
+    "attestation"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
     "api.qa": "dist/cli/index.js"
   },
