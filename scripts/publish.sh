@@ -34,10 +34,14 @@ if npm view "$NAME" version >/dev/null 2>&1; then
 else
   echo "note: $NAME is unclaimed on the registry (first publish)."
   # Similarity risk: npm rejects new names that differ from an existing
-  # package only by punctuation. api.qa -> apiqa.
-  if npm view "apiqa" version >/dev/null 2>&1; then
-    echo "WARNING: 'apiqa' exists — npm may reject '$NAME' as too similar." >&2
-  fi
+  # package only by punctuation (that block is what renamed api.qa -> autonomous-qa).
+  bare=$(echo "$NAME" | tr -d '.-_')
+  for variant in "$bare" "${NAME//-/.}" "${NAME//-/_}"; do
+    [ "$variant" = "$NAME" ] && continue
+    if npm view "$variant" version >/dev/null 2>&1; then
+      echo "WARNING: '$variant' exists — npm may reject '$NAME' as too similar." >&2
+    fi
+  done
 fi
 
 # 3. Build + test.

@@ -45,7 +45,7 @@ export function reportMarkdown(r: VerificationReport): string {
     'same grade, or the report is forged / the verifier version changed:',
     '',
     '```sh',
-    `curl -H 'accept: application/json' https://api.qa/${host} | npx api.qa rejudge`,
+    `curl -H 'accept: application/json' https://api.qa/${host} | npx autonomous-qa rejudge`,
     '```',
     '',
   )

@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * npx api.qa — the verifier core, local mount.
+ * npx autonomous-qa — the verifier core, local mount.
  *
- *   npx api.qa <domain|url>                       grade a target (advisory, unsigned)
- *   npx api.qa verify <target> --spec <file>      pinned-spec mode (the hill-climb gate)
+ *   npx autonomous-qa <domain|url>                       grade a target (advisory, unsigned)
+ *   npx autonomous-qa verify <target> --spec <file>      pinned-spec mode (the hill-climb gate)
  *       [--expect-digest <sha256>] [--seed <n>] [--json]
- *   npx api.qa spec-digest <file>                 print the sha256 pin for a spec
- *   npx api.qa rejudge                            re-judge a JSON report from stdin
- *   npx api.qa mcp                                MCP server (stdio)
+ *   npx autonomous-qa spec-digest <file>                 print the sha256 pin for a spec
+ *   npx autonomous-qa rejudge                            re-judge a JSON report from stdin
+ *   npx autonomous-qa mcp                                MCP server (stdio)
  *
  * Local runs are ADVISORY: deterministic and replayable, but never attested —
  * only the held-out deployed verifier signs. A hill-climb loop uses this
@@ -95,19 +95,19 @@ function isLocalTarget(target: string): boolean {
 }
 
 function die(message: string): number {
-  console.error(`api.qa: ${message}\n\n${usage()}`)
+  console.error(`autonomous-qa: ${message}\n\n${usage()}`)
   return 1
 }
 
 function usage(): string {
-  return `api.qa — the external verifier for agent-first APIs
+  return `autonomous-qa — the external verifier for agent-first APIs (hosted service: api.qa)
 
-  npx api.qa <domain|url>                      grade a target (advisory, unsigned)
-  npx api.qa verify <target> --spec <file>     pinned-spec mode
+  npx autonomous-qa <domain|url>                      grade a target (advisory, unsigned)
+  npx autonomous-qa verify <target> --spec <file>     pinned-spec mode
       [--expect-digest <sha256>] [--seed <n>]
-  npx api.qa spec-digest <file>                print the sha256 pin for a spec
-  npx api.qa rejudge                           re-judge a JSON report from stdin
-  npx api.qa mcp                               MCP server (stdio)
+  npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec
+  npx autonomous-qa rejudge                           re-judge a JSON report from stdin
+  npx autonomous-qa mcp                               MCP server (stdio)
   flags: --json (raw report)
 
   Attested runs live at https://api.qa/{domain} — local runs never sign.`
@@ -116,7 +116,7 @@ function usage(): string {
 main().then(
   (code) => process.exit(code),
   (err) => {
-    console.error(`api.qa: ${err instanceof Error ? err.message : err}`)
+    console.error(`autonomous-qa: ${err instanceof Error ? err.message : err}`)
     process.exit(1)
   },
 )

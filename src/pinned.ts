@@ -11,7 +11,7 @@
  *
  * How the weekend build points its hill-climb here (local mode):
  *
- *   npx api.qa verify http://localhost:8787 \
+ *   npx autonomous-qa verify http://localhost:8787 \
  *     --spec specs/golden-scenario.spec.json \
  *     --expect-digest <sha256 printed when the spec was ratified>
  *

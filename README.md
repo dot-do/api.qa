@@ -1,6 +1,8 @@
-# api.qa
+# autonomous-qa — the external verifier for agent-first APIs
 
-**The external third-party verifier for agent-first APIs.** Agent fleets
+**The external third-party verifier for agent-first APIs** — the npm name
+for the concept and reference client; the hosted service lives at
+**[api.qa](https://api.qa)**. Agent fleets
 hill-climb against tests; a fleet that can edit its tests Goodharts them.
 api.qa is the fitness function held outside the fleet's write access:
 verification derived from *published contracts*, deterministic, attested,
@@ -9,8 +11,8 @@ replayable — and self-referential (api.qa grades itself with its own checks,
 
 ```sh
 curl https://api.qa/example.com        # public grade page, as markdown
-npx api.qa example.com                 # same verifier core, locally (advisory)
-npx api.qa mcp                         # MCP server: verify_domain, discover_domain, verify_pinned_spec
+npx autonomous-qa example.com                 # same verifier core, locally (advisory)
+npx autonomous-qa mcp                         # MCP server: verify_domain, discover_domain, verify_pinned_spec
 ```
 
 A report is: letter grade (A+–F) + the 10-point **AX score** (llms.txt ·
@@ -23,8 +25,8 @@ a verdict offline.
 ## The hill-climb harness (pinned-spec mode)
 
 ```sh
-npx api.qa spec-digest examples/golden-scenario.spec.json   # mint the pin once
-npx api.qa verify http://localhost:8787 \
+npx autonomous-qa spec-digest examples/golden-scenario.spec.json   # mint the pin once
+npx autonomous-qa verify http://localhost:8787 \
   --spec examples/golden-scenario.spec.json \
   --expect-digest <pin>                                     # loop until exit 0
 ```

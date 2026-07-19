@@ -1,7 +1,7 @@
 {
-  "name": "api.qa",
+  "name": "autonomous-qa",
   "version": "0.1.0",
-  "description": "The external third-party verifier for agent-first APIs. Discovery from published machine surfaces, contract-derived deterministic checks, attested public grade reports.",
+  "description": "The external third-party verifier for agent-first APIs. Discovery from published machine surfaces, contract-derived deterministic checks, attested public grade reports. Reference client for the hosted service at https://api.qa.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -24,7 +24,7 @@
     "node": ">=18"
   },
   "bin": {
-    "api.qa": "dist/cli/index.js"
+    "autonomous-qa": "dist/cli/index.js"
   },
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",

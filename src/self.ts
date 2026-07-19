@@ -36,7 +36,7 @@ curl -X POST https://api.qa/verify \\
 
 If the spec text does not hash to \`expectedDigest\`, nothing runs — the
 verdict is bound to the pinned contract, not to any file a fleet can edit.
-Local mode: \`npx api.qa verify http://localhost:8787 --spec spec.json\`
+Local mode: \`npx autonomous-qa verify http://localhost:8787 --spec spec.json\`
 (advisory; never attested).
 
 ## Other surfaces
@@ -47,7 +47,7 @@ Local mode: \`npx api.qa verify http://localhost:8787 --spec spec.json\`
 - \`GET /openapi.json\` — the API contract (we are verified against it too)
 - \`GET /health\` — keyless liveness
 - \`GET /self\` — api.qa's own verdict on api.qa, run live
-- \`npx api.qa <domain>\` — CLI; \`npx api.qa mcp\` — MCP server (stdio)
+- \`npx autonomous-qa <domain>\` — CLI; \`npx autonomous-qa mcp\` — MCP server (stdio)
 
 ## 402s are offers, not errors
 
@@ -85,10 +85,10 @@ export function selfAgentsJson(): object {
         health: { method: 'GET', url: `${SELF_ORIGIN}/health`, auth: 'none' },
         usage: { method: 'GET', url: `${SELF_ORIGIN}/llms.txt`, auth: 'none' },
       },
-      cli: { install: 'npx api.qa', commands: ['<domain>', 'verify <target> --spec <file>', 'rejudge', 'mcp'] },
+      cli: { install: 'npx autonomous-qa', commands: ['<domain>', 'verify <target> --spec <file>', 'rejudge', 'mcp'] },
       mcp: {
         transport: 'stdio',
-        command: 'npx api.qa mcp',
+        command: 'npx autonomous-qa mcp',
         tools: ['verify_domain', 'discover_domain', 'verify_pinned_spec'],
       },
     },
@@ -134,7 +134,7 @@ export function selfIcpJson(): object {
       {
         id: 'builder',
         fit: 'You just built or changed an API and need to know it works.',
-        flow: `GET https://api.qa/<your-domain> — read the grade, fix the FAILs, re-run. For dev URLs: npx api.qa <http://localhost:port> (advisory).`,
+        flow: `GET https://api.qa/<your-domain> — read the grade, fix the FAILs, re-run. For dev URLs: npx autonomous-qa <http://localhost:port> (advisory).`,
       },
       {
         id: 'fleet-orchestrator',
@@ -263,7 +263,7 @@ export function selfOffer(): object {
     checkoutUrl: 'https://api.qa/checkout/attested-run', // SEAM: x402 / Stripe — not wired in the spike
     alternatives: [
       { id: 'free-tier', how: 'GET /{domain} — free rate-limited public verification, no key needed' },
-      { id: 'local-mode', how: 'npx api.qa <target> — run the same verifier core locally (advisory, unsigned)' },
+      { id: 'local-mode', how: 'npx autonomous-qa <target> — run the same verifier core locally (advisory, unsigned)' },
     ],
   }
 }
