@@ -1,0 +1,61 @@
+{
+  "$type": "PinnedSpec",
+  "name": "primitives-golden-scenario",
+  "version": "1",
+  "description": "The completion-ladder golden scenario as an acceptance contract: one exemplar business (dealer slice: lead → prequal → deal → escalate → approve → deliver → settle) executes end-to-end on the target's dev surface with zero external dependencies. This document is pinned by sha256; the fleet implements against it but cannot change what passing means. Run: npx api.qa verify http://localhost:8787 --spec examples/golden-scenario.spec.json --expect-digest <pin>",
+  "requirements": [
+    {
+      "id": "openapi-published",
+      "kind": "surface",
+      "surface": "openapi",
+      "must": "valid"
+    },
+    {
+      "id": "golden-run-settles",
+      "kind": "endpoint",
+      "method": "POST",
+      "path": "/golden/run",
+      "body": { "scenario": "dealer-slice", "seed": 1 },
+      "expect": {
+        "status": 200,
+        "contentTypeIncludes": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["settled", "ledgerBalanced", "path"],
+          "properties": {
+            "settled": { "type": "boolean" },
+            "ledgerBalanced": { "type": "boolean" },
+            "path": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "paths": [
+          { "path": "settled", "equals": true },
+          { "path": "ledgerBalanced", "equals": true },
+          { "path": "path.0", "equals": "lead" }
+        ]
+      }
+    },
+    {
+      "id": "escalation-reachable",
+      "kind": "endpoint",
+      "method": "POST",
+      "path": "/golden/run",
+      "body": { "scenario": "dealer-slice-escalation", "seed": 1 },
+      "expect": {
+        "status": 200,
+        "paths": [
+          { "path": "escalatedToHumanDesk", "equals": true },
+          { "path": "settled", "equals": true }
+        ]
+      }
+    },
+    {
+      "id": "clean-4xx-on-garbage",
+      "kind": "endpoint",
+      "method": "POST",
+      "path": "/golden/run",
+      "body": { "scenario": "not-a-scenario" },
+      "expect": { "status": [400, 422] }
+    }
+  ]
+}

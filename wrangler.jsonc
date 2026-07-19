@@ -1,0 +1,17 @@
+// api.qa — Cloudflare Worker config. Nothing deploys from this spike;
+// this pins the intended shape (see DESIGN.md "Seams" for what deploy needs).
+{
+  "name": "api-qa",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-07-01",
+  "routes": [{ "pattern": "api.qa", "custom_domain": true }],
+  // Secrets (wrangler secret put):
+  //   SIGNING_KEY — base64 pkcs8 Ed25519 private key. Reports are attested
+  //   with this key; it lives ONLY here — never in any repo a fleet can write.
+  "vars": {
+    // "ALLOW_PRIVATE_TARGETS": "false"
+  }
+  // Seams (not wired in the spike):
+  //   KV: report cache (per-target cooldown + replay store)
+  //   DO: per-domain politeness budget across isolates
+}
