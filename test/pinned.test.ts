@@ -81,6 +81,74 @@ describe('pinned-spec mode (the X1 harness)', () => {
     expect(report.passed).toBe(true)
   })
 
+  it('numeric comparators express a pinned floor (gte/gt/lte/lt) held in the spec, not the target', async () => {
+    // A ratchet-style spec: the target reports `passed`, the PINNED contract owns
+    // the floor. 7 >= 5 passes; the same run fails a floor of 9.
+    const ratchetSpec = JSON.stringify({
+      $type: 'PinnedSpec',
+      name: 'ratchet',
+      version: '1',
+      requirements: [
+        {
+          id: 'subset-floor',
+          kind: 'endpoint',
+          method: 'POST',
+          path: '/subset/run',
+          body: { seed: 1 },
+          expect: {
+            status: 200,
+            paths: [
+              { path: 'passed', gte: 5 },
+              { path: 'failed', lte: 3 },
+              { path: 'passed', gt: 0 },
+            ],
+          },
+        },
+      ],
+    })
+    const routes = withOverrides(goodTargetRoutes(), {
+      'POST /subset/run': () => json200({ passed: 7, failed: 2, total: 9 }),
+    })
+    const pass = await verifyPinnedSpec(GOOD, ratchetSpec, {
+      fetcher: makeFetcher(routes), delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(pass.passed, JSON.stringify(pass.requirements, null, 2)).toBe(true)
+
+    // Raise the floor above what the target reports: the same target now fails.
+    const higherFloor = ratchetSpec.replace('"gte":5', '"gte":9')
+    const fail = await verifyPinnedSpec(GOOD, higherFloor, {
+      fetcher: makeFetcher(routes), delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(fail.passed).toBe(false)
+    expect(fail.requirements.find((r) => r.id === 'subset-floor')?.detail).toMatch(/wanted >= 9/)
+  })
+
+  it('a numeric comparator on a missing or non-numeric path fails', async () => {
+    const spec = JSON.stringify({
+      $type: 'PinnedSpec',
+      name: 'numeric-guard',
+      version: '1',
+      requirements: [
+        {
+          id: 'needs-number',
+          kind: 'endpoint',
+          method: 'POST',
+          path: '/subset/run',
+          body: {},
+          expect: { status: 200, paths: [{ path: 'passed', gte: 1 }] },
+        },
+      ],
+    })
+    const routes = withOverrides(goodTargetRoutes(), {
+      'POST /subset/run': () => json200({ passed: 'seven' }),
+    })
+    const report = await verifyPinnedSpec(GOOD, spec, {
+      fetcher: makeFetcher(routes), delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(report.passed).toBe(false)
+    expect(report.requirements.find((r) => r.id === 'needs-number')?.detail).toMatch(/wanted a number >= 1/)
+  })
+
   it('surface requirements reuse the AX judges', async () => {
     const report = await verifyPinnedSpec(GOOD, specText, {
       fetcher: makeFetcher(withOverrides(goldenTargetRoutes(), {

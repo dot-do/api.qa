@@ -140,6 +140,24 @@ export async function verifyPinnedSpec(
               if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
                 problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
               }
+              // Numeric comparators — the pinned floor/ceiling. A comparator on a
+              // path that is absent or non-numeric is itself a failure (the target
+              // did not report the number the contract measures).
+              const comparators: Array<[keyof typeof p, string, (a: number, b: number) => boolean]> = [
+                ['gte', '>=', (a, b) => a >= b],
+                ['lte', '<=', (a, b) => a <= b],
+                ['gt', '>', (a, b) => a > b],
+                ['lt', '<', (a, b) => a < b],
+              ]
+              for (const [key, sym, cmp] of comparators) {
+                const bound = p[key] as number | undefined
+                if (bound === undefined) continue
+                if (!r.found || typeof r.value !== 'number') {
+                  problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted a number ${sym} ${bound}`)
+                } else if (!cmp(r.value, bound)) {
+                  problems.push(`path ${p.path} = ${r.value}, wanted ${sym} ${bound}`)
+                }
+              }
             }
           }
         }

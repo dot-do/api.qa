@@ -179,8 +179,23 @@ export type PinnedRequirement =
         status?: number | number[]
         contentTypeIncludes?: string
         schema?: MiniSchema
-        /** dot-path assertions into the JSON body. */
-        paths?: Array<{ path: string; equals?: unknown; exists?: boolean }>
+        /**
+         * dot-path assertions into the JSON body. Beyond `equals`/`exists`,
+         * numeric comparators (`gte`/`lte`/`gt`/`lt`) express FLOORS and CEILINGS
+         * that live in the pinned spec, not in the target — the Goodhart-correct
+         * home for a ratchet threshold (e.g. `passed >= floor`): the target
+         * reports the number, the PINNED contract owns the bar it must clear.
+         * A comparator requires the path to resolve to a JSON number.
+         */
+        paths?: Array<{
+          path: string
+          equals?: unknown
+          exists?: boolean
+          gte?: number
+          lte?: number
+          gt?: number
+          lt?: number
+        }>
       }
     }
   | { id: string; kind: 'ax-floor'; minScore: number }
