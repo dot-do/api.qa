@@ -69,6 +69,24 @@ export function parsePinnedSpec(text: string): PinnedSpec {
   if (doc.$type !== 'PinnedSpec' || !Array.isArray(doc.requirements)) {
     throw new Error('not a PinnedSpec: expected {"$type":"PinnedSpec","requirements":[...]}')
   }
+  // Requirement ids MUST be unique. Observe captures/fetches by loop POSITION,
+  // but the judge indexes evidence by `find(role === 'pinned:<id>')`, which
+  // returns the FIRST match. A duplicate id would make the two phases resolve
+  // to different items — self-contradictory reports that violate the
+  // observe/judge determinism invariant. Reject the spec up front, naming the
+  // offender, rather than verify something incoherent.
+  const seen = new Set<string>()
+  for (const req of doc.requirements) {
+    const id = (req as { id?: unknown }).id
+    if (typeof id !== 'string') continue
+    if (seen.has(id)) {
+      throw new Error(
+        `duplicate requirement id "${id}" in PinnedSpec — requirement ids must be unique ` +
+          '(observe indexes evidence by position, the judge by id; a repeat makes them disagree)',
+      )
+    }
+    seen.add(id)
+  }
   return doc
 }
 
@@ -431,11 +449,18 @@ type EndpointReq = Extract<PinnedRequirement, { kind: 'endpoint' }>
 /** `{{var}}` token — dot/word chars only (matches a capture var name). */
 const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g
 
+/** A string that is EXACTLY one `{{var}}` token, edge to edge (no surrounding text). */
+const WHOLE_VALUE_TOKEN = /^\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}$/
+
 /**
  * Interpolate every `{{var}}` in a string from the binding scope. A reference
  * to an unbound var is an ERROR (fail-closed) — the literal token is never
  * emitted onto the wire. Bound values render as their primitive text; a bound
  * object/array renders as compact JSON.
+ *
+ * This is the STRING-coercing path, used unconditionally for the URL path and
+ * method (both are always strings on the wire) and for any partial/embedded
+ * token (a token surrounded by other text, e.g. `/things/{{id}}`).
  */
 function interpolateString(s: string, bindings: Bindings): { value: string } | { error: string } {
   let undef: string | undefined
@@ -452,9 +477,29 @@ function interpolateString(s: string, bindings: Bindings): { value: string } | {
   return { value }
 }
 
+/**
+ * Interpolate a string leaf in a TYPED context (a JSON value inside `body` or
+ * `expect` — e.g. `expect.paths[].equals`, an expected scalar, a body field).
+ * When the ENTIRE string is a single whole-value `{{var}}` token, the RAW bound
+ * value is substituted PRESERVING ITS TYPE (number / boolean / object / null),
+ * so a captured numeric/boolean id chained into a typed compare or a JSON body
+ * value is judged/serialized as the value it is — not falsely stringified to
+ * `"1"` where `judgeExpect` would then mismatch `1`. Any other string (a
+ * partial/embedded token, or plain text) falls through to string coercion.
+ */
+function interpolateTypedString(s: string, bindings: Bindings): { value: unknown } | { error: string } {
+  const whole = WHOLE_VALUE_TOKEN.exec(s)
+  if (whole) {
+    const name = whole[1]!
+    if (!Object.hasOwn(bindings, name)) return { error: `undefined capture var {{${name}}}` }
+    return { value: bindings[name] }
+  }
+  return interpolateString(s, bindings)
+}
+
 /** Deep-interpolate strings inside an arbitrary JSON value (body / expect). */
 function interpolateDeep(value: unknown, bindings: Bindings): { value: unknown } | { error: string } {
-  if (typeof value === 'string') return interpolateString(value, bindings)
+  if (typeof value === 'string') return interpolateTypedString(value, bindings)
   if (Array.isArray(value)) {
     const out: unknown[] = []
     for (const item of value) {
