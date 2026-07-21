@@ -106,3 +106,122 @@ describe('SSRF: hostile monetization.probe (ax-6ql)', () => {
     expect(offers?.verdict).toBe('pass')
   })
 })
+
+/**
+ * Redirect-follow SSRF (ax-6ql, second fix): a probe URL can be perfectly
+ * legal — same-origin, GET, public host — pass parseAgentsJson AND the
+ * same-origin gate, then the target's own server answers `302 Location:
+ * http://169.254.169.254/…`. The FIRST fix validated only the DECLARED URL
+ * string; native `fetch(redirect: 'follow')` would silently hop to the
+ * metadata IP and store the credential body. The observer must follow
+ * redirects MANUALLY and re-validate every hop, failing closed on any
+ * off-origin / private / metadata Location. This shares the single fetch
+ * site, so it protects EVERY observe() role (root, openapi, keyless, offer).
+ */
+const METADATA = 'http://169.254.169.254/latest/meta-data'
+const METADATA_BODY = 'AWS-CREDS-role-ABCDEF-secret-do-not-exfiltrate'
+
+/** Routes whose offer probe 302-redirects to an attacker-chosen Location. */
+function redirectingOfferRoutes(location: string): ReturnType<typeof goodTargetRoutes> {
+  return withOverrides(goodTargetRoutes(), {
+    'GET /offers/upgrade': () => ({
+      status: 302,
+      contentType: 'text/plain',
+      body: '',
+      headers: { location },
+    }),
+  })
+}
+
+describe('SSRF: redirect-follow off the declared probe (ax-6ql, second fix)', () => {
+  it('a 302 to the metadata IP is NOT followed; probe fails closed, no body stored', async () => {
+    // The metadata host is reachable in the harness (so a naive follow WOULD
+    // succeed) — proving the guard, not the mock, is what stops it.
+    const routes = withOverrides(redirectingOfferRoutes(METADATA), {})
+    const calls: string[] = []
+    const base = makeFetcher(routes)
+    const fetcher: Fetcher = async (url, init) => {
+      calls.push(url)
+      if (new URL(url).hostname === '169.254.169.254') {
+        return new Response(METADATA_BODY, { status: 200, headers: { 'content-type': 'text/plain' } })
+      }
+      return base(url, init)
+    }
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    // The declared same-origin probe WAS requested (it is legal)...
+    expect(calls).toContain(`${GOOD}/offers/upgrade`)
+    // ...but the metadata Location is NEVER fetched.
+    expect(calls).not.toContain(METADATA)
+    expect(calls.some((u) => u.includes('169.254.169.254'))).toBe(false)
+
+    // The offer probe recorded a blocked failure — no status, no body.
+    const offerEv = observer.items.find((e) => e.role === 'probe:402-offer')
+    expect(offerEv).toBeDefined()
+    expect(offerEv?.error).toMatch(/redirect|ssrf|off-origin|private/i)
+    expect(offerEv?.status).toBeNull()
+    expect(offerEv?.body).toBeNull()
+
+    // The metadata/credential body appears NOWHERE in the Evidence bundle.
+    for (const ev of bundle.items) {
+      expect(ev.body ?? '').not.toContain(METADATA_BODY)
+    }
+    // The offers-402 check fails closed (the boundary never answered 402).
+    const offers = runChecks(bundle).find((c) => c.id === 'offers-402')
+    expect(offers?.verdict).toBe('fail')
+  })
+
+  it('a 302 to an off-origin https host is NOT followed (fails closed)', async () => {
+    const offOrigin = 'https://evil.example/steal'
+    const { fetcher, calls } = spyFetcher(redirectingOfferRoutes(offOrigin))
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    expect(calls).toContain(`${GOOD}/offers/upgrade`)
+    expect(calls).not.toContain(offOrigin)
+    expect(calls.some((u) => u.startsWith('https://evil.example'))).toBe(false)
+
+    const offerEv = observer.items.find((e) => e.role === 'probe:402-offer')
+    expect(offerEv?.error).toMatch(/redirect|ssrf|off-origin|private/i)
+    expect(offerEv?.body).toBeNull()
+  })
+
+  it('a benign SAME-ORIGIN 302 (to another GET path) IS still followed (no over-block)', async () => {
+    // /offers/upgrade 302 → /offers/v2 (same origin, GET) → 402 offer body.
+    const routes = withOverrides(goodTargetRoutes(), {
+      'GET /offers/upgrade': () => ({
+        status: 302,
+        contentType: 'text/plain',
+        body: '',
+        headers: { location: `${GOOD}/offers/v2` },
+      }),
+      'GET /offers/v2': () => ({
+        status: 402,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          id: 'pro',
+          title: 'Pro tier',
+          price: { amount: 10, currency: 'USD', interval: 'month' },
+          checkoutUrl: `${GOOD}/checkout/pro`,
+          alternatives: [{ id: 'free', how: 'stay on the free tier' }],
+        }),
+      }),
+    })
+    const { fetcher, calls } = spyFetcher(routes)
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    // Both hops were fetched (the same-origin redirect was followed).
+    expect(calls).toContain(`${GOOD}/offers/upgrade`)
+    expect(calls).toContain(`${GOOD}/offers/v2`)
+
+    // The offer probe recorded the followed 402 with its body.
+    const offerEv = observer.items.find((e) => e.role === 'probe:402-offer')
+    expect(offerEv?.status).toBe(402)
+    expect(offerEv?.error).toBeUndefined()
+
+    const offers = runChecks(bundle).find((c) => c.id === 'offers-402')
+    expect(offers?.verdict).toBe('pass')
+  })
+})

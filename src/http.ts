@@ -27,6 +27,18 @@ export interface ObserverOpts {
 
 const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin']
 
+/** Max redirect hops the observer will manually follow (each re-validated). */
+const MAX_REDIRECT_HOPS = 3
+
+/** The origin of a URL, or null if it does not parse. */
+function safeOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin
+  } catch {
+    return null
+  }
+}
+
 export class Observer {
   readonly items: Evidence[] = []
   private used = 0
@@ -76,7 +88,51 @@ export class Observer {
         body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
         headers['content-type'] = 'application/json'
       }
-      const res = await this.opts.fetcher(url, { method, headers, body, signal: controller.signal, redirect: 'follow' })
+      // SSRF (DESIGN.md attack #9): NEVER let native `fetch` auto-follow a
+      // redirect — a hostile-but-legal same-origin GET probe can 3xx to
+      // http://169.254.169.254/… (or any off-origin host) and native
+      // `redirect: 'follow'` would hop there and store the metadata/credential
+      // body. We follow manually and re-validate EVERY hop against the original
+      // origin (same-origin, publicly-routable, not private/metadata) and keep
+      // it read-only (GET/HEAD). Any failing hop fails closed: we do not fetch
+      // the Location and never read its body.
+      const originForRedirect = safeOrigin(url)
+      let currentUrl = url
+      let res: Response
+      let hop = 0
+      for (;;) {
+        res = await this.opts.fetcher(currentUrl, {
+          method, headers, body, signal: controller.signal, redirect: 'manual',
+        })
+        const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null
+        if (!location) break
+        // A redirect on a non-read-only method is never safe to follow.
+        if (method !== 'GET' && method !== 'HEAD') {
+          clearTimeout(timer)
+          return this.record(role, url, method, init.accept, null, null, {}, null, Date.now() - started,
+            `blocked: refusing to follow redirect on ${method} (read-only)`)
+        }
+        if (hop >= MAX_REDIRECT_HOPS) {
+          clearTimeout(timer)
+          return this.record(role, url, method, init.accept, null, null, {}, null, Date.now() - started,
+            `blocked: too many redirects (> ${MAX_REDIRECT_HOPS})`)
+        }
+        let nextUrl: string
+        try {
+          nextUrl = new URL(location, currentUrl).toString()
+        } catch {
+          clearTimeout(timer)
+          return this.record(role, url, method, init.accept, null, null, {}, null, Date.now() - started,
+            `blocked: unparseable redirect Location`)
+        }
+        if (!originForRedirect || !isPubliclyRoutableSameOrigin(nextUrl, originForRedirect)) {
+          clearTimeout(timer)
+          return this.record(role, url, method, init.accept, null, null, {}, null, Date.now() - started,
+            `blocked: refusing off-origin/private redirect (SSRF): ${nextUrl}`)
+        }
+        hop += 1
+        currentUrl = nextUrl
+      }
       clearTimeout(timer)
       const text = await this.readCapped(res)
       const kept: Record<string, string> = {}
@@ -135,21 +191,33 @@ export function isPrivateHost(host: string): boolean {
  *
  * Returns true only when `rawUrl` parses, is same-origin with `origin`, and
  * does not point at a private/loopback/link-local/metadata address (e.g.
- * 169.254.169.254, 10.x, 127.x, ::1). The same-origin gate alone blocks the
- * off-origin SSRF (evil.example, off-origin metadata IPs); the private-host
- * block is defense in depth and — because same-origin means same host — only
- * ever engages when the target origin is itself public yet the declared probe
- * host is a private literal. A consented private/local target (origin itself
- * private, the dev-mode escape hatch) still serves its own same-origin probes.
- * The method (GET-only) is enforced by the caller, mirroring the manifest rule.
+ * 169.254.169.254, 10.x, 127.x, ::1). This gate protects TWO surfaces:
+ *   1. the declared probe URL (monetization.probe / probes.*), where `rawUrl`
+ *      is same-origin with `origin` by construction; and
+ *   2. every redirect Location the observer manually follows, where `rawUrl`
+ *      is the hop target and its host CAN differ from `origin` — a hostile
+ *      same-origin probe that 3xx-redirects to http://169.254.169.254/… is
+ *      the live SSRF this guard must stop.
+ *
+ * The private/metadata block is checked FIRST and against `rawUrl`'s host, so
+ * it bites on the redirect hop (the case the same-origin compare alone cannot
+ * be relied on to reach). The one exception is a consented private/local
+ * target (origin itself private — the dev-mode escape hatch) serving its own
+ * same-origin private probe. The method (GET-only) is enforced by the caller.
  */
 export function isPubliclyRoutableSameOrigin(rawUrl: string, origin: string): boolean {
   let u: URL
   try { u = new URL(rawUrl) } catch { return false }
   let base: URL
   try { base = new URL(origin) } catch { return false }
+  // Private/metadata block — runs against the RESOLVED host (`u`), which is
+  // where a redirect Location differs from the origin. Only a consented
+  // private target serving its own same-origin private probe is exempt.
+  if (isPrivateHost(u.hostname)) {
+    const consentedPrivateSameOrigin = isPrivateHost(base.hostname) && u.origin === base.origin
+    if (!consentedPrivateSameOrigin) return false
+  }
   if (u.origin !== base.origin) return false
-  if (!isPrivateHost(base.hostname) && isPrivateHost(u.hostname)) return false
   return true
 }
 
