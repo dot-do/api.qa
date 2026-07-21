@@ -34,7 +34,10 @@ export async function verifyTarget(target: string, opts: VerifyTargetOpts = {}):
   if ('error' in normalized) throw new Error(normalized.error)
 
   const seed = opts.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0)
-  const observer = new Observer(opts)
+  // Consent flows to the observer: only a consented private/local target may be
+  // fetched at a private address (the structural SSRF backstop). Same signal
+  // normalizeTarget used above — the deployed Worker leaves it false.
+  const observer = new Observer({ ...opts, allowPrivate })
   const bundle = await observeTarget(normalized.origin, observer, seed)
   const discovery = await deriveDiscovery(bundle)
   const checks = runChecks(bundle)

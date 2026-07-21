@@ -23,6 +23,13 @@ export interface ObserverOpts {
   maxBodyBytes?: number
   /** Pinned-spec consent mode may enable non-GET probes. Default false. */
   allowWrites?: boolean
+  /**
+   * Consented private/local target mode (dev/CLI `--allow-private`). When true,
+   * the observer may fetch a private/loopback/link-local initial target (e.g.
+   * http://localhost:8787). Default false — the deployed Worker NEVER sets it,
+   * so it can never fetch a private/metadata address as an initial target.
+   */
+  allowPrivate?: boolean
 }
 
 const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin']
@@ -52,6 +59,7 @@ export class Observer {
       timeoutMs: opts.timeoutMs ?? 10_000,
       maxBodyBytes: opts.maxBodyBytes ?? 262_144,
       allowWrites: opts.allowWrites ?? false,
+      allowPrivate: opts.allowPrivate ?? false,
     }
   }
 
@@ -66,6 +74,22 @@ export class Observer {
     init: { method?: string; accept?: string; body?: unknown } = {},
   ): Promise<Evidence> {
     const method = (init.method ?? 'GET').toUpperCase()
+    // STRUCTURAL SSRF BACKSTOP (DESIGN.md attack #9): re-validate our OWN
+    // INITIAL url before the first byte leaves, independent of any call site.
+    // No redirect is needed to hit metadata — `openapi:"http://169.254.169.254/…"`
+    // is fetched DIRECTLY, so `redirect:'manual'` never sees it. api.qa must
+    // NEVER fetch a private/loopback/link-local/metadata address as an initial
+    // target, for EVERY role, no matter which (present or future) call site
+    // passed it — this is the whack-a-mole-proof layer under the per-call-site
+    // same-origin gates. The ONLY exception is a consented private/local target
+    // (dev/CLI `--allow-private`, the same escape hatch normalizeTarget honors);
+    // the deployed Worker never sets allowPrivate. Mirrors the redirect-hop
+    // guard, which fails closed on exactly these addresses.
+    const initialHost = (() => { try { return new URL(url).hostname } catch { return null } })()
+    if (!this.opts.allowPrivate && initialHost !== null && isPrivateHost(initialHost)) {
+      return this.record(role, url, method, init.accept, null, null, {}, null, 0,
+        `blocked: refusing private/metadata initial target (SSRF): ${url}`)
+    }
     if (!this.opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
       const ev = this.record(role, url, method, init.accept, null, null, {}, null, 0, 'blocked: read-only mode')
       return ev

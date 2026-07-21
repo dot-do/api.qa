@@ -248,8 +248,21 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   await observer.observe(ROLE.icpJson, `${origin}/icp.json`, { accept: 'application/json' })
 
   const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
+  // openapiUrl is CARD-DERIVED (openapi / openapiUrl / surfaces.openapi), and
+  // absolutize() preserves an ABSOLUTE attacker-chosen url. It is fetched
+  // DIRECTLY (no redirect), so the redirect-hop guard never sees it — an
+  // un-gated `openapi:"http://169.254.169.254/…"` is a first-hop SSRF that
+  // exfiltrates the metadata/credential body into the Evidence bundle. Gate it
+  // through the SAME shared same-origin helper as the offer probe: only fetch
+  // when the declared url is same-origin AND publicly-routable. A hostile
+  // declared url is DROPPED (never fetched, no fallback) — the openapi surface
+  // then fails closed, exactly as a hostile monetization.probe fails the
+  // offers-402 check. The default `${origin}/openapi.json` is same-origin by
+  // construction and always passes, so absence of a card url is unaffected.
   const openapiUrl = agents.openapiUrl ?? `${origin}/openapi.json`
-  const openapiEv = await observer.observe(ROLE.openapi, openapiUrl, { accept: 'application/json' })
+  const openapiEv = isPubliclyRoutableSameOrigin(openapiUrl, origin)
+    ? await observer.observe(ROLE.openapi, openapiUrl, { accept: 'application/json' })
+    : undefined
   const openapi = parseOpenapi(parseJsonBody(openapiEv))
 
   // 2. Seeded endpoint sampling — which endpoints get probed is not
@@ -265,7 +278,16 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     .filter((p) => !p.includes('{') && !p.includes('%7B')) // URL templates aren't probeable
     .sort()
   for (const path of sampleSeeded(candidatePaths, MAX_KEYLESS_PROBES, seed)) {
-    await observer.observe(ROLE.keyless('GET', path), `${origin}${path}`, { accept: 'application/json' })
+    // Candidate paths are CARD-DERIVED: openapi path keys are raw attacker
+    // input, and a key that does NOT begin with "/" (e.g. "@evil.example/x" or
+    // ".evil.example/x") makes `${origin}${path}` resolve OFF-ORIGIN. The
+    // private-host backstop only bites private hosts, so gate through the
+    // shared same-origin helper — a hostile key can never steer a keyless probe
+    // off the target origin. Legitimate absolute paths ("/api/x") stay same
+    // origin and pass unchanged.
+    const url = `${origin}${path}`
+    if (!isPubliclyRoutableSameOrigin(url, origin)) continue
+    await observer.observe(ROLE.keyless('GET', path), url, { accept: 'application/json' })
   }
 
   // 3. The 402 boundary probe, if the target declares one. Defense in depth:

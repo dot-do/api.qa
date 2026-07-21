@@ -89,8 +89,14 @@ export async function verifyPinnedSpec(
   const origin = normalized.origin
 
   const seed = opts.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0)
-  // Pinned mode is consent mode: the target is yours, POST probes allowed.
-  const observer = new Observer({ ...opts, allowWrites: true, budget: opts.budget ?? 48 })
+  // Pinned mode is consent mode: the target is yours, POST probes allowed. The
+  // same consent gates the structural SSRF backstop for a private/local target.
+  const observer = new Observer({
+    ...opts,
+    allowWrites: true,
+    allowPrivate: opts.allowPrivateTargets ?? mode === 'local',
+    budget: opts.budget ?? 48,
+  })
   const bundle = await observeTarget(origin, observer, seed)
 
   // Extra observations demanded by the spec's endpoint requirements.

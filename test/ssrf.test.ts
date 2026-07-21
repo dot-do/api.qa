@@ -225,3 +225,183 @@ describe('SSRF: redirect-follow off the declared probe (ax-6ql, second fix)', ()
     expect(offers?.verdict).toBe('pass')
   })
 })
+
+/**
+ * First-hop SSRF via the card-derived `openapi` url (ax-6ql, third fix).
+ *
+ * `agents.openapiUrl` (from `openapi` / `openapiUrl` / `surfaces.openapi`) is
+ * card-controlled and absolutize() preserves an ABSOLUTE attacker url. Before
+ * this fix it was passed straight to observer.observe(ROLE.openapi, …) with NO
+ * same-origin gate. The fetch is DIRECT (no redirect), so the redirect-hop
+ * guard never sees it: `openapi:"http://169.254.169.254/…"` was fetched, the
+ * metadata answered 200, and readCapped stored the credential body into the
+ * Evidence bundle under ROLE.openapi. Two layers now stop it: (1) the call
+ * site gates the declared url through isPubliclyRoutableSameOrigin, and (2) the
+ * observer re-validates its OWN initial url and refuses any private/metadata
+ * address for EVERY role — the whack-a-mole-proof backstop.
+ */
+const OPENAPI_METADATA = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/role'
+const OPENAPI_CREDS = 'AWS-CREDS-openapi-role-XYZ-secret-do-not-exfiltrate'
+
+/** The good card with its `openapi` field replaced by `openapiUrl`. */
+function cardWithOpenapi(openapiUrl: string): Record<string, unknown> {
+  return {
+    name: 'good.example',
+    description: 'Reference agent-first widget API.',
+    interfaces: {
+      http: {
+        status: { method: 'GET', url: `${GOOD}/api/status`, auth: 'none' },
+        widgets: { method: 'GET', url: `${GOOD}/api/widgets`, auth: 'none' },
+      },
+      mcp: { transport: 'stdio', command: 'npx good.example mcp', tools: ['list_widgets'] },
+    },
+    openapi: openapiUrl,
+    attestationLadder: [{ rung: 'anonymous' }],
+    monetization: {
+      model: '402 offers at boundaries',
+      offers: [{ id: 'pro', title: 'Pro tier', price: { amount: 10, currency: 'USD', interval: 'month' } }],
+      probe: { method: 'GET', url: `${GOOD}/offers/upgrade` },
+    },
+  }
+}
+
+function hostileOpenapiRoutes(openapiUrl: string) {
+  return withOverrides(goodTargetRoutes(), {
+    'GET /.well-known/agents.json': () => ({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(cardWithOpenapi(openapiUrl)),
+    }),
+  })
+}
+
+describe('SSRF: first-hop via card-derived openapi url (ax-6ql, third fix)', () => {
+  it('(a) openapi = metadata IP is NEVER fetched; no creds in Evidence; openapi fails closed', async () => {
+    // The metadata host is reachable in the harness (a naive fetch WOULD get
+    // the credential body) — proving the guard, not the mock, is what stops it.
+    const calls: string[] = []
+    const base = makeFetcher(hostileOpenapiRoutes(OPENAPI_METADATA))
+    const fetcher: Fetcher = async (url, init) => {
+      calls.push(url)
+      if (new URL(url).hostname === '169.254.169.254') {
+        return new Response(OPENAPI_CREDS, { status: 200, headers: { 'content-type': 'text/plain' } })
+      }
+      return base(url, init)
+    }
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    // The hostile metadata url is NEVER requested.
+    expect(calls).not.toContain(OPENAPI_METADATA)
+    expect(calls.some((u) => u.includes('169.254.169.254'))).toBe(false)
+    // The credential body appears NOWHERE in the Evidence bundle.
+    for (const ev of bundle.items) {
+      expect(ev.body ?? '').not.toContain(OPENAPI_CREDS)
+    }
+    // The openapi surface fails closed (the hostile url was dropped, not fetched).
+    const openapi = runChecks(bundle).find((c) => c.id === 'openapi')
+    expect(openapi?.verdict).toBe('fail')
+  })
+
+  it('(b) openapi = off-origin https host is NEVER fetched; openapi fails closed', async () => {
+    const offOrigin = 'https://evil.example/openapi.json'
+    const { fetcher, calls } = spyFetcher(hostileOpenapiRoutes(offOrigin))
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    expect(calls).not.toContain(offOrigin)
+    expect(calls.some((u) => u.startsWith('https://evil.example'))).toBe(false)
+    const openapi = runChecks(bundle).find((c) => c.id === 'openapi')
+    expect(openapi?.verdict).toBe('fail')
+  })
+
+  it('(c) a SAME-ORIGIN card-declared openapi url still works (no over-block)', async () => {
+    // A non-default same-origin path proves the gate admits legitimate cards.
+    const routes = withOverrides(hostileOpenapiRoutes(`${GOOD}/spec/openapi.json`), {
+      'GET /spec/openapi.json': () => ({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          openapi: '3.1.0',
+          info: { title: 'good.example', version: '1.0.0' },
+          paths: { '/api/status': { get: { responses: { '200': { description: 'ok' } } } } },
+        }),
+      }),
+    })
+    const { fetcher, calls } = spyFetcher(routes)
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+
+    expect(calls).toContain(`${GOOD}/spec/openapi.json`)
+    const openapi = runChecks(bundle).find((c) => c.id === 'openapi')
+    expect(openapi?.verdict).toBe('pass')
+  })
+
+  it('(d) an openapi PATH KEY that breaks off-origin ("@evil…") is NEVER fetched (keyless gate)', async () => {
+    // A raw openapi path key that does not begin with "/" makes the keyless
+    // probe `${origin}${path}` resolve OFF-ORIGIN: "@evil.example/x" →
+    // https://good.example@evil.example/x (host evil.example). The keyless
+    // call site now gates every candidate through the same-origin helper.
+    const hostileKey = '@evil.example/pwn'
+    const routes = withOverrides(goodTargetRoutes(), {
+      'GET /openapi.json': () => ({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          openapi: '3.1.0',
+          info: { title: 'good.example', version: '1.0.0' },
+          paths: {
+            [hostileKey]: { get: { responses: { '200': { description: 'ok' } } } },
+            '/api/status': { get: { responses: { '200': { description: 'ok' } } } },
+          },
+        }),
+      }),
+    })
+    const { fetcher, calls } = spyFetcher(routes)
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    await observeTarget(GOOD, observer, 42)
+
+    // The breakout url is never constructed into a real off-origin fetch.
+    expect(calls.some((u) => new URL(u).hostname === 'evil.example')).toBe(false)
+    expect(calls.every((u) => new URL(u).hostname === 'good.example')).toBe(true)
+    // No keyless evidence was recorded for the hostile key.
+    expect(observer.items.some((e) => e.role.includes('@evil.example'))).toBe(false)
+  })
+})
+
+/**
+ * The structural backstop in isolation (ax-6ql, third fix): Observer.observe()
+ * refuses a private/metadata INITIAL url for ANY role, independent of the call
+ * site that passed it — no future caller can reintroduce a first-hop SSRF.
+ */
+describe('SSRF: observe() re-validates its own initial url (structural backstop)', () => {
+  it('refuses a private/metadata initial target for any role, without fetching', async () => {
+    const calls: string[] = []
+    const fetcher: Fetcher = async (url) => {
+      calls.push(url)
+      return new Response(OPENAPI_CREDS, { status: 200, headers: { 'content-type': 'text/plain' } })
+    }
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const ev = await observer.observe('probe:arbitrary', OPENAPI_METADATA, { accept: '*/*' })
+
+    // Nothing was fetched; the evidence is a blocked failure with no body.
+    expect(calls).toHaveLength(0)
+    expect(ev.status).toBeNull()
+    expect(ev.body).toBeNull()
+    expect(ev.error).toMatch(/private|metadata|ssrf/i)
+  })
+
+  it('still fetches a private initial target when private mode is consented', async () => {
+    // Dev/CLI `--allow-private`: a consented localhost target IS reachable.
+    const local = 'http://127.0.0.1:8787/openapi.json'
+    const calls: string[] = []
+    const fetcher: Fetcher = async (url) => {
+      calls.push(url)
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const observer = new Observer({ fetcher, delayMs: 0, allowPrivate: true })
+    const ev = await observer.observe('probe:arbitrary', local, { accept: '*/*' })
+    expect(calls).toContain(local)
+    expect(ev.status).toBe(200)
+  })
+})
