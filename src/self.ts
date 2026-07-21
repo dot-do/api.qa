@@ -280,7 +280,7 @@ export function selfLandingHtml(): string {
       },
       {
         '@type': 'DefinedTerm',
-        name: 'Agent Experience (AX)',
+        name: 'Agent eXperience (AX)',
         description:
           'The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless trial flows, structured payment offers, and attestable behavior. Successor term to Developer Experience (DX).',
         inDefinedTermSet: { '@type': 'DefinedTermSet', name: 'api.qa AX score', url: SELF_ORIGIN },
@@ -292,12 +292,22 @@ export function selfLandingHtml(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>api.qa — the verifier your fleet can't edit</title>
+<meta name="color-scheme" content="light dark">
+<title>api.qa · the verifier your fleet can't edit</title>
 <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
 <style>
-  body{font:16px/1.6 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#111}
-  pre{background:#0b0b0d;color:#e4e4e7;padding:1rem;border-radius:8px;overflow-x:auto}
-  h1{font-size:2.2rem}
+  :root{--bg:oklch(0.988 0.006 175);--fg:oklch(0.205 0.021 210);--link:oklch(0.500 0.118 185);
+    --code-bg:oklch(0.190 0.024 220);--code-fg:oklch(0.910 0.014 190)}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:oklch(0.165 0.021 220);--fg:oklch(0.935 0.012 185);--link:oklch(0.735 0.130 178);
+      --code-bg:oklch(0.135 0.020 222);--code-fg:oklch(0.900 0.016 190)}
+  }
+  body{font:16px/1.6 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;
+    background:var(--bg);color:var(--fg)}
+  pre{background:var(--code-bg);color:var(--code-fg);padding:1rem;border-radius:8px;overflow-x:auto;
+    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
+  h1{font-size:2.2rem;line-height:1.1;margin:0 0 1rem}
+  a{color:var(--link)}
 </style>
 </head>
 <body>
@@ -308,10 +318,10 @@ tests stop meaning anything. api.qa is the fitness function held outside the
 fleet's write access: verification derived from your published contracts,
 deterministic, attested, replayable.</p>
 <pre>curl https://api.qa/example.com</pre>
-<p>Letter grade + the 10-point <strong>AX score</strong> (Agent Experience) +
+<p>Letter grade + the 10-point <strong>AX score</strong> (Agent eXperience) +
 per-check verdicts, with the evidence bundle embedded so anyone can re-judge
 the verdict. api.qa grades itself with the same checks: <a href="/self">/self</a>.</p>
-<p>Agents: this page content-negotiates — <code>curl</code> gets
+<p>Agents: this page content-negotiates: <code>curl</code> gets
 <a href="/llms.txt">llms.txt</a>. See <a href="/.well-known/agents.json">agents.json</a>,
 <a href="/icp.json">icp.json</a>, <a href="/openapi.json">openapi.json</a>.</p>
 </body>
