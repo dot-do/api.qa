@@ -117,6 +117,21 @@ export async function verifyPinnedSpec(
         verdict: axScore.points >= req.minScore ? 'pass' : 'fail',
         detail: `AX ${axScore.points}/10 (floor ${req.minScore})`, evidence: [],
       })
+    } else if (req.kind === 'check') {
+      // Bind a MUST clause to a SPECIFIC api.qa check, not the coarse floor.
+      const c = surfaceChecks.find((sc) => sc.id === req.check)
+      const verdict: Verdict = c?.verdict === 'pass' ? 'pass' : 'fail'
+      results.push({
+        id: req.id, title: `check ${req.check} must ${req.must}`,
+        verdict,
+        detail:
+          c === undefined
+            ? `unknown check "${req.check}" — not produced by api.qa runChecks; cannot pass`
+            : c.verdict === 'pass'
+              ? `check ${req.check} passed: ${c.detail}`
+              : `check ${req.check} verdict '${c.verdict}' (must be 'pass'): ${c.detail}`,
+        evidence: c?.evidence ?? [],
+      })
     } else {
       const ev = fullBundle.items.find((e) => e.role === `pinned:${req.id}`)
       const problems: string[] = []

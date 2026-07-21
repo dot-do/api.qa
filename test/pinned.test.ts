@@ -149,6 +149,48 @@ describe('pinned-spec mode (the X1 harness)', () => {
     expect(report.requirements.find((r) => r.id === 'needs-number')?.detail).toMatch(/wanted a number >= 1/)
   })
 
+  it('kind:check binds a MUST to a SPECIFIC check, not the coarse AX floor', async () => {
+    const spec = JSON.stringify({
+      $type: 'PinnedSpec',
+      name: 'per-check',
+      version: '1',
+      requirements: [
+        { id: 'must-content-negotiate', kind: 'check', check: 'content-negotiation', must: 'pass' },
+        { id: 'must-offer-402', kind: 'check', check: 'offers-402', must: 'pass' },
+      ],
+    })
+    // Conformant target passes both discriminating checks.
+    const good = await verifyPinnedSpec(GOOD, spec, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(good.passed, JSON.stringify(good.requirements, null, 2)).toBe(true)
+
+    // Serve HTML to the agent Accept: the SPECIFIC content-negotiation check
+    // fails even though the AX floor would still be cleared.
+    const htmlToAgent = await verifyPinnedSpec(GOOD, spec, {
+      fetcher: makeFetcher(withOverrides(goodTargetRoutes(), {
+        'GET /': () => ({ status: 200, contentType: 'text/html', body: '<!doctype html><html><body>hi</body></html>' }),
+      })),
+      delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(htmlToAgent.passed).toBe(false)
+    expect(htmlToAgent.requirements.find((r) => r.id === 'must-content-negotiate')?.verdict).toBe('fail')
+  })
+
+  it('kind:check with an unknown check id cannot pass', async () => {
+    const spec = JSON.stringify({
+      $type: 'PinnedSpec',
+      name: 'bogus-check',
+      version: '1',
+      requirements: [{ id: 'nope', kind: 'check', check: 'not-a-real-check', must: 'pass' }],
+    })
+    const report = await verifyPinnedSpec(GOOD, spec, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(report.passed).toBe(false)
+    expect(report.requirements.find((r) => r.id === 'nope')?.detail).toMatch(/unknown check/)
+  })
+
   it('surface requirements reuse the AX judges', async () => {
     const report = await verifyPinnedSpec(GOOD, specText, {
       fetcher: makeFetcher(withOverrides(goldenTargetRoutes(), {

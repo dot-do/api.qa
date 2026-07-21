@@ -199,6 +199,15 @@ export type PinnedRequirement =
       }
     }
   | { id: string; kind: 'ax-floor'; minScore: number }
+  /**
+   * Require a SPECIFIC api.qa check to pass — not just the aggregate AX floor.
+   * `check` is a check id produced by runChecks (checks.ts), e.g.
+   * 'content-negotiation', 'offers-402', 'keyless-flow', 'agents-json'. This is
+   * how a pinned contract binds a single RFC-2119 MUST to its OWN discriminating
+   * verification instead of letting it ride a coarse floor that tolerates its
+   * violation. A `skip` or unknown check id is a failure under `must: 'pass'`.
+   */
+  | { id: string; kind: 'check'; check: string; must: 'pass' }
 
 export interface PinnedSpec {
   $type: 'PinnedSpec'
