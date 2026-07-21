@@ -7,24 +7,34 @@
  * verdict.
  */
 
+import { TAGLINE, AXP_ANCHOR, JUDGED, ADMISSION, VILLAIN } from './copy.js'
+
 export const SELF_ORIGIN = 'https://api.qa'
 
 export function selfLlmsTxt(): string {
   return `# api.qa
 
-> The external third-party verifier for agent-first APIs. Contract-derived
-> deterministic checks, public grade pages, attested replayable reports.
-> The fitness function your own fleet cannot edit.
+> ${TAGLINE}
+> api.qa is the proof mechanism of the agent-first arc: the external
+> third-party verifier for agent-first APIs — every grade is ${JUDGED}.
+> Contract-derived deterministic checks, public grade pages, attested
+> replayable reports. The fitness function your own fleet cannot edit.
 
-## Grade any API (no key, no account)
+The villain is ${VILLAIN}. api.qa fights the honesty front of that war: it
+grades whether a surface tells machines the truth, computed only from the
+surface's own published contracts.
+
+## Grade any API (keyless first value — no key, no account)
 
 \`\`\`sh
 curl https://api.qa/example.com
 \`\`\`
 
-Returns the public report as markdown: letter grade + the 10-point AX score
-+ per-check verdicts. \`accept: application/json\` returns the full report
-including the evidence bundle (replayable) and the Ed25519 attestation.
+Zero-shot: returns the public report as markdown — letter grade + the
+10-point AX score + per-check verdicts — over the machine surfaces made
+normative by ${AXP_ANCHOR}. \`accept: application/json\` returns the full
+report including the evidence bundle (replayable) and the Ed25519
+attestation.
 
 ## Verify against a pinned spec (the hill-climb harness)
 
@@ -34,10 +44,17 @@ curl -X POST https://api.qa/verify \\
   -d '{"target":"https://your.dev","spec":<PinnedSpec JSON>,"expectedDigest":"<sha256>"}'
 \`\`\`
 
-If the spec text does not hash to \`expectedDigest\`, nothing runs — the
-verdict is bound to the pinned contract, not to any file a fleet can edit.
-Local mode: \`npx autonomous-qa verify http://localhost:8787 --spec spec.json\`
-(advisory; never attested).
+Acceptance is \`${ADMISSION}\`. If the spec text does not hash to
+\`expectedDigest\`, nothing runs — the verdict is bound to the ratified
+contract, not to any file a fleet can edit. Local mode:
+\`npx autonomous-qa verify http://localhost:8787 --spec spec.json\`
+(advisory; local runs never sign).
+
+## Admission (the apis.ax catalog)
+
+Every Listing in the apis.ax catalog passed the pinned AXP gate —
+${JUDGED}. Admission is \`${ADMISSION}\`. apis.ax never grades its own
+catalog.
 
 ## Other surfaces
 
@@ -51,8 +68,10 @@ Local mode: \`npx autonomous-qa verify http://localhost:8787 --spec spec.json\`
 
 ## 402s are offers, not errors
 
-Free verification is rate-limited and public. Boundaries (bulk runs, CI
-webhooks, private report retention) answer HTTP 402 with a structured offer:
+Free verification is rate-limited and public — the free path never 401/402s,
+because a gate on the free grade would contradict the whole thesis.
+Boundaries (bulk runs, CI webhooks, private report retention) answer HTTP
+402 with a structured, hard-ceiling offer per AXP's payment clause:
 \`GET /offers/attested-run\` shows the shape. Relay the checkout link; keep
 building.
 
@@ -281,8 +300,7 @@ export function selfLandingHtml(): string {
       {
         '@type': 'DefinedTerm',
         name: 'Agent eXperience (AX)',
-        description:
-          'The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless trial flows, structured payment offers, and attestable behavior. Successor term to Developer Experience (DX).',
+        description: `${TAGLINE} The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless first value, hard-ceiling 402 offers, and attestable behavior. Made normative by ${AXP_ANCHOR}.`,
         inDefinedTermSet: { '@type': 'DefinedTermSet', name: 'api.qa AX score', url: SELF_ORIGIN },
       },
     ],
@@ -312,15 +330,18 @@ export function selfLandingHtml(): string {
 </head>
 <body>
 <h1>api.qa</h1>
-<p><strong>The external third-party verifier for agent-first APIs.</strong>
-Agent fleets hill-climb against tests. If the fleet can edit the tests, the
-tests stop meaning anything. api.qa is the fitness function held outside the
-fleet's write access: verification derived from your published contracts,
-deterministic, attested, replayable.</p>
+<p><strong>${TAGLINE}</strong></p>
+<p>An AI agent won't integrate an API it can't trust, and a principal can't
+prove their API works for agents by asserting it — assertions are exactly
+what Goodharted fleets produce. api.qa is the external third-party verifier,
+held outside the building fleet's write access: every grade is ${JUDGED},
+derived from your published contracts, deterministic, Ed25519-attested,
+replayable — bound to a ratified digest.</p>
 <pre>curl https://api.qa/example.com</pre>
-<p>Letter grade + the 10-point <strong>AX score</strong> (Agent eXperience) +
-per-check verdicts, with the evidence bundle embedded so anyone can re-judge
-the verdict. api.qa grades itself with the same checks: <a href="/self">/self</a>.</p>
+<p>Letter grade + the 10-point <strong>AX score</strong> over the machine
+surfaces made normative by ${AXP_ANCHOR} — with the evidence bundle embedded
+so anyone can re-judge the verdict. Dogfooding, beneath the independence
+claim: api.qa runs itself through the same checks: <a href="/self">/self</a>.</p>
 <p>Agents: this page content-negotiates: <code>curl</code> gets
 <a href="/llms.txt">llms.txt</a>. See <a href="/.well-known/agents.json">agents.json</a>,
 <a href="/icp.json">icp.json</a>, <a href="/openapi.json">openapi.json</a>.</p>

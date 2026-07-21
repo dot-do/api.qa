@@ -23,6 +23,7 @@
  */
 
 import type { VerificationReport, Grade, Verdict } from './types.js'
+import { TAGLINE, AXP_ANCHOR, JUDGED, ADMISSION, VILLAIN } from './copy.js'
 
 export function esc(text: string): string {
   return text
@@ -137,6 +138,7 @@ code,pre,.mono{font-family:var(--font-mono);font-feature-settings:'liga' 0}
 .btn-ghost{background:transparent;color:var(--foreground);border-color:var(--border)}
 .btn-ghost:hover{background:var(--muted)}
 .btn-ghost:active{background:color-mix(in oklch,var(--muted) 70%,var(--border))}
+.btn.mono{font-family:var(--font-mono);font-size:.85rem;letter-spacing:0}
 
 /* nav */
 .nav{position:sticky;top:0;z-index:40;backdrop-filter:saturate(1.4) blur(10px);
@@ -234,7 +236,7 @@ function navHtml(active: 'landing' | 'report'): string {
     ${links}
     <div class="nav-cta">
       <a class="btn btn-ghost" href="https://github.com/dot-do/api.qa">GitHub</a>
-      <a class="btn btn-primary" href="/self">Grade an API</a>
+      <a class="btn btn-primary mono" href="/self">curl api.qa/{domain}</a>
     </div>
   </div></header>`
 }
@@ -254,7 +256,7 @@ function footHtml(): string {
       <a href="/icp.json">icp.json</a><a href="/openapi.json">openapi.json</a>
     </div>
     <div class="foot-col"><h4>Verify</h4>
-      <a href="/self">/self &middot; api.qa grades itself</a><a href="/offers/attested-run">Attested run</a>
+      <a href="/self">/self &middot; dogfooding: api.qa under its own checks</a><a href="/offers/attested-run">Attested run</a>
       <a href="https://github.com/dot-do/api.qa">Source</a>
     </div>
   </div>
@@ -273,19 +275,19 @@ const AX_ITEMS: Array<[string, string]> = [
   ['Content negotiation', 'curl gets markdown, browser gets HTML'],
   ['OpenAPI', 'machine-readable contract published'],
   ['MCP', 'interface declared with transport + tools'],
-  ['Keyless flow', 'a declared endpoint answers 2xx with no key'],
-  ['402 offers', 'payment boundaries are structured offers'],
+  ['Keyless flow', 'keyless first value — a No-ask Zone endpoint answers 2xx with no key'],
+  ['402 offers', 'payment boundaries are structured, hard-ceiling 402 offers'],
   ['Linkset', 'surfaces cross-reference each other'],
   ['Attestation', 'identity / attestation ladder declared'],
 ]
 
 const FEATURES: Array<[string, string]> = [
   ['Derived at run time', 'Checks are computed from the target’s own published surfaces: llms.txt, agents.json, icp.json, OpenAPI, MCP, 402 offers. There are zero repo-local test files to rewrite until green.'],
-  ['Pinned-digest gate', 'Acceptance names a sha256 digest, not a file path. Supply a spec that does not hash to the expected digest and the run refuses before a single probe fires. The pin lives with the orchestrator, not the workers.'],
+  ['Ratified-digest gate', 'Acceptance names a ratified sha256 digest, not a file path. If the spec text doesn’t hash to the pin, nothing runs — the verifier refuses before a single probe fires. The pin lives with the orchestrator, not the workers.'],
   ['Held-out signing key', 'Attested verdicts are Ed25519-signed by a key that lives only as a deploy secret. A fleet that owns the code still cannot mint attested history. Local runs are advisory and unsigned by construction.'],
-  ['Deterministic + replayable', 'A verdict is a pure function of published contracts, observed behavior, pinned digest, seed, and verifier version. The evidence bundle is embedded, so anyone can re-judge it offline and confirm the grade reproduces.'],
+  ['Deterministic + replayable', 'A verdict is a pure function of published contracts, observed behavior, ratified digest, seed, and verifier version. The evidence bundle is embedded, so anyone can re-judge it offline and confirm the grade reproduces.'],
   ['Seeded, no flake-mining', 'Endpoint sampling is seeded fresh per run and recorded in the report. Overfitting to one run’s probes fails the next, and the same evidence cannot re-judge to a different verdict.'],
-  ['Honesty caps the grade', 'Two non-scoring checks, schema-conformance and claims-honesty, cap the grade at C when a surface lies. A lying surface scores worse than a missing one.'],
+  ['Honesty caps the grade', 'Two non-scoring checks, schema-conformance and claims-honesty, cap the grade at C when a surface lies. A faked 200 where a typed BLOCKED/EMPTY belongs scores worse than a missing surface.'],
 ]
 
 const PRICING: Array<{ name: string; price: string; note: string; features: string[]; cta: string; href: string; featured?: boolean }> = [
@@ -293,16 +295,16 @@ const PRICING: Array<{ name: string; price: string; note: string; features: stri
     name: 'Public grade',
     price: '$0',
     note: 'keyless, forever',
-    features: ['GET api.qa/{domain}: grade + AX score', 'Per-check verdicts and the punch list', 'Advisory local runs: npx autonomous-qa', 'No signup, no key'],
-    cta: 'Grade an API',
-    href: '/self',
+    features: ['GET api.qa/{domain}: grade + AX score', 'Per-check verdicts and the punch list', 'Advisory local runs: npx autonomous-qa', 'Keyless first value — no signup, no key'],
+    cta: 'curl api.qa/example.com',
+    href: '/example.com',
   },
   {
     name: 'Attested run',
     price: '$5',
     note: 'one-time, per run',
-    features: ['On-demand, Ed25519-signed verdict', 'Embedded evidence bundle, replayable offline', 'Portable proof URL that survives a handover', 'Settled as a 402 offer'],
-    cta: 'Get attested',
+    features: ['On-demand, Ed25519-signed verdict', 'Embedded evidence bundle, replayable offline', 'Portable proof URL that survives a handover', 'Settled as a hard-ceiling 402 offer'],
+    cta: 'curl api.qa/offers/attested-run',
     href: '/offers/attested-run',
     featured: true,
   },
@@ -310,8 +312,8 @@ const PRICING: Array<{ name: string; price: string; note: string; features: stri
     name: 'CI webhook',
     price: '$20',
     note: 'per month',
-    features: ['Re-verify on every deploy', 'Freshness gate against time-shifted state', 'Reverify-as-a-subscription', 'Grade timeline + badge (roadmap)'],
-    cta: 'Subscribe',
+    features: ['Re-verify on every deploy', 'Freshness gate against time-shifted state', 'Reverify-as-a-subscription', 'Grade timeline + badge'],
+    cta: 'curl api.qa/offers/attested-run',
     href: '/offers/attested-run',
   },
 ]
@@ -333,20 +335,9 @@ function landingCss(): string {
 .hero h1 .hl{color:var(--primary)}
 .hero .lede{margin-top:1.15rem;max-width:34rem;font-size:1.12rem}
 .hero-actions{display:flex;flex-wrap:wrap;gap:.75rem;margin-top:1.6rem}
-.grade-bar{margin-top:1.9rem;display:flex;align-items:stretch;max-width:33rem;
-  border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);background:var(--card);
-  box-shadow:var(--shadow-md);overflow:hidden}
-.grade-bar:focus-within{border-color:var(--ring);
-  box-shadow:0 0 0 3px color-mix(in oklch,var(--ring) 20%,transparent),var(--shadow-md)}
-.grade-bar .pfx{display:flex;align-items:center;padding:0 .3rem 0 .9rem;color:var(--muted-foreground);font-family:var(--font-mono);font-size:.92rem}
-.grade-bar input{flex:1;border:0;background:transparent;color:var(--foreground);font-family:var(--font-mono);
-  font-size:.95rem;padding:.85rem .4rem;outline:none;min-width:0}
-.grade-bar input::placeholder{color:var(--muted-foreground);opacity:.7}
-.grade-bar button{border:0;margin:.35rem;border-radius:calc(var(--radius) - .2rem);background:var(--primary);
-  color:var(--primary-foreground);font-weight:600;padding:0 1.1rem;cursor:pointer;font-size:.9rem;
-  transition:filter .15s}
-.grade-bar button:hover{filter:brightness(1.06)}
-.grade-bar button:active{filter:brightness(.96)}
+.hero-cmd{margin-top:1.9rem;max-width:38rem;box-shadow:var(--shadow-md);
+  border:1px solid color-mix(in oklch,var(--code-fg) 12%,var(--code-bg))}
+.hero-cmd .tok-c{user-select:none}
 .trust{margin-top:1.7rem;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.4rem;color:var(--muted-foreground);font-size:.82rem}
 .trust span{display:inline-flex;align-items:center;gap:.4rem}
 .trust .dot{width:5px;height:5px;border-radius:99px;background:var(--pass)}
@@ -448,12 +439,11 @@ export function landingHtml(): string {
   const jsonLd = {
     '@context': 'https://schema.org',
     '@graph': [
-      { '@type': 'WebSite', name: 'api.qa', url: 'https://api.qa', description: 'External third-party verifier for agent-first APIs.' },
+      { '@type': 'WebSite', name: 'api.qa', url: 'https://api.qa', description: `External third-party verifier for agent-first APIs — ${JUDGED}.` },
       {
         '@type': 'DefinedTerm',
         name: 'Agent eXperience (AX)',
-        description:
-          'The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless trial flows, structured payment offers, and attestable behavior. Successor term to Developer Experience (DX).',
+        description: `${TAGLINE} The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless first value, hard-ceiling 402 offers, and attestable behavior. Made normative by ${AXP_ANCHOR}.`,
         inDefinedTermSet: { '@type': 'DefinedTermSet', name: 'api.qa AX score', url: 'https://api.qa' },
       },
     ],
@@ -464,18 +454,16 @@ export function landingHtml(): string {
 
   const hero = `<section class="hero"><div class="wrap hero-grid">
     <div>
-      <a class="announce" href="/llms.txt"><b>NEW</b> SSL Labs, but for how well an API works for agents</a>
-      <h1>Green because it <span class="hl">works</span>, not because it gamed the test</h1>
-      <p class="lede">api.qa/{domain} returns a letter grade (A+ to F) and a 10-point AX score computed only from a target’s own published machine surfaces. The verdict is deterministic, replayable, and Ed25519-signed, and a fleet optimizing for it cannot edit the tests, pin a friendlier spec, or forge a report.</p>
-      <form class="grade-bar" onsubmit="return gradeGo(event)">
-        <span class="pfx">api.qa/</span>
-        <input id="g" name="g" placeholder="your-api.com" autocomplete="off" spellcheck="false" aria-label="domain to grade">
-        <button type="submit">Grade &rarr;</button>
-      </form>
+      <a class="announce" href="https://apis.ax/axp"><b>Thesis</b> ${esc(TAGLINE)}</a>
+      <h1>An agent won’t integrate an API it can’t <span class="hl">trust</span></h1>
+      <p class="lede">And a principal can’t prove their API works for agents by asserting it — assertions are exactly what Goodharted fleets produce. api.qa is the proof mechanism of the agent-first arc: the external, third-party verifier that grades a surface from its own published contracts, held outside the building fleet’s write access — every grade here is ${JUDGED}. Verdicts are deterministic, Ed25519-attested, replayable, and bind to a ratified digest.</p>
+      <pre class="code hero-cmd"><span class="tok-k">curl</span> https://api.qa/example.com  <span class="tok-c"># public grade page, as markdown</span>
+<span class="tok-k">npx</span> autonomous-qa example.com   <span class="tok-c"># same verifier core, locally (advisory)</span>
+<span class="tok-k">npx</span> autonomous-qa mcp           <span class="tok-c"># MCP: verify_domain, discover_domain, verify_pinned_spec</span></pre>
       <div class="trust">
+        <span><i class="dot"></i> ${JUDGED}</span>
         <span><i class="dot"></i> deterministic, seeded, replayable</span>
-        <span><i class="dot"></i> self-grades 10/10 A+</span>
-        <span><i class="dot"></i> keyless, no signup</span>
+        <span><i class="dot"></i> keyless first value — zero-shot, no signup</span>
       </div>
     </div>
     <aside class="cred" aria-label="sample verdict">
@@ -493,9 +481,9 @@ export function landingHtml(): string {
   </div></section>`
 
   const invariant = `<section class="invariant"><div class="wrap">
-    <div class="eyebrow">The core invariant</div>
-    <p class="q" style="margin-top:1rem">A verdict is a pure function of published contracts, observed behavior, a pinned spec digest, a seed, and the verifier version. <em>None of those five inputs is yours to write.</em></p>
-    <p class="sub">The fleet can change its behavior and its published contracts, but changing either changes the evidence digest, visibly, in the attested report. Goodhart is the adversary, and every mechanism below exists because of a specific attack on it.</p>
+    <div class="eyebrow">The villain &middot; the core invariant</div>
+    <p class="q" style="margin-top:1rem">A verdict is a pure function of published contracts, observed behavior, a ratified digest, a seed, and the verifier version. <em>None of those five inputs is yours to write.</em></p>
+    <p class="sub">The villain is ${esc(VILLAIN)}. api.qa fights the honesty front of that war: a surface that lies to machines scores worse than one that is missing, and a fleet that would rather game the grade than fix the product finds the tests held outside its write access.</p>
   </div></section>`
 
   const features = `<section class="section" id="how"><div class="wrap">
@@ -513,7 +501,7 @@ export function landingHtml(): string {
     <div class="center">
       <div class="eyebrow">The AX score</div>
       <h2 style="margin-top:.6rem">Ten binary checks. One letter grade.</h2>
-      <p class="lede" style="margin-top:.8rem">Each item is derived from the target’s own published surfaces and scored 0 or 1. Two honesty checks sit outside the score and cap the grade when a surface lies.</p>
+      <p class="lede" style="margin-top:.8rem">Ten checks over the machine surfaces made normative by AXP — the Agent eXperience Protocol (<a href="https://apis.ax/axp" style="color:var(--primary)">https://apis.ax/axp</a>). Each item is derived from the target’s own published surfaces and scored 0 or 1. Two honesty checks sit outside the score and cap the grade when a surface lies.</p>
     </div>
     <div class="checklist">
       ${AX_ITEMS.map(([name, desc], i) => `<div class="ck-row"><div class="num">${i + 1}</div><div><span class="name">${esc(name)}</span> <span class="desc">${esc(desc)}</span></div><div class="check pill pass">scores</div></div>`).join('')}
@@ -529,20 +517,20 @@ export function landingHtml(): string {
     <div class="tracks">
       <div class="track">
         <span class="tag">B2A &middot; the agent</span>
-        <h3>Read the grade, act on it</h3>
+        <h3>Zero-shot: read the grade, act on it</h3>
         <ol>
-          <li><b>Read.</b> <code>GET api.qa/{domain}</code> returns the grade, AX score, per-check FAILs (the punch list), and the evidence bundle.</li>
-          <li><b>Act.</b> Fix the named FAILs, or use another target’s grade to decide whether to integrate.</li>
-          <li><b>Carry the proof.</b> An attested report URL is portable evidence any third party can re-judge offline.</li>
+          <li><b><code>curl https://api.qa/{domain}</code></b> — grade, AX score, per-check FAILs (the punch list), and the evidence bundle. Keyless first value: no key, no account.</li>
+          <li><b>Integrate on the verdict.</b> A Listing admitted to the catalog is conformant by admission — ${JUDGED} — so skip re-vetting. Call: keyless first value, then pay by 402 inside your ceiling.</li>
+          <li><b><code>curl -H 'accept: application/json' api.qa/{domain} | npx autonomous-qa rejudge</code></b> — carry the proof; any third party can re-judge it offline.</li>
         </ol>
       </div>
       <div class="track">
         <span class="tag">B2A2D &middot; the fleet orchestrator</span>
         <h3>An acceptance gate the workers cannot touch</h3>
         <ol>
-          <li><b>Ratify + pin.</b> Write the golden scenario as a PinnedSpec; mint its sha256 digest once. The digest lives with you, never in the workers’ repos.</li>
-          <li><b>Hill-climb locally.</b> Workers loop <code>npx autonomous-qa verify</code> against the pin (advisory, unsigned, fine inside the loop).</li>
-          <li><b>Accept on the held-out verifier.</b> Done means <code>POST /verify</code> returns <code>passed:true</code> from a service the fleet has no write access to.</li>
+          <li><b>Ratify + pin.</b> <code>npx autonomous-qa spec-digest golden-scenario.spec.json</code> — mint the pin once. The ratified digest lives with you, never in the workers’ repos.</li>
+          <li><b>Hill-climb locally.</b> <code>npx autonomous-qa verify http://localhost:8787 --spec golden-scenario.spec.json --expect-digest &lt;pin&gt;</code> — loop until exit 0. Advisory; local runs never sign.</li>
+          <li><b>Accept on the held-out verifier.</b> Done is <code>${esc(ADMISSION)}</code> — <code>POST /verify</code> from a service the fleet has no write access to.</li>
         </ol>
       </div>
     </div>
@@ -552,7 +540,7 @@ export function landingHtml(): string {
     <div class="center">
       <div class="eyebrow">Pricing</div>
       <h2 style="margin-top:.6rem">Public verification is free. You pay for durable evidence.</h2>
-      <p class="lede" style="margin-top:.8rem">Keyless grade pages stay free forever, that is the point. Money enters at the boundaries, as structured 402 offers an agent can settle.</p>
+      <p class="lede" style="margin-top:.8rem">The public grade runs unauthenticated — keyless first value, because a gate on the free grade would contradict the whole thesis, and the free path never 401/402s. Money enters only at the boundaries, as machine-settleable, hard-ceiling 402 offers per AXP’s payment clause: api.qa dogfoods the protocol it grades.</p>
     </div>
     <div class="price-grid">
       ${PRICING.map(
@@ -560,31 +548,29 @@ export function landingHtml(): string {
         <h3>${esc(t.name)}</h3>
         <div class="amt">${esc(t.price)} <small>${esc(t.note)}</small></div>
         <ul>${t.features.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-        <a class="btn ${t.featured ? 'btn-primary' : 'btn-ghost'}" href="${t.href}">${esc(t.cta)}</a>
+        <a class="btn mono ${t.featured ? 'btn-primary' : 'btn-ghost'}" href="${t.href}">${esc(t.cta)}</a>
       </div>`,
       ).join('')}
     </div>
   </div></section>`
 
   const ctaFinal = `<section class="section"><div class="wrap"><div class="cta-final">
-    <div class="eyebrow">The proof URL is the atomic unit</div>
+    <div class="eyebrow">The stakes</div>
     <h2 style="margin-top:.7rem">Attack the product, not the verifier</h2>
-    <p class="lede center" style="margin-top:.9rem">A fleet whose reward is api.qa-green will attack the test before it fixes the product. So we built the one grade it cannot game.</p>
-    <div class="hero-actions" style="justify-content:center;margin-top:1.7rem">
-      <a class="btn btn-primary" href="/self">See api.qa grade api.qa &rarr;</a>
-      <a class="btn btn-ghost" href="/llms.txt">Read the design</a>
+    <p class="lede center" style="margin-top:.9rem">Fail, and the agent-first web routes around you: to agents you are invisible, to wallets you are unbounded risk. Pass, and you are zero-shot transactable — an agent that has never seen you discovers, understands, and pays you on first contact — and your Listing is admitted to the catalog, ${JUDGED}. Admission is <code>${esc(ADMISSION)}</code>.</p>
+    <pre class="code" style="display:inline-block;text-align:left;margin-top:1.7rem"><span class="tok-k">curl</span> https://api.qa/your-api.com</pre>
+    <div class="hero-actions" style="justify-content:center;margin-top:1.2rem">
+      <a class="btn btn-ghost" href="/self">/self &middot; dogfooding: api.qa under its own checks, 10/10</a>
+      <a class="btn btn-ghost" href="/llms.txt">/llms.txt &middot; the design</a>
     </div>
   </div></div></section>`
 
-  const script = `function gradeGo(e){e.preventDefault();var v=document.getElementById('g').value.trim().replace(/^https?:\\/\\//,'').replace(/\\/.*$/,'');if(v){location.href='/'+encodeURIComponent(v)}return false}`
-
   return shell({
     title: 'api.qa · the verifier your fleet cannot edit',
-    description: 'An independent, deterministic, Ed25519-signed verdict on whether an agent-first API works as described. A grade your fleet cannot game.',
+    description: `The external third-party verifier for agent-first APIs — ${JUDGED}. Deterministic, Ed25519-signed verdicts that bind to a ratified digest.`,
     jsonLd,
     extraCss: landingCss(),
     body: navHtml('landing') + hero + invariant + features + checklist + tracks + pricing + ctaFinal + footHtml(),
-    script,
   })
 }
 
@@ -788,7 +774,7 @@ curl -H <span class="tok-k">'accept: application/json'</span> https://api.qa/${e
 
   return shell({
     title: `api.qa/${host} · Grade ${r.grade}`,
-    description: `${host} scored ${r.grade} (AX ${r.axScore.points}/10) on api.qa, the external verifier for agent-first APIs. ${r.attested ? 'Ed25519-attested' : 'Advisory'} verdict.`,
+    description: `${host} scored ${r.grade} (AX ${r.axScore.points}/10) on api.qa, the external verifier for agent-first APIs — ${JUDGED}. ${r.attested ? 'Ed25519-attested' : 'Advisory'} verdict.`,
     jsonLd,
     extraCss: reportCss(),
     body: navHtml('report') + hero + notes + axTable + details + att + repro + footHtml(),
