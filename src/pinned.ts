@@ -20,13 +20,21 @@
  */
 
 import { Observer, normalizeTarget, type ObserverOpts } from './http.js'
-import { observeTarget } from './discovery.js'
+import { observeTarget, ROLE, parseAgentsJson, parseJsonBody, parseOpenapi } from './discovery.js'
 import { runChecks } from './checks.js'
 import { axScoreOf } from './grade.js'
 import { sha256Hex } from './digest.js'
 import { validateSchema, readPath } from './schema.js'
 import { VERIFIER_VERSION } from './verify.js'
-import type { CheckResult, EvidenceBundle, PinnedSpec, Verdict } from './types.js'
+import type {
+  CheckResult,
+  EndpointExpect,
+  Evidence,
+  EvidenceBundle,
+  PinnedRequirement,
+  PinnedSpec,
+  Verdict,
+} from './types.js'
 
 export interface PinnedReport {
   $type: 'PinnedVerificationReport'
@@ -95,6 +103,81 @@ export async function verifyPinnedSpec(
       })
     }
   }
+
+  // Probe requirements resolve against the TARGET's own card-declared probe
+  // manifest (`probes.<channel>`), never against spec-hardcoded routes. The
+  // manifest is adversarial input: entries that are not same-origin GETs are
+  // refused WITHOUT fetching, and any unresolvable requirement fails closed —
+  // never skips. Two phases, so a derived amount (paramValue.fromProbe) can
+  // read a number out of a phase-1 observation: the verifier, not the
+  // manifest, owns the over-ceiling amount.
+  const card = parseAgentsJson(
+    parseJsonBody(observer.items.find((e) => e.role === ROLE.agentsJson)),
+    origin,
+  )
+  const probePlans = new Map<string, ProbePlan>()
+  const probeReqs = spec.requirements.filter(
+    (r): r is Extract<PinnedRequirement, { kind: 'probe' }> => r.kind === 'probe',
+  )
+  const phase1 = probeReqs.filter((r) => r.paramValue === undefined || typeof r.paramValue === 'number')
+  const phase2 = probeReqs.filter((r) => typeof r.paramValue === 'object' && r.paramValue !== null)
+  for (const req of [...phase1, ...phase2]) {
+    const plan: ProbePlan = {
+      declared: dedupeByUrl(card.probes?.[req.probe] ?? []),
+      entryProblems: new Map(),
+      finalUrls: new Map(),
+    }
+    probePlans.set(req.id, plan)
+    const min = req.minDeclared ?? 1
+    if (plan.declared.length < min) {
+      plan.unresolved =
+        `probe manifest declares ${plan.declared.length} distinct probe(s) under "probes.${req.probe}"; ` +
+        `the pinned contract requires at least ${min} — failing closed`
+      continue
+    }
+    for (let i = 0; i < plan.declared.length; i++) {
+      const entry = plan.declared[i]!
+      let entryOrigin: string | undefined
+      try { entryOrigin = new URL(entry.url).origin } catch { /* unparseable → refused below */ }
+      if (entryOrigin !== origin || entry.method !== 'GET') {
+        // Refused WITHOUT fetching — a manifest cannot steer the verifier off-origin.
+        plan.entryProblems.set(i, `probe url ${entry.url} is not a same-origin GET — refused, fail closed`)
+        continue
+      }
+      let url = entry.url
+      if (req.paramValue !== undefined) {
+        let amount: number
+        if (typeof req.paramValue === 'number') {
+          amount = req.paramValue
+        } else {
+          const { fromProbe, path, multiply } = req.paramValue
+          const srcReq = phase1.find((r) => r.probe === fromProbe)
+          const srcEv = srcReq
+            ? observer.items.find((e) => e.role === `pinned:${srcReq.id}:0`)
+            : undefined
+          let srcBody: unknown
+          try { srcBody = JSON.parse(srcEv?.body ?? '') } catch { /* non-JSON → unresolved below */ }
+          const r = readPath(srcBody, path)
+          if (!r.found || typeof r.value !== 'number') {
+            plan.unresolved = `probes.${fromProbe} yielded no numeric ${path} — cannot derive amount, failing closed`
+            break
+          }
+          amount = r.value * (multiply ?? 1)
+        }
+        if (typeof entry.param !== 'string' || entry.param.length === 0) {
+          plan.unresolved =
+            `probes.${req.probe} entry ${entry.url} declares no "param" member — ` +
+            'cannot set the verifier-owned amount, failing closed'
+          break
+        }
+        const u = new URL(url)
+        u.searchParams.set(entry.param, String(amount))
+        url = u.toString()
+      }
+      plan.finalUrls.set(i, url)
+      await observer.observe(`pinned:${req.id}:${i}`, url, { accept: 'application/json' })
+    }
+  }
   const fullBundle: EvidenceBundle = { ...bundle, items: observer.items }
 
   // Judge (pure over the bundle).
@@ -106,10 +189,26 @@ export async function verifyPinnedSpec(
     if (req.kind === 'surface') {
       const idMap = { 'llms.txt': 'llms-txt', 'agents.json': 'agents-json', 'icp.json': 'icp-json', openapi: 'openapi' } as const
       const base = surfaceChecks.find((c) => c.id === idMap[req.surface])
+      // Pinned tightening for the openapi surface: the spec may pin the
+      // declared version prefix (e.g. "3.1") and a minimum operation count —
+      // a generic "parses" verdict is not the same as "is the pinned contract".
+      const extras: string[] = []
+      if (req.surface === 'openapi' && base?.verdict === 'pass' &&
+          (req.versionPrefix !== undefined || req.minOperations !== undefined)) {
+        const summary = parseOpenapi(parseJsonBody(fullBundle.items.find((e) => e.role === ROLE.openapi)))
+        if (req.versionPrefix !== undefined && !(summary.version ?? '').startsWith(req.versionPrefix)) {
+          extras.push(`declared spec version ${summary.version === undefined ? '(none)' : `"${summary.version}"`} does not begin with "${req.versionPrefix}"`)
+        }
+        if (req.minOperations !== undefined && summary.operationCount < req.minOperations) {
+          extras.push(`declares ${summary.operationCount} operation(s); the pinned contract requires at least ${req.minOperations}`)
+        }
+      }
+      const verdict: Verdict = base?.verdict === 'pass' && extras.length === 0 ? 'pass' : 'fail'
       results.push({
         id: req.id, title: `surface ${req.surface} must be ${req.must}`,
-        verdict: base?.verdict === 'pass' ? 'pass' : 'fail',
-        detail: base?.detail ?? 'surface not judged', evidence: base?.evidence ?? [],
+        verdict,
+        detail: extras.length > 0 ? extras.join('; ') : base?.detail ?? 'surface not judged',
+        evidence: base?.evidence ?? [],
       })
     } else if (req.kind === 'ax-floor') {
       results.push({
@@ -132,56 +231,66 @@ export async function verifyPinnedSpec(
               : `check ${req.check} verdict '${c.verdict}' (must be 'pass'): ${c.detail}`,
         evidence: c?.evidence ?? [],
       })
-    } else {
+    } else if (req.kind === 'endpoint') {
       const ev = fullBundle.items.find((e) => e.role === `pinned:${req.id}`)
-      const problems: string[] = []
-      if (!ev || ev.status === null) problems.push(`fetch failed (${ev?.error ?? 'not observed'})`)
-      else {
-        const wanted = req.expect.status === undefined ? [200] : Array.isArray(req.expect.status) ? req.expect.status : [req.expect.status]
-        if (!wanted.includes(ev.status)) problems.push(`status ${ev.status}, wanted ${wanted.join('|')}`)
-        if (req.expect.contentTypeIncludes && !(ev.contentType ?? '').includes(req.expect.contentTypeIncludes)) {
-          problems.push(`content-type ${ev.contentType}, wanted *${req.expect.contentTypeIncludes}*`)
-        }
-        if (req.expect.schema || req.expect.paths) {
-          let body: unknown
-          try { body = JSON.parse(ev.body ?? '') } catch { problems.push('body is not JSON') }
-          if (body !== undefined) {
-            if (req.expect.schema) {
-              for (const v of validateSchema(body, req.expect.schema)) problems.push(`${v.path} ${v.message}`)
-            }
-            for (const p of req.expect.paths ?? []) {
-              const r = readPath(body, p.path)
-              if (p.exists !== undefined && r.found !== p.exists) problems.push(`path ${p.path} ${p.exists ? 'missing' : 'unexpectedly present'}`)
-              if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
-                problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
-              }
-              // Numeric comparators — the pinned floor/ceiling. A comparator on a
-              // path that is absent or non-numeric is itself a failure (the target
-              // did not report the number the contract measures).
-              const comparators: Array<[keyof typeof p, string, (a: number, b: number) => boolean]> = [
-                ['gte', '>=', (a, b) => a >= b],
-                ['lte', '<=', (a, b) => a <= b],
-                ['gt', '>', (a, b) => a > b],
-                ['lt', '<', (a, b) => a < b],
-              ]
-              for (const [key, sym, cmp] of comparators) {
-                const bound = p[key] as number | undefined
-                if (bound === undefined) continue
-                if (!r.found || typeof r.value !== 'number') {
-                  problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted a number ${sym} ${bound}`)
-                } else if (!cmp(r.value, bound)) {
-                  problems.push(`path ${p.path} = ${r.value}, wanted ${sym} ${bound}`)
-                }
-              }
-            }
-          }
-        }
-      }
+      const problems = judgeExpect(ev, req.expect)
       const verdict: Verdict = problems.length === 0 ? 'pass' : 'fail'
       results.push({
         id: req.id, title: `${req.method} ${req.path}`, verdict,
         detail: verdict === 'pass' ? 'behaved as pinned' : problems.join('; '),
         evidence: [`pinned:${req.id}`],
+      })
+    } else if (req.kind === 'probe') {
+      const plan = probePlans.get(req.id)!
+      if (plan.unresolved !== undefined) {
+        results.push({
+          id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
+          detail: plan.unresolved, evidence: [ROLE.agentsJson],
+        })
+      } else {
+        const problems: string[] = []
+        const evidence: string[] = []
+        plan.declared.forEach((entry, i) => {
+          const refused = plan.entryProblems.get(i)
+          if (refused !== undefined) {
+            problems.push(`#${i} ${entry.url}: ${refused}`)
+            return
+          }
+          const role = `pinned:${req.id}:${i}`
+          evidence.push(role)
+          const ev = fullBundle.items.find((e) => e.role === role)
+          const ps = judgeExpect(ev, req.expect)
+          // Anti-decoy rule: the probed pathname must also have answered a
+          // 200 `OK` envelope somewhere in this same run — a path that can
+          // only ever say EMPTY/BLOCKED is a dedicated decoy, not a branch.
+          if (req.pathMustServeOk === true) {
+            const finalUrl = plan.finalUrls.get(i) ?? entry.url
+            let pathname: string | undefined
+            try { pathname = new URL(finalUrl).pathname } catch { /* unparseable → fails below */ }
+            if (pathname === undefined || !okPathnamesOf(fullBundle).has(pathname)) {
+              ps.push(`pathname ${pathname ?? finalUrl} was never observed answering 200 with an "OK" envelope in this run — the probe path does not demonstrably branch on its query (decoy endpoint)`)
+            }
+          }
+          if (ps.length > 0) problems.push(`#${i} ${plan.finalUrls.get(i) ?? entry.url}: ${ps.join('; ')}`)
+        })
+        const verdict: Verdict = problems.length === 0 ? 'pass' : 'fail'
+        results.push({
+          id: req.id,
+          title: `probe ${req.probe} (${plan.declared.length} declared)`,
+          verdict,
+          detail: verdict === 'pass' ? 'every declared probe behaved as pinned' : problems.join('; '),
+          evidence,
+        })
+      }
+    } else {
+      // A spec kind this verifier does not implement must fail LOUDLY: a
+      // silent pass (or skip) would let a newer contract vacuously clear.
+      results.push({
+        id: (req as { id: string }).id ?? 'unknown',
+        title: 'unknown requirement kind',
+        verdict: 'fail',
+        detail: `unknown requirement kind "${(req as { kind?: string }).kind}" — verifier too old for this spec`,
+        evidence: [],
       })
     }
   }
@@ -200,4 +309,109 @@ export async function verifyPinnedSpec(
     evidence: fullBundle,
     attested: false,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Probe-requirement plumbing
+// ---------------------------------------------------------------------------
+
+interface ProbeEntry {
+  method: string
+  url: string
+  param?: string
+}
+
+/** Per-requirement resolution of the card-declared probe manifest. */
+interface ProbePlan {
+  /** Declared entries for the channel, deduped by full URL. */
+  declared: ProbeEntry[]
+  /** Fail-closed reason that dooms the whole requirement (never a skip). */
+  unresolved?: string
+  /** Per-entry refusals (non-same-origin / non-GET) — never fetched. */
+  entryProblems: Map<number, string>
+  /** Final URLs actually observed (after verifier-owned param injection). */
+  finalUrls: Map<number, string>
+}
+
+function dedupeByUrl(entries: ProbeEntry[]): ProbeEntry[] {
+  // Distinctness keys on the FETCHED identity: fragments never reach the
+  // wire, so `/e?a=1` and `/e?a=1#dup` are the same probe, not two.
+  const key = (raw: string) => {
+    try { const u = new URL(raw); u.hash = ''; return u.toString() } catch { return raw }
+  }
+  return [...new Map(entries.map((p) => [key(p.url), p])).values()]
+}
+
+/**
+ * Pathnames observed answering HTTP 200 with a top-level `type: "OK"` JSON
+ * envelope anywhere in the run. Memoized per bundle — the set backs the
+ * `pathMustServeOk` anti-decoy rule.
+ */
+const okPathnamesCache = new WeakMap<EvidenceBundle, Set<string>>()
+function okPathnamesOf(bundle: EvidenceBundle): Set<string> {
+  const cached = okPathnamesCache.get(bundle)
+  if (cached) return cached
+  const out = new Set<string>()
+  for (const ev of bundle.items) {
+    if (ev.status !== 200) continue
+    let body: unknown
+    try { body = JSON.parse(ev.body ?? '') } catch { continue }
+    if (!body || typeof body !== 'object' || (body as Record<string, unknown>).type !== 'OK') continue
+    try { out.add(new URL(ev.url).pathname) } catch { /* unparseable url contributes nothing */ }
+  }
+  okPathnamesCache.set(bundle, out)
+  return out
+}
+
+/**
+ * Judge one observed exchange against an expectation block. Pure; returns the
+ * list of problems (empty = conforms). Shared by `endpoint` and `probe`
+ * requirement kinds.
+ */
+function judgeExpect(ev: Evidence | undefined, expect: EndpointExpect): string[] {
+  const problems: string[] = []
+  if (!ev || ev.status === null) {
+    problems.push(`fetch failed (${ev?.error ?? 'not observed'})`)
+    return problems
+  }
+  const wanted = expect.status === undefined ? [200] : Array.isArray(expect.status) ? expect.status : [expect.status]
+  if (!wanted.includes(ev.status)) problems.push(`status ${ev.status}, wanted ${wanted.join('|')}`)
+  if (expect.contentTypeIncludes && !(ev.contentType ?? '').includes(expect.contentTypeIncludes)) {
+    problems.push(`content-type ${ev.contentType}, wanted *${expect.contentTypeIncludes}*`)
+  }
+  if (expect.schema || expect.paths) {
+    let body: unknown
+    try { body = JSON.parse(ev.body ?? '') } catch { problems.push('body is not JSON') }
+    if (body !== undefined) {
+      if (expect.schema) {
+        for (const v of validateSchema(body, expect.schema)) problems.push(`${v.path} ${v.message}`)
+      }
+      for (const p of expect.paths ?? []) {
+        const r = readPath(body, p.path)
+        if (p.exists !== undefined && r.found !== p.exists) problems.push(`path ${p.path} ${p.exists ? 'missing' : 'unexpectedly present'}`)
+        if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
+          problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
+        }
+        // Numeric comparators — the pinned floor/ceiling. A comparator on a
+        // path that is absent or non-numeric is itself a failure (the target
+        // did not report the number the contract measures).
+        const comparators: Array<[keyof typeof p, string, (a: number, b: number) => boolean]> = [
+          ['gte', '>=', (a, b) => a >= b],
+          ['lte', '<=', (a, b) => a <= b],
+          ['gt', '>', (a, b) => a > b],
+          ['lt', '<', (a, b) => a < b],
+        ]
+        for (const [key, sym, cmp] of comparators) {
+          const bound = p[key] as number | undefined
+          if (bound === undefined) continue
+          if (!r.found || typeof r.value !== 'number') {
+            problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted a number ${sym} ${bound}`)
+          } else if (!cmp(r.value, bound)) {
+            problems.push(`path ${p.path} = ${r.value}, wanted ${sym} ${bound}`)
+          }
+        }
+      }
+    }
+  }
+  return problems
 }

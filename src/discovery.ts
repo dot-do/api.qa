@@ -51,13 +51,19 @@ export function parseJsonBody(ev: Evidence | undefined): unknown | undefined {
 // Claim parsers (pure)
 // ---------------------------------------------------------------------------
 
-interface AgentsClaims {
+export interface AgentsClaims {
   name?: string
   description?: string
   endpoints: ClaimedEndpoint[]
   mcp?: { transport?: string; command?: string; url?: string; tools?: string[] }
   offers?: Array<{ id?: string; title?: string; price?: unknown }>
   offerProbe?: { method: string; url: string }
+  /**
+   * Self-declared probe manifest (top-level `probes`): named channels of probe
+   * refs the target invites a pinned verifier to fire. Single objects
+   * normalize to one-element arrays; entries without a string `url` drop.
+   */
+  probes?: Record<string, Array<{ method: string; url: string; param?: string }>>
   attestation?: unknown
   openapiUrl?: string
 }
@@ -103,6 +109,24 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
     out.offerProbe = { method: str(probe.method) ?? 'GET', url: absolutize(probe.url, origin) }
   }
 
+  // Probe manifest — the card-declared channel a pinned verifier resolves
+  // `kind:'probe'` requirements against (mirrors the monetization.probe shape).
+  const probes = d.probes as Record<string, unknown> | undefined
+  if (probes && typeof probes === 'object' && !Array.isArray(probes)) {
+    const out2: NonNullable<AgentsClaims['probes']> = {}
+    for (const [key, value] of Object.entries(probes)) {
+      const refs = (Array.isArray(value) ? value : [value])
+        .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object' && typeof (r as Record<string, unknown>).url === 'string')
+        .map((r) => ({
+          method: (str(r.method) ?? 'GET').toUpperCase(),
+          url: absolutize(r.url as string, origin),
+          param: str(r.param),
+        }))
+      if (refs.length) out2[key] = refs
+    }
+    if (Object.keys(out2).length) out.probes = out2
+  }
+
   if (d.attestationLadder !== undefined) out.attestation = d.attestationLadder
   else if (d.attestation !== undefined) out.attestation = d.attestation
 
@@ -121,20 +145,33 @@ export interface OpenapiSummary {
   /** GET operations with no required parameters — keyless-probe candidates. */
   probeCandidates: Array<{ path: string; responseSchema?: MiniSchema }>
   pathCount: number
+  /** The declared spec version (`openapi:` or `swagger:` member), verbatim. */
+  version?: string
+  /** Count of HTTP operations (method keys) declared across all paths. */
+  operationCount: number
 }
 
+const HTTP_METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const
+
 export function parseOpenapi(doc: unknown): OpenapiSummary {
-  if (!doc || typeof doc !== 'object') return { valid: false, probeCandidates: [], pathCount: 0 }
+  if (!doc || typeof doc !== 'object') return { valid: false, probeCandidates: [], pathCount: 0, operationCount: 0 }
   const d = doc as Record<string, unknown>
   const version = str(d.openapi) ?? str(d.swagger)
   const paths = d.paths as Record<string, unknown> | undefined
   if (!version || !paths || typeof paths !== 'object') {
-    return { valid: false, probeCandidates: [], pathCount: 0 }
+    const out: OpenapiSummary = { valid: false, probeCandidates: [], pathCount: 0, operationCount: 0 }
+    if (version) out.version = version
+    return out
   }
   const candidates: OpenapiSummary['probeCandidates'] = []
+  let operationCount = 0
   for (const [path, item] of Object.entries(paths)) {
     if (!item || typeof item !== 'object') continue
-    const get = (item as Record<string, unknown>).get as Record<string, unknown> | undefined
+    const it = item as Record<string, unknown>
+    for (const m of HTTP_METHODS) {
+      if (it[m] && typeof it[m] === 'object') operationCount++
+    }
+    const get = it.get as Record<string, unknown> | undefined
     if (!get) continue
     if (path.includes('{')) continue // path params → not probeable without values
     const params = Array.isArray(get.parameters) ? (get.parameters as Array<Record<string, unknown>>) : []
@@ -142,7 +179,13 @@ export function parseOpenapi(doc: unknown): OpenapiSummary {
     if (get.security !== undefined && Array.isArray(get.security) && get.security.length > 0) continue
     candidates.push({ path, responseSchema: extractResponseSchema(get, d) })
   }
-  return { valid: true, probeCandidates: candidates.sort((a, b) => a.path.localeCompare(b.path)), pathCount: Object.keys(paths).length }
+  return {
+    valid: true,
+    version,
+    probeCandidates: candidates.sort((a, b) => a.path.localeCompare(b.path)),
+    pathCount: Object.keys(paths).length,
+    operationCount,
+  }
 }
 
 function extractResponseSchema(op: Record<string, unknown>, root: Record<string, unknown>): MiniSchema | undefined {
@@ -270,6 +313,7 @@ export async function deriveDiscovery(bundle: EvidenceBundle): Promise<Discovery
   if (agents.mcp) claims.mcp = agents.mcp
   if (agents.offers) claims.offers = agents.offers
   if (agents.offerProbe) claims.offerProbe = agents.offerProbe
+  if (agents.probes) claims.probes = agents.probes
   if (agents.attestation !== undefined) claims.attestation = agents.attestation
   if (agents.openapiUrl) claims.openapiUrl = agents.openapiUrl
 

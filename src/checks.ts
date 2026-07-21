@@ -179,6 +179,87 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
           : { verdict: 'fail', detail: `claimed but dead: ${lying.map((p) => `${p.url} → ${p.status}`).join(', ')}` }))
   }
 
+  // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
+  {
+    // The manifest is ADVERSARIAL input: a pinned standard that resolves its
+    // behavioral probes from the target's own card must first hold the card to
+    // the manifest rules — same-origin, GET-only, addressing only operations
+    // the contract itself publishes, required channels present and disjoint.
+    // Targets without a manifest SKIP (generic grading unaffected); a pinned
+    // `must:'pass'` requirement turns that skip into a fail-closed gate.
+    const manifest = agents.probes
+    if (!manifest) {
+      checks.push(check('probe-manifest', 'card-declared probe manifest is valid', undefined, [ROLE.agentsJson],
+        { verdict: 'skip', detail: 'no probe manifest declared (agents.json top-level `probes`) — nothing to validate' }))
+    } else {
+      const origin = bundle.target
+      const problems: string[] = []
+      // Paths the target's own contract declares — a probe may only address these.
+      const declaredPaths = new Set<string>()
+      const rawPaths = openapiDoc && typeof openapiDoc === 'object'
+        ? ((openapiDoc as Record<string, unknown>).paths as Record<string, unknown> | undefined)
+        : undefined
+      if (rawPaths && typeof rawPaths === 'object') {
+        for (const p of Object.keys(rawPaths)) if (!p.includes('{')) declaredPaths.add(p)
+      }
+      for (const e of agents.endpoints) {
+        try {
+          const u = new URL(e.url)
+          if (u.origin === origin) declaredPaths.add(u.pathname)
+        } catch { /* unparseable claimed url — contributes no declared path */ }
+      }
+
+      // Distinctness is judged on the FETCHED identity of the URL: fragments
+      // are stripped before requests, so `/e?a=1` and `/e?a=1#dup` are ONE
+      // probe, not two.
+      const urlKey = (raw: string) => {
+        try { const u = new URL(raw); u.hash = ''; return u.toString() } catch { return raw }
+      }
+      const dedupe = (a: Array<{ method: string; url: string; param?: string }>) =>
+        [...new Map(a.map((p) => [urlKey(p.url), p])).values()]
+      const required: Array<[string, number]> = [
+        ['keyless', 1], ['pricing', 1], ['overCeiling', 1], ['knownEmpty', 2], ['knownForbidden', 2],
+      ]
+      const deduped: Record<string, Array<{ method: string; url: string; param?: string }>> = {}
+      for (const [ch, entries] of Object.entries(manifest)) deduped[ch] = dedupe(entries)
+      for (const [ch, min] of required) {
+        const n = deduped[ch]?.length ?? 0
+        if (n < min) problems.push(`probes.${ch} declares ${n} distinct probe(s); at least ${min} required`)
+      }
+      for (const [ch, entries] of Object.entries(deduped)) {
+        for (const e of entries) {
+          let u: URL | undefined
+          try { u = new URL(e.url) } catch { /* fallthrough */ }
+          if (!u || u.origin !== origin) { problems.push(`probes.${ch} url ${e.url} is not same-origin with ${origin}`); continue }
+          if (e.method !== 'GET') problems.push(`probes.${ch} ${e.url} uses method ${e.method} — probe manifests are GET-only`)
+          if (!declaredPaths.has(u.pathname)) {
+            problems.push(`probes.${ch} path ${u.pathname} is not an operation declared in the OpenAPI contract or interfaces.http`)
+          }
+        }
+      }
+      const emptyUrls = new Set((deduped.knownEmpty ?? []).map((e) => urlKey(e.url)))
+      const overlap = (deduped.knownForbidden ?? []).filter((e) => emptyUrls.has(urlKey(e.url)))
+      if (overlap.length > 0) {
+        problems.push(`probes.knownEmpty and probes.knownForbidden share URL(s): ${overlap.map((e) => e.url).join(', ')}`)
+      }
+      for (const e of deduped.overCeiling ?? []) {
+        if (typeof e.param !== 'string' || e.param.length === 0) {
+          problems.push(`probes.overCeiling ${e.url} carries no non-empty "param" (the spend query-parameter name)`)
+        }
+      }
+      // A card that invites pinned probing must also declare its 402-offer
+      // boundary (monetization.probe), so the structured-offer obligation is
+      // behaviorally verified — never satisfiable by declaration alone.
+      if (!agents.offerProbe) {
+        problems.push('card declares a probe manifest but no monetization.probe URL — the 402 offer boundary cannot be behaviorally verified')
+      }
+      checks.push(check('probe-manifest', 'card-declared probe manifest is valid', undefined, [ROLE.agentsJson, ROLE.openapi],
+        problems.length === 0
+          ? pass('probe manifest declares every required channel; all entries same-origin GET on contract-declared paths')
+          : { verdict: 'fail', detail: problems.slice(0, 8).join('; ') }))
+    }
+  }
+
   return checks
 }
 

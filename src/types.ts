@@ -74,6 +74,11 @@ export interface DiscoveryReport {
     offers?: Array<{ id?: string; title?: string; price?: unknown }>
     /** URL that should answer 402 with a structured offer (behavioral probe). */
     offerProbe?: { method: string; url: string }
+    /**
+     * Self-declared probe manifest (agents.json top-level `probes`): named
+     * channels of probe URLs the target invites a pinned verifier to fire.
+     */
+    probes?: Record<string, Array<{ method: string; url: string; param?: string }>>
     attestation?: unknown
     openapiUrl?: string
   }
@@ -161,12 +166,47 @@ export interface MiniSchema {
   const?: unknown
 }
 
+/**
+ * Expectation block shared by `endpoint` and `probe` requirements: what an
+ * observed response must look like for the requirement to pass.
+ */
+export interface EndpointExpect {
+  status?: number | number[]
+  contentTypeIncludes?: string
+  schema?: MiniSchema
+  /**
+   * dot-path assertions into the JSON body. Beyond `equals`/`exists`,
+   * numeric comparators (`gte`/`lte`/`gt`/`lt`) express FLOORS and CEILINGS
+   * that live in the pinned spec, not in the target — the Goodhart-correct
+   * home for a ratchet threshold (e.g. `passed >= floor`): the target
+   * reports the number, the PINNED contract owns the bar it must clear.
+   * A comparator requires the path to resolve to a JSON number.
+   */
+  paths?: Array<{
+    path: string
+    equals?: unknown
+    exists?: boolean
+    gte?: number
+    lte?: number
+    gt?: number
+    lt?: number
+  }>
+}
+
 export type PinnedRequirement =
   | {
       id: string
       kind: 'surface'
       surface: 'llms.txt' | 'agents.json' | 'icp.json' | 'openapi'
       must: 'present' | 'valid'
+      /**
+       * openapi surface only: the declared spec version (`openapi:`/`swagger:`)
+       * must begin with this prefix (e.g. "3.1"). A Swagger 2.0 document, or
+       * one with no version member, fails.
+       */
+      versionPrefix?: string
+      /** openapi surface only: minimum count of declared operations. */
+      minOperations?: number
     }
   | {
       id: string
@@ -175,28 +215,38 @@ export type PinnedRequirement =
       path: string
       /** JSON body for POST/PUT probes (pinned mode is consent mode). */
       body?: unknown
-      expect: {
-        status?: number | number[]
-        contentTypeIncludes?: string
-        schema?: MiniSchema
-        /**
-         * dot-path assertions into the JSON body. Beyond `equals`/`exists`,
-         * numeric comparators (`gte`/`lte`/`gt`/`lt`) express FLOORS and CEILINGS
-         * that live in the pinned spec, not in the target — the Goodhart-correct
-         * home for a ratchet threshold (e.g. `passed >= floor`): the target
-         * reports the number, the PINNED contract owns the bar it must clear.
-         * A comparator requires the path to resolve to a JSON number.
-         */
-        paths?: Array<{
-          path: string
-          equals?: unknown
-          exists?: boolean
-          gte?: number
-          lte?: number
-          gt?: number
-          lt?: number
-        }>
-      }
+      expect: EndpointExpect
+    }
+  | {
+      id: string
+      kind: 'probe'
+      /**
+       * Member name under the target card's top-level `probes` manifest.
+       * Open string: the closed vocabulary is the pinned standard's business,
+       * not the verifier's — api.qa resolves whatever channel the spec names
+       * against whatever the target's own capability card declares.
+       */
+      probe: string
+      /** Minimum count of DISTINCT declared probe URLs. Default 1. */
+      minDeclared?: number
+      /**
+       * When present, every declared entry for this channel must carry a
+       * `param` member; the verifier sets that query parameter to this value.
+       * Object form derives the value from another channel's observed JSON
+       * body — the VERIFIER, never the manifest, owns the amount.
+       */
+      paramValue?: number | { fromProbe: string; path: string; multiply?: number }
+      /**
+       * When true, every declared entry's pathname must ALSO be observed
+       * answering `200` with a top-level `type: "OK"` JSON envelope somewhere
+       * in the same verification run (e.g. the keyless probe or the amount-0
+       * over-ceiling control). This is the anti-decoy rule: a probed path must
+       * demonstrably branch on its query — a dedicated endpoint that can only
+       * ever answer EMPTY/BLOCKED cannot satisfy the requirement.
+       */
+      pathMustServeOk?: boolean
+      /** Applied to EVERY declared probe under the channel. */
+      expect: EndpointExpect
     }
   | { id: string; kind: 'ax-floor'; minScore: number }
   /**
