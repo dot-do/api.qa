@@ -44,7 +44,7 @@ interface Opts {
   aap?: Record<string, unknown> // top-level overrides on the conformant AAP doc
   // auth.md agent-identity.
   declareMcp?: boolean // default true; false => no MCP interface => no AS metadata fetched
-  agentAuth?: Record<string, unknown> | null // null => omit block; object => replace block; undefined => conformant
+  agentAuth?: unknown // null => omit block; object => replace block; array/string/number => present-but-defective; undefined => conformant
   identityEndpoint?: string // override agent_auth.identity_endpoint (SSRF / non-https tests)
   identity?: RouteOut | null // response at the identity_endpoint; null => 404 (does not resolve)
   idJag?: boolean // default true; false => drop subject_token_types_supported (no ID-JAG advertised)
@@ -62,7 +62,10 @@ function aapDoc(over: Record<string, unknown> = {}): unknown {
     issuer: TARGET,
     algorithms: ['Ed25519'],
     approval_methods: ['device_authorization'],
-    endpoints: { register: `${TARGET}/agent/register`, status: `${TARGET}/agent/status`, revoke: `${TARGET}/agent/revoke` },
+    // RELATIVE endpoint paths — the canonical id.org.ai AAP shape (resolved
+    // against the issuer to the provider's own origin). Absolute URLs masked the
+    // relative-path over-block, so the conformant fixture uses the real shape.
+    endpoints: { register: '/agent/register', status: '/agent/status', revoke: '/agent/revoke' },
     jwks_uri: `${TARGET}/.well-known/jwks.json`,
     ...over,
   }
@@ -264,10 +267,31 @@ describe('aap-discovery fails the specific malformed field', () => {
     expect(detailOf(checks, 'aap-discovery')).toMatch(/register|status|revoke/)
   })
 
-  it('relative (non-absolute) endpoints → fail', async () => {
+  it('RELATIVE endpoints (the reference id.org.ai AAP shape) resolve against the issuer → pass', async () => {
+    // AAP v1.0-draft: the canonical provider (id.org.ai worker/routes/aap.ts)
+    // serves RELATIVE endpoint paths; resolved against the issuer they yield the
+    // provider's own https origin, so this MUST pass (not fail on relativity).
     const { checks } = await judge({ aap: { endpoints: { register: '/agent/register', status: '/agent/status', revoke: '/agent/revoke' } } })
+    expect(verdictOf(checks, 'aap-discovery'), detailOf(checks, 'aap-discovery')).toBe('pass')
+  })
+
+  it('an absolute OFF-ORIGIN register endpoint (https://evil.example/r) → fail (not same-origin with issuer)', async () => {
+    const { checks } = await judge({ aap: { endpoints: { register: 'https://evil.example/r', status: '/agent/status', revoke: '/agent/revoke' } } })
     expect(verdictOf(checks, 'aap-discovery')).toBe('fail')
-    expect(detailOf(checks, 'aap-discovery')).toMatch(/register|status|revoke/)
+    expect(detailOf(checks, 'aap-discovery')).toMatch(/register/)
+    expect(detailOf(checks, 'aap-discovery')).toMatch(/same-origin/)
+  })
+
+  it('jwks_uri on a DIFFERENT host (CDN-hosted key material) is allowed → pass', async () => {
+    // Endpoints stay same-origin (relative); only jwks_uri points off-origin to
+    // an https CDN — key material may be hosted elsewhere, so this MUST pass.
+    const { checks } = await judge({
+      aap: {
+        endpoints: { register: '/agent/register', status: '/agent/status', revoke: '/agent/revoke' },
+        jwks_uri: 'https://cdn.example/aap/jwks.json',
+      },
+    })
+    expect(verdictOf(checks, 'aap-discovery'), detailOf(checks, 'aap-discovery')).toBe('pass')
   })
 
   it('missing jwks_uri → fail', async () => {
@@ -363,6 +387,20 @@ describe('authmd-agent-identity fails the specific advertisement defect', () => 
   it('AS metadata carries no agent_auth block → skip (not an agent-identity provider)', async () => {
     const { checks } = await judge({ agentAuth: null })
     expect(verdictOf(checks, 'authmd-agent-identity')).toBe('skip')
+  })
+
+  it('agent_auth is a JSON ARRAY ([]) → fail (present-but-defective, NOT skip)', async () => {
+    // The key is PRESENT — the provider claims the block — but its shape carries
+    // no identity advertisement. This must FAIL the defect, never leak to SKIP
+    // (which only ABSENT agent_auth, above, correctly yields).
+    const { checks } = await judge({ agentAuth: [] })
+    expect(verdictOf(checks, 'authmd-agent-identity')).toBe('fail')
+    expect(detailOf(checks, 'authmd-agent-identity')).toMatch(/not a JSON object|present/)
+  })
+
+  it('agent_auth is a JSON STRING → fail (present-but-defective, NOT skip)', async () => {
+    const { checks } = await judge({ agentAuth: 'nope' })
+    expect(verdictOf(checks, 'authmd-agent-identity')).toBe('fail')
   })
 
   it('no AS metadata at all (no MCP declared) → skip', async () => {

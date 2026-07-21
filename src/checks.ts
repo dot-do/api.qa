@@ -533,6 +533,26 @@ function isAbsoluteHttpsUrl(v: unknown): boolean {
 }
 
 /**
+ * Resolve a possibly-RELATIVE endpoint against a base URL and return the result
+ * only when it is https. Per AAP v1.0-draft the reference provider (id.org.ai
+ * worker/routes/aap.ts) emits RELATIVE endpoint paths ('/agent/register',
+ * '/agent/status', '/agent/revoke'); resolved against the doc's issuer they
+ * yield the provider's own https origin. A non-string, an empty string, an
+ * unresolvable value (relative with no valid base), or a non-https result all
+ * yield undefined. Same-origin restriction, when required, is applied by the
+ * caller against the returned URL's origin.
+ */
+function resolveHttpsUrl(value: unknown, base: string | undefined): URL | undefined {
+  // A whitespace-only value must NOT count: the URL parser strips surrounding
+  // whitespace, so '   ' would otherwise resolve to the base origin root and
+  // inflate the grade. Reject the empty/whitespace case before resolving.
+  if (typeof value !== 'string' || value.trim().length === 0) return undefined
+  let u: URL
+  try { u = base !== undefined ? new URL(value, base) : new URL(value) } catch { return undefined }
+  return u.protocol === 'https:' ? u : undefined
+}
+
+/**
  * A non-empty TRIMMED string (the floor for AAP required string members). A
  * whitespace-only value ("   ") is `typeof 'string'` yet carries no advertised
  * identity/version/name — it must not inflate the grade, so it is rejected.
@@ -616,6 +636,15 @@ function judgeAapDiscovery(doc: unknown): { verdict: Verdict; detail: string } {
   if (usableApprovals.length === 0) {
     problems.push('approval_methods is missing, empty, or has no non-empty string element (expected device_authorization | ciba; custom string values tolerated, but null/whitespace/non-string junk is not a method an agent can approve against)')
   }
+  // The reference AAP provider (id.org.ai) emits RELATIVE endpoint paths, per
+  // AAP v1.0-draft. Resolve register/status/revoke against the doc's issuer
+  // BEFORE validating, so a relative path is ACCEPTED and resolves to the issuer
+  // origin. After resolution require https AND same-origin with the issuer:
+  // these are the provider's OWN AAP surface, so an absolute off-origin endpoint
+  // (https://evil.example/r) must FAIL. jwks_uri is resolved + https-required but
+  // NOT same-origin-restricted (key material may be CDN/hosted on another host).
+  const issuer = isNonEmptyString(d.issuer) ? d.issuer.trim() : undefined
+  const issuerOrigin = issuer ? originOf(issuer) : undefined
   const endpoints = d.endpoints && typeof d.endpoints === 'object' && !Array.isArray(d.endpoints)
     ? (d.endpoints as Record<string, unknown>)
     : undefined
@@ -623,10 +652,15 @@ function judgeAapDiscovery(doc: unknown): { verdict: Verdict; detail: string } {
     problems.push('endpoints object is missing')
   } else {
     for (const key of ['register', 'status', 'revoke'] as const) {
-      if (!isAbsoluteHttpsUrl(endpoints[key])) problems.push(`endpoints.${key} is missing or not an absolute https URL (an agent cannot register/poll/revoke against a relative or non-https endpoint)`)
+      const resolved = resolveHttpsUrl(endpoints[key], issuer)
+      if (!resolved) {
+        problems.push(`endpoints.${key} is missing or does not resolve to an https URL against the issuer (an agent cannot register/poll/revoke against a missing or non-https endpoint)`)
+      } else if (!issuerOrigin || resolved.origin !== issuerOrigin) {
+        problems.push(`endpoints.${key} ${resolved.href} does not resolve same-origin with the issuer ${issuerOrigin ?? '(missing issuer)'} (register/status/revoke are the provider's own AAP surface — an off-origin endpoint must not be advertised here)`)
+      }
     }
   }
-  if (!isAbsoluteHttpsUrl(d.jwks_uri)) problems.push('jwks_uri is missing or not an absolute https URL (the jwt-verification key host must be an https URL)')
+  if (!resolveHttpsUrl(d.jwks_uri, issuer)) problems.push('jwks_uri is missing or does not resolve to an https URL against the issuer (the jwt-verification key host must be https; a different host is allowed for CDN/hosted key material)')
   if (problems.length) return { verdict: 'fail', detail: `AAP discovery malformed: ${problems.slice(0, 8).join('; ')}` }
   return pass(`AAP discovery advertises version/issuer/provider_name, Ed25519, ${usableApprovals.length} approval method(s), register/status/revoke endpoints, and jwks_uri`)
 }
@@ -640,11 +674,18 @@ function judgeAapDiscovery(doc: unknown): { verdict: Verdict; detail: string } {
  * alone (the hostile URL is never requested), matching the MCP-OAuth posture.
  */
 function judgeAuthmdAgentIdentity(
-  agentAuth: { identity_endpoint?: string; claim_endpoint?: string; events_endpoint?: string; raw: Record<string, unknown> },
+  agentAuth: { identity_endpoint?: string; claim_endpoint?: string; events_endpoint?: string; raw: Record<string, unknown>; defective?: boolean },
   asMeta: unknown,
   resolvedAsEv: Evidence | undefined,
   idEv: Evidence | undefined,
 ): { verdict: Verdict; detail: string } {
+  // agent_auth key PRESENT but not a plain object (JSON array / string / number
+  // / null) — the provider claims the block yet its shape carries no identity
+  // advertisement. FAIL the defect rather than SKIP (which absence, handled by
+  // the caller, correctly yields).
+  if (agentAuth.defective) {
+    return { verdict: 'fail', detail: 'auth.md agent-identity advertisement incomplete: agent_auth is present but is not a JSON object (an array/string/number/null carries no identity/claim/events endpoints, ID-JAG assertion, or SET-revocation advertisement)' }
+  }
   const problems: string[] = []
   // (1) identity + claim endpoints must be non-empty absolute https URLs.
   for (const key of ['identity_endpoint', 'claim_endpoint'] as const) {

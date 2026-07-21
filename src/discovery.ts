@@ -186,6 +186,14 @@ export interface AgentAuthClaims {
   events_endpoint?: string
   /** The raw agent_auth object, so a judge can scan for ID-JAG advertisement. */
   raw: Record<string, unknown>
+  /**
+   * True when the `agent_auth` key is PRESENT but not a plain object (a JSON
+   * array / string / number / null). The key exists, so the provider claims to
+   * be an agent-identity provider — the block is defective, not absent — and the
+   * judge must FAIL it, never collapse to the "absent => SKIP" path. Absence of
+   * the key (or of the AS metadata) still returns `undefined` => SKIP.
+   */
+  defective?: boolean
 }
 
 /**
@@ -197,7 +205,15 @@ export interface AgentAuthClaims {
 export function parseAgentAuth(asMeta: unknown): AgentAuthClaims | undefined {
   if (!asMeta || typeof asMeta !== 'object') return undefined
   const block = (asMeta as Record<string, unknown>).agent_auth
-  if (!block || typeof block !== 'object' || Array.isArray(block)) return undefined
+  // Key ABSENT (metadata carries no agent_auth at all) => not an agent-identity
+  // provider => SKIP.
+  if (!('agent_auth' in (asMeta as Record<string, unknown>)) || block === undefined) return undefined
+  // Key PRESENT but not a plain object — a JSON array / string / number / null.
+  // The provider claims the block yet its shape is defective: return a sentinel
+  // so the judge FAILs it (present-but-defective) rather than leaking to SKIP.
+  if (!block || typeof block !== 'object' || Array.isArray(block)) {
+    return { raw: {}, defective: true }
+  }
   const b = block as Record<string, unknown>
   return {
     identity_endpoint: str(b.identity_endpoint),
