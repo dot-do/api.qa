@@ -59,7 +59,7 @@ function tokensCss(): string {
   --fail: oklch(0.560 0.198 27);
   --fail-soft: oklch(0.950 0.045 27);
   --skip: oklch(0.640 0.018 200);
-  --warn: oklch(0.700 0.150 75);
+  --warn: oklch(0.580 0.140 70);
   --code-bg: oklch(0.190 0.024 220);
   --code-fg: oklch(0.910 0.014 190);
   --glow-a: oklch(0.720 0.130 175 / 0.30);
@@ -68,8 +68,8 @@ function tokensCss(): string {
   --shadow-sm: 0 1px 2px oklch(0.30 0.02 210 / 0.06), 0 1px 3px oklch(0.30 0.02 210 / 0.05);
   --shadow-md: 0 4px 12px oklch(0.30 0.02 210 / 0.08), 0 2px 4px oklch(0.30 0.02 210 / 0.05);
   --shadow-lg: 0 18px 40px oklch(0.30 0.02 210 / 0.12), 0 6px 12px oklch(0.30 0.02 210 / 0.06);
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark){
   :root{
@@ -111,12 +111,18 @@ body{
   margin:0;font-family:var(--font-sans);
   background:var(--background);color:var(--foreground);
   line-height:1.6;letter-spacing:-0.011em;
+  font-variant-numeric:tabular-nums;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-h1,h2,h3{line-height:1.08;letter-spacing:-0.03em;font-weight:700;margin:0}
+h1,h2,h3{line-height:1.08;letter-spacing:-0.03em;font-weight:700;margin:0;text-wrap:balance}
 p{margin:0}
 a{color:inherit;text-decoration:none}
 code,pre,.mono{font-family:var(--font-mono);font-feature-settings:'liga' 0}
+::selection{background:color-mix(in oklch,var(--primary) 24%,transparent)}
+:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important}
+}
 .wrap{max-width:72rem;margin:0 auto;padding:0 1.5rem}
 .eyebrow{font-size:.74rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--primary)}
 .lede{color:var(--muted-foreground);font-size:1.075rem;line-height:1.65}
@@ -127,8 +133,10 @@ code,pre,.mono{font-family:var(--font-mono);font-feature-settings:'liga' 0}
   cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),background .18s,border-color .18s,box-shadow .18s}
 .btn-primary{background:var(--primary);color:var(--primary-foreground);box-shadow:var(--shadow-sm)}
 .btn-primary:hover{transform:translateY(-1px);box-shadow:var(--shadow-md)}
+.btn-primary:active{transform:translateY(0);box-shadow:var(--shadow-sm)}
 .btn-ghost{background:transparent;color:var(--foreground);border-color:var(--border)}
 .btn-ghost:hover{background:var(--muted)}
+.btn-ghost:active{background:color-mix(in oklch,var(--muted) 70%,var(--border))}
 
 /* nav */
 .nav{position:sticky;top:0;z-index:40;backdrop-filter:saturate(1.4) blur(10px);
@@ -169,10 +177,15 @@ pre.code{background:var(--code-bg);color:var(--code-fg);padding:1rem 1.15rem;bor
 .code .tok-k{color:oklch(0.78 0.13 175)}`
 }
 
-function fontHead(): string {
-  return `<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">`
+/**
+ * Head metadata beyond the basics. Deliberately no webfont links: the page is
+ * self-contained and CSP-clean (no external hosts), so the font tokens resolve
+ * through local/system stacks only. The theme-color pair keeps the browser
+ * chrome in step with the lab-paper / night surface.
+ */
+function headMeta(): string {
+  return `<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7fbfa">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#12181c">`
 }
 
 /** The verified-seal glyph — a check inside a rounded shield. Reused in nav + hero. */
@@ -191,7 +204,7 @@ function shell(opts: { title: string; description: string; jsonLd: object; body:
 <meta name="color-scheme" content="light dark">
 <meta property="og:title" content="${esc(opts.title)}">
 <meta property="og:description" content="${esc(opts.description)}">
-${fontHead()}
+${headMeta()}
 <script type="application/ld+json">${JSON.stringify(opts.jsonLd)}</script>
 <style>${tokensCss()}${baseCss()}${opts.extraCss ?? ''}</style>
 </head>
@@ -323,11 +336,17 @@ function landingCss(): string {
 .grade-bar{margin-top:1.9rem;display:flex;align-items:stretch;max-width:33rem;
   border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);background:var(--card);
   box-shadow:var(--shadow-md);overflow:hidden}
+.grade-bar:focus-within{border-color:var(--ring);
+  box-shadow:0 0 0 3px color-mix(in oklch,var(--ring) 20%,transparent),var(--shadow-md)}
 .grade-bar .pfx{display:flex;align-items:center;padding:0 .3rem 0 .9rem;color:var(--muted-foreground);font-family:var(--font-mono);font-size:.92rem}
 .grade-bar input{flex:1;border:0;background:transparent;color:var(--foreground);font-family:var(--font-mono);
   font-size:.95rem;padding:.85rem .4rem;outline:none;min-width:0}
+.grade-bar input::placeholder{color:var(--muted-foreground);opacity:.7}
 .grade-bar button{border:0;margin:.35rem;border-radius:calc(var(--radius) - .2rem);background:var(--primary);
-  color:var(--primary-foreground);font-weight:600;padding:0 1.1rem;cursor:pointer;font-size:.9rem}
+  color:var(--primary-foreground);font-weight:600;padding:0 1.1rem;cursor:pointer;font-size:.9rem;
+  transition:filter .15s}
+.grade-bar button:hover{filter:brightness(1.06)}
+.grade-bar button:active{filter:brightness(.96)}
 .trust{margin-top:1.7rem;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.4rem;color:var(--muted-foreground);font-size:.82rem}
 .trust span{display:inline-flex;align-items:center;gap:.4rem}
 .trust .dot{width:5px;height:5px;border-radius:99px;background:var(--pass)}
@@ -351,17 +370,22 @@ function landingCss(): string {
   font-family:var(--font-mono);font-size:.72rem;color:var(--muted-foreground);display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
 .cred-badge{display:inline-flex;align-items:center;gap:.35rem;color:var(--pass);font-weight:600}
 
-/* invariant band */
-.invariant{background:var(--foreground);color:var(--background);border-radius:0}
+/* invariant band — a fixed dark plate in both themes, like the code blocks:
+   the one sentence the whole product hangs on reads as engraved, not themed */
+.invariant{background:var(--code-bg);color:var(--code-fg)}
 .invariant .wrap{padding-top:3.2rem;padding-bottom:3.2rem}
-.invariant .q{font-size:clamp(1.35rem,3vw,2rem);font-weight:600;letter-spacing:-.025em;max-width:52rem;line-height:1.32}
-.invariant .q em{font-style:normal;color:var(--primary);font-weight:700}
+.invariant .eyebrow{color:oklch(0.78 0.13 175)}
+.invariant .q{font-size:clamp(1.35rem,3vw,2rem);font-weight:600;letter-spacing:-.025em;max-width:52rem;line-height:1.32;text-wrap:balance}
+.invariant .q em{font-style:normal;color:oklch(0.78 0.13 175);font-weight:700}
 .invariant .sub{margin-top:1rem;opacity:.72;max-width:44rem;font-size:1rem}
 
-/* feature grid — asymmetric, not identical cards */
-.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1.15rem;margin-top:2.75rem}
+/* mechanism ledger — one framed panel, hairline rules, not six floating cards.
+   The 1px grid gap over the border color draws the rules for free. */
+.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;margin-top:2.75rem;
+  background:var(--border);border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);
+  overflow:hidden;box-shadow:var(--shadow-sm)}
 @media(max-width:860px){.feat-grid{grid-template-columns:1fr}}
-.feat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.5rem;box-shadow:var(--shadow-sm)}
+.feat{background:var(--card);padding:1.5rem 1.6rem}
 .feat .n{font-family:var(--font-mono);font-size:.78rem;color:var(--primary);font-weight:600}
 .feat h3{font-size:1.12rem;margin:.55rem 0 .5rem}
 .feat p{color:var(--muted-foreground);font-size:.94rem;line-height:1.6}
@@ -427,7 +451,7 @@ export function landingHtml(): string {
       { '@type': 'WebSite', name: 'api.qa', url: 'https://api.qa', description: 'External third-party verifier for agent-first APIs.' },
       {
         '@type': 'DefinedTerm',
-        name: 'Agent Experience (AX)',
+        name: 'Agent eXperience (AX)',
         description:
           'The quality of a service as experienced by AI agents: discoverable machine surfaces, keyless trial flows, structured payment offers, and attestable behavior. Successor term to Developer Experience (DX).',
         inDefinedTermSet: { '@type': 'DefinedTermSet', name: 'api.qa AX score', url: 'https://api.qa' },
@@ -449,7 +473,7 @@ export function landingHtml(): string {
         <button type="submit">Grade &rarr;</button>
       </form>
       <div class="trust">
-        <span><i class="dot"></i> 52 tests pass</span>
+        <span><i class="dot"></i> deterministic, seeded, replayable</span>
         <span><i class="dot"></i> self-grades 10/10 A+</span>
         <span><i class="dot"></i> keyless, no signup</span>
       </div>
@@ -469,7 +493,7 @@ export function landingHtml(): string {
   </div></section>`
 
   const invariant = `<section class="invariant"><div class="wrap">
-    <div class="eyebrow" style="color:var(--primary)">The core invariant</div>
+    <div class="eyebrow">The core invariant</div>
     <p class="q" style="margin-top:1rem">A verdict is a pure function of published contracts, observed behavior, a pinned spec digest, a seed, and the verifier version. <em>None of those five inputs is yours to write.</em></p>
     <p class="sub">The fleet can change its behavior and its published contracts, but changing either changes the evidence digest, visibly, in the attested report. Goodhart is the adversary, and every mechanism below exists because of a specific attack on it.</p>
   </div></section>`
@@ -555,7 +579,7 @@ export function landingHtml(): string {
   const script = `function gradeGo(e){e.preventDefault();var v=document.getElementById('g').value.trim().replace(/^https?:\\/\\//,'').replace(/\\/.*$/,'');if(v){location.href='/'+encodeURIComponent(v)}return false}`
 
   return shell({
-    title: 'api.qa — the verifier your fleet cannot edit',
+    title: 'api.qa · the verifier your fleet cannot edit',
     description: 'An independent, deterministic, Ed25519-signed verdict on whether an agent-first API works as described. A grade your fleet cannot game.',
     jsonLd,
     extraCss: landingCss(),
@@ -626,8 +650,12 @@ table.ax td.n{font-family:var(--font-mono);color:var(--muted-foreground);width:2
 table.ax td.v{text-align:right;width:6rem}
 table.ax tr:first-child td{border-top:0}
 
-.checks{margin-top:1.2rem;display:grid;gap:.7rem}
-.chk{border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.15rem;background:var(--card)}
+/* check details — one ruled ledger, same frame vocabulary as the AX table */
+.checks{margin-top:1.2rem;background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden}
+.chk{padding:1rem 1.2rem;border-top:1px solid var(--border)}
+.chk:first-child{border-top:0}
+.chk.fail{background:color-mix(in oklch,var(--fail-soft) 45%,var(--card))}
 .chk-h{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
 .chk-h .t{font-weight:600;font-size:.96rem}
 .chk-h code{font-family:var(--font-mono);font-size:.76rem;color:var(--muted-foreground);
@@ -641,7 +669,16 @@ table.ax tr:first-child td{border-top:0}
 .attest .kv dd{margin:0;font-family:var(--font-mono);font-size:.78rem;word-break:break-all;color:var(--foreground)}
 
 .repro{margin-top:1.1rem}
-.repro p{color:var(--muted-foreground);font-size:.92rem;margin-bottom:.8rem;max-width:46rem}`
+.repro p{color:var(--muted-foreground);font-size:.92rem;margin-bottom:.8rem;max-width:46rem}
+
+/* a grade report is a document people file; make the paper copy behave */
+@media print{
+  .nav,.foot{display:none}
+  .rep-hero{padding-top:0}
+  .rep-hero::before{display:none}
+  .rep-card,.checks,.attest,table.ax{box-shadow:none}
+  .rep-sec{padding:1.2rem 0}
+}`
 }
 
 export function reportPageHtml(r: VerificationReport): string {
@@ -711,7 +748,7 @@ export function reportPageHtml(r: VerificationReport): string {
     <div class="checks">
     ${r.checks
       .map(
-        (c) => `<article class="chk">
+        (c) => `<article class="chk ${c.verdict}">
         <div class="chk-h"><span class="pill ${c.verdict}">${VERDICT_LABEL[c.verdict]}</span>
           <span class="t">${esc(c.title)}</span><code>${esc(c.id)}</code></div>
         <p>${esc(c.detail)}</p>
@@ -750,7 +787,7 @@ curl -H <span class="tok-k">'accept: application/json'</span> https://api.qa/${e
   </div></section>`
 
   return shell({
-    title: `api.qa — ${host} — Grade ${r.grade}`,
+    title: `api.qa/${host} · Grade ${r.grade}`,
     description: `${host} scored ${r.grade} (AX ${r.axScore.points}/10) on api.qa, the external verifier for agent-first APIs. ${r.attested ? 'Ed25519-attested' : 'Advisory'} verdict.`,
     jsonLd,
     extraCss: reportCss(),

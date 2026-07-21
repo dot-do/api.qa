@@ -82,32 +82,47 @@ export function reportHtml(r: VerificationReport): string {
     .map((i) => `<tr><td>${i.item}</td><td>${esc(i.title)}</td><td class="${i.verdict}">${MARK[i.verdict]}</td></tr>`)
     .join('\n')
   const details = r.checks
-    .map((c) => `<li class="${c.verdict}"><strong>${MARK[c.verdict]}</strong> ${esc(c.title)} <code>${c.id}</code><br><small>${esc(c.detail)}</small></li>`)
+    .map((c) => `<li><strong class="${c.verdict}">${MARK[c.verdict]}</strong> ${esc(c.title)} <code>${c.id}</code><br><small>${esc(c.detail)}</small></li>`)
     .join('\n')
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>api.qa — ${esc(host)} — Grade ${r.grade}</title>
+<meta name="color-scheme" content="light dark">
+<title>api.qa/${esc(host)} · Grade ${r.grade}</title>
 <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
 <style>
-  body{font:16px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem;color:#111}
-  .grade{font-size:4rem;font-weight:800}
-  table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.35rem .5rem;text-align:left}
-  .pass{color:#087443}.fail{color:#b42318}.skip{color:#667085}
-  code{background:#f4f4f5;padding:.1rem .3rem;border-radius:4px}
+  :root{--bg:oklch(0.988 0.006 175);--fg:oklch(0.205 0.021 210);--mut:oklch(0.470 0.020 200);
+    --line:oklch(0.905 0.013 190);--chip:oklch(0.958 0.010 185);
+    --pass:oklch(0.560 0.140 158);--fail:oklch(0.560 0.198 27);--skip:oklch(0.640 0.018 200)}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:oklch(0.165 0.021 220);--fg:oklch(0.935 0.012 185);--mut:oklch(0.660 0.022 195);
+      --line:oklch(0.290 0.022 218);--chip:oklch(0.235 0.024 218);
+      --pass:oklch(0.720 0.150 158);--fail:oklch(0.680 0.190 27);--skip:oklch(0.600 0.020 200)}
+  }
+  body{font:16px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem;
+    background:var(--bg);color:var(--fg);font-variant-numeric:tabular-nums}
+  h1 small{color:var(--mut);font-weight:400}
+  .grade{font-size:4rem;font-weight:800;line-height:1;margin:.25rem 0}
+  .tblwrap{overflow-x:auto}
+  table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:.35rem .5rem;text-align:left}
+  th{color:var(--mut);font-weight:600}
+  .pass{color:var(--pass)}.fail{color:var(--fail)}.skip{color:var(--skip)}
+  small{color:var(--mut)}
+  code{background:var(--chip);padding:.1rem .3rem;border-radius:4px;
+    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
   li{margin:.5rem 0}
 </style>
 </head>
 <body>
 <h1>api.qa <small>/${esc(host)}</small></h1>
-<p class="grade">${r.grade}</p>
-<p>AX score <strong>${r.axScore.points}/10</strong> · ${r.mode} mode · ${r.attested ? 'attested (Ed25519)' : 'not attested — advisory'}<br>
+<p class="grade ${r.grade === 'F' || r.grade === 'D' ? 'fail' : ''}">${r.grade}</p>
+<p>AX score <strong>${r.axScore.points}/10</strong> · ${r.mode} mode · ${r.attested ? 'attested (Ed25519)' : 'not attested (advisory)'}<br>
 <small>verified ${esc(r.verifiedAt)} · seed ${r.seed} · evidence <code>${r.discovery.evidenceDigest.slice(0, 16)}…</code></small></p>
-<table><thead><tr><th>#</th><th>check</th><th>verdict</th></tr></thead><tbody>
+<div class="tblwrap"><table><thead><tr><th>#</th><th>check</th><th>verdict</th></tr></thead><tbody>
 ${rows}
-</tbody></table>
+</tbody></table></div>
 <h2>Details</h2>
 <ul>
 ${details}
