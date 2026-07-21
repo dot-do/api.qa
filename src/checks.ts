@@ -14,8 +14,10 @@ import {
   parseOpenapi,
   looksLikeLlmsTxt,
   hasAgentClasses,
+  firstAuthorizationServer,
+  wellKnownAt,
 } from './discovery.js'
-import { isPubliclyRoutableSameOrigin } from './http.js'
+import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
 import type { CheckResult, Evidence, EvidenceBundle, Verdict } from './types.js'
 
@@ -107,6 +109,164 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     agents.mcp && (agents.mcp.transport || agents.mcp.url) && (agents.mcp.tools?.length ?? 0) > 0
       ? pass(`mcp: ${agents.mcp!.transport ?? agents.mcp!.url} with tools [${agents.mcp!.tools!.join(', ')}] (presence-grade; stdio not spawned)`)
       : fail(agentsEv, 'agents.json interfaces.mcp with a transport/url and a non-empty tools list')))
+
+  // ── MCP authorization conformance (RFC 9728 / 8414 / 7636 / 7591 / 8707) ──
+  //    Sibling checks to AX-6: an MCP-exposing API declared over HTTP/SSE
+  //    (interfaces.mcp.url) MUST be an OAuth 2.1 resource server publishing the
+  //    MCP well-knowns. These are PURE judges over evidence observeTarget
+  //    recorded — no network here. stdio-only MCP (no url) is NOT an OAuth
+  //    resource server → skip, not fail.
+  {
+    const mcpUrl = agents.mcp?.url
+    // The mcpUrl is the target's OWN endpoint → MUST be same-origin (SSRF).
+    // Decided from the URL string alone; the hostile URL is never fetched.
+    const mcpViolation = mcpUrlSameOriginViolation(mcpUrl, bundle.target)
+    // stdio-vs-remote is decided from the DECLARED TRANSPORT, never from url
+    // presence — a remote transport that simply OMITS its url must FAIL, not
+    // silently skip and pocket the AX-6 point. stdio (or a command-only card
+    // with no transport and no url) is NOT an OAuth resource server → skip. Any
+    // other (non-stdio) transport, or a declared url, means an HTTP/SSE MCP
+    // endpoint that IS an OAuth 2.1 resource server and MUST publish the MCP
+    // well-knowns.
+    const transport = agents.mcp?.transport?.toLowerCase()
+    const isStdioLike =
+      !agents.mcp ||
+      transport === 'stdio' ||
+      (transport === undefined && mcpUrl === undefined)
+    const isRemote = !!agents.mcp && !isStdioLike
+    // A remote transport that declares no reachable url can never be verified as
+    // an OAuth resource server — fail closed (NOT skip) so the missing url is
+    // penalized, not rewarded.
+    const remoteNoUrl = isRemote && mcpUrl === undefined
+
+    const prEv = findEvidence(bundle, ROLE.mcpProtectedResource)
+    const asEv = findEvidence(bundle, ROLE.mcpAsMetadata)
+    const asOidcEv = findEvidence(bundle, ROLE.mcpAsMetadataOidc)
+    const unauthEv = findEvidence(bundle, ROLE.mcpUnauth)
+    const pr = parseJsonBody(prEv) as Record<string, unknown> | undefined
+    // RFC 8414 primary, OIDC discovery fallback: judge whichever resolved 2xx.
+    const asMetaOk = ok(asEv) || ok(asOidcEv)
+    const usedOidc = !ok(asEv) && ok(asOidcEv)
+    const asMeta = parseJsonBody(ok(asEv) ? asEv : ok(asOidcEv) ? asOidcEv : asEv ?? asOidcEv) as
+      | Record<string, unknown>
+      | undefined
+
+    // Consistent skip/violation gate for every MCP-OAuth sibling check.
+    const mcpCheck = (
+      id: string,
+      title: string,
+      evidence: string[],
+      judge: () => { verdict: Verdict; detail: string },
+    ): void => {
+      let result: { verdict: Verdict; detail: string }
+      if (!isRemote) {
+        result = {
+          verdict: 'skip',
+          detail: agents.mcp
+            ? `MCP declared ${transport ?? 'command-only'} transport (no url) — not an OAuth resource server; skipped`
+            : 'no MCP interface declared — nothing to verify',
+        }
+      } else if (remoteNoUrl) {
+        result = {
+          verdict: 'fail',
+          detail: `remote MCP transport '${transport ?? 'http'}' declares no reachable url — an HTTP/SSE MCP endpoint must publish a url to act as an OAuth 2.1 resource server (RFC 9728)`,
+        }
+      } else if (mcpViolation) {
+        result = { verdict: 'fail', detail: mcpViolation }
+      } else {
+        result = judge()
+      }
+      checks.push(check(id, title, undefined, evidence, result))
+    }
+
+    // (a) RFC 9728 protected-resource metadata.
+    mcpCheck('mcp-oauth-protected-resource',
+      'MCP endpoint publishes RFC 9728 protected-resource metadata', [ROLE.agentsJson, ROLE.mcpProtectedResource], () => {
+        if (!ok(prEv)) return fail(prEv, `expected 200 JSON at ${wellKnownAt(mcpUrl!, 'oauth-protected-resource')}`)
+        const resource = typeof pr?.resource === 'string' ? (pr.resource as string) : undefined
+        const asList = Array.isArray(pr?.authorization_servers) ? (pr!.authorization_servers as unknown[]) : []
+        if (!resource) return { verdict: 'fail', detail: 'protected-resource metadata is missing a string `resource` (RFC 9728 §3)' }
+        if (asList.length === 0) return { verdict: 'fail', detail: 'protected-resource metadata `authorization_servers` is empty or missing (RFC 9728 §3)' }
+        return pass(`RFC 9728: resource="${resource}" with ${asList.length} authorization_server(s)`)
+      })
+
+    // (b) Follow authorization_servers[0] to RFC 8414 metadata (OIDC fallback).
+    mcpCheck('mcp-oauth-as-metadata',
+      'authorization server publishes RFC 8414 metadata (openid-configuration fallback)',
+      [ROLE.mcpProtectedResource, ROLE.mcpAsMetadata, ROLE.mcpAsMetadataOidc], () => {
+        const asBase = firstAuthorizationServer(pr)
+        if (!asBase) return { verdict: 'fail', detail: 'no authorization_servers[0] in protected-resource metadata to resolve' }
+        // The AS MAY be off-origin, but never cleartext or a private/metadata
+        // host — refused WITHOUT fetching (decided from the URL string).
+        if (!isPublicHttpsOffOriginAllowed(asBase)) {
+          return { verdict: 'fail', detail: `authorization_servers[0] ${asBase} is not a public https authorization server — refused without fetching (SSRF guard: no cleartext, no private/metadata host)` }
+        }
+        if (!asMetaOk) {
+          return { verdict: 'fail', detail: `neither /.well-known/oauth-authorization-server nor /.well-known/openid-configuration resolved 200 JSON at ${originOf(asBase)}` }
+        }
+        // Presence-of-a-string is NOT enough: the empty string and non-URL junk
+        // are typeof 'string' yet worthless. Each RFC 8414 member MUST be a
+        // non-empty absolute https URL — parsed with new URL(), mirroring the
+        // stricter parsing mcp-oauth-resource-indicators already applies.
+        const missing = [
+          !isAbsoluteHttpsUrl(asMeta?.issuer) && 'issuer',
+          !isAbsoluteHttpsUrl(asMeta?.authorization_endpoint) && 'authorization_endpoint',
+          !isAbsoluteHttpsUrl(asMeta?.token_endpoint) && 'token_endpoint',
+        ].filter((m): m is string => typeof m === 'string')
+        if (missing.length) return { verdict: 'fail', detail: `AS metadata missing required member(s): ${missing.join(', ')} (RFC 8414 §2)` }
+        return pass(`RFC 8414${usedOidc ? ' (openid-configuration fallback)' : ''}: issuer + authorization_endpoint + token_endpoint present`)
+      })
+
+    // (c-i) PKCE S256 (RFC 7636).
+    mcpCheck('mcp-pkce',
+      'authorization server advertises PKCE S256 (RFC 7636)', [ROLE.mcpAsMetadata, ROLE.mcpAsMetadataOidc], () => {
+        if (!asMetaOk) return { verdict: 'fail', detail: 'authorization server metadata not resolved — cannot confirm PKCE support' }
+        const methods = Array.isArray(asMeta?.code_challenge_methods_supported) ? (asMeta!.code_challenge_methods_supported as unknown[]) : []
+        return methods.includes('S256')
+          ? pass('code_challenge_methods_supported includes S256')
+          : { verdict: 'fail', detail: `code_challenge_methods_supported ${methods.length ? `[${methods.join(', ')}]` : 'missing'} does not include 'S256' (RFC 7636 PKCE is mandatory for OAuth 2.1)` }
+      })
+
+    // (c-ii) Dynamic Client Registration (RFC 7591).
+    mcpCheck('mcp-oauth-dcr',
+      'authorization server supports Dynamic Client Registration (RFC 7591)', [ROLE.mcpAsMetadata, ROLE.mcpAsMetadataOidc], () => {
+        if (!asMetaOk) return { verdict: 'fail', detail: 'authorization server metadata not resolved — cannot confirm DCR support' }
+        // Presence-only (typeof 'string') passes for '' and non-URL junk. DCR
+        // requires a real endpoint: a non-empty absolute https URL, parsed.
+        return isAbsoluteHttpsUrl(asMeta?.registration_endpoint)
+          ? pass(`registration_endpoint present: ${asMeta!.registration_endpoint as string} (RFC 7591 DCR)`)
+          : { verdict: 'fail', detail: `AS metadata registration_endpoint ${typeof asMeta?.registration_endpoint === 'string' ? `"${asMeta.registration_endpoint}" is not a valid absolute https URL` : 'is missing'} — Dynamic Client Registration (RFC 7591) is not advertised` }
+      })
+
+    // (c-iii) Resource Indicators (RFC 8707): the protected-resource `resource`
+    //         is the canonical audience the client sends as the RFC 8707
+    //         `resource` parameter to audience-bind its token to THIS MCP origin.
+    mcpCheck('mcp-oauth-resource-indicators',
+      'protected-resource declares an RFC 8707 audience bound to the MCP origin', [ROLE.mcpProtectedResource], () => {
+        const resource = typeof pr?.resource === 'string' ? (pr.resource as string) : undefined
+        if (!resource) return { verdict: 'fail', detail: 'protected-resource metadata has no `resource` audience for the client to send as the RFC 8707 resource parameter' }
+        let ru: URL
+        try { ru = new URL(resource) } catch { return { verdict: 'fail', detail: `resource "${resource}" is not an absolute URL — cannot serve as an RFC 8707 audience` } }
+        const mcpOrigin = originOf(mcpUrl!)
+        if (ru.origin !== mcpOrigin) return { verdict: 'fail', detail: `resource audience origin ${ru.origin} does not match the MCP endpoint origin ${mcpOrigin} — token audience-binding (RFC 8707) would not protect this resource` }
+        return pass(`resource audience "${resource}" is bound to the MCP origin (RFC 8707 resource indicator)`)
+      })
+
+    // (d) Unauthenticated 401 carries WWW-Authenticate → protected-resource.
+    mcpCheck('mcp-www-authenticate',
+      'unauthenticated MCP request returns 401 with WWW-Authenticate → protected-resource metadata', [ROLE.mcpUnauth], () => {
+        if (!unauthEv || unauthEv.status === null) return fail(unauthEv, `expected an unauthenticated 401 from ${mcpUrl}`)
+        const status = unauthEv.status
+        if (status !== 401 && status !== 403) return { verdict: 'fail', detail: `unauthenticated MCP request returned ${status}, not 401 — the endpoint is not gated as an OAuth resource server` }
+        const wa = unauthEv.headers['www-authenticate']
+        if (!wa) return { verdict: 'fail', detail: `${status} response carries no WWW-Authenticate header (RFC 9728 §5.1 / RFC 6750)` }
+        if (!/bearer/i.test(wa)) return { verdict: 'fail', detail: `WWW-Authenticate does not offer the Bearer scheme: ${wa}` }
+        const prUrl = wellKnownAt(mcpUrl!, 'oauth-protected-resource')
+        const refsMetadata = /resource_metadata/i.test(wa) && prUrl !== undefined && wa.includes(prUrl)
+        if (!refsMetadata) return { verdict: 'fail', detail: `WWW-Authenticate does not reference the protected-resource metadata via resource_metadata="${prUrl}" (RFC 9728 §5.1): ${wa}` }
+        return pass(`${status} with WWW-Authenticate: Bearer resource_metadata pointing at the protected-resource metadata`)
+      })
+  }
 
   // ── AX 7: keyless flow ───────────────────────────────────────────────────
   {
@@ -306,6 +466,40 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
 
 function ok(ev: Evidence | undefined): boolean {
   return !!ev && ev.status !== null && ev.status >= 200 && ev.status < 300
+}
+
+function originOf(url: string): string {
+  try { return new URL(url).origin } catch { return url }
+}
+
+/**
+ * True only for a NON-EMPTY absolute https URL. Presence-of-a-string is not
+ * enough for RFC 8414 members (issuer / authorization_endpoint / token_endpoint)
+ * or the RFC 7591 registration_endpoint: the empty string and non-URL junk are
+ * `typeof 'string'` yet inflate the grade. Parsed with new URL(), the same
+ * strictness mcp-oauth-resource-indicators already applies to `resource`.
+ */
+function isAbsoluteHttpsUrl(v: unknown): boolean {
+  if (typeof v !== 'string' || v.length === 0) return false
+  try { return new URL(v).protocol === 'https:' } catch { return false }
+}
+
+/**
+ * Why interfaces.mcp.url is inadmissible as a same-origin MCP endpoint — or
+ * undefined if it is fine (or absent). The MCP endpoint is the target's OWN
+ * resource server, so it MUST be same-origin with the verification target, the
+ * identical gate every other card-derived probe passes (a mcpUrl off-origin or
+ * at a private/metadata address is an SSRF vector). Pure string validation: the
+ * hostile URL is NEVER fetched to decide.
+ */
+function mcpUrlSameOriginViolation(rawUrl: string | undefined, origin: string): string | undefined {
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0) return undefined
+  let abs: string
+  try { abs = new URL(rawUrl, origin).toString() } catch { return `interfaces.mcp.url ${rawUrl} is not a valid URL` }
+  if (!isPubliclyRoutableSameOrigin(abs, origin)) {
+    return `interfaces.mcp.url ${rawUrl} is not a same-origin, publicly-routable MCP endpoint for ${origin} — refused without fetching (SSRF guard: an MCP resource server MUST be same-origin with the target)`
+  }
+  return undefined
 }
 
 function looksLikeHtml(body: string): boolean {

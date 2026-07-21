@@ -8,7 +8,7 @@
  * bundle — the verifier never judges anything it didn't record.
  */
 
-import { Observer, isPubliclyRoutableSameOrigin } from './http.js'
+import { Observer, isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
 import type {
   ClaimedEndpoint,
@@ -32,6 +32,13 @@ export const ROLE = {
   openapi: 'surface:openapi',
   keyless: (method: string, path: string) => `probe:endpoint:${method} ${path}`,
   offer: 'probe:402-offer',
+  // MCP OAuth conformance (RFC 9728 / 8414 / 7591 / 7636 / 8707). Recorded only
+  // when agents.json declares an HTTP/SSE MCP interface (interfaces.mcp.url).
+  mcpUnauth: 'probe:mcp:unauthenticated',
+  mcpProtectedResource: 'surface:mcp:oauth-protected-resource',
+  mcpAsMetadata: 'surface:mcp:oauth-authorization-server',
+  /** RFC 8414 fallback well-known: /.well-known/openid-configuration. */
+  mcpAsMetadataOidc: 'surface:mcp:openid-configuration',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -92,10 +99,15 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
   }
   const mcp = interfaces.mcp as Record<string, unknown> | undefined
   if (mcp && typeof mcp === 'object') {
+    // interfaces.mcp.url is CARD-DERIVED and steers OAuth well-known fetches, so
+    // absolutize it (like every other card url) — a relative "/mcp" resolves
+    // same-origin; an absolute attacker url is preserved so the same-origin gate
+    // downstream can DROP it. stdio-only MCP has no url and stays undefined.
+    const mcpRawUrl = str(mcp.url)
     out.mcp = {
       transport: str(mcp.transport),
       command: str(mcp.command),
-      url: str(mcp.url),
+      url: mcpRawUrl !== undefined ? absolutize(mcpRawUrl, origin) : undefined,
       tools: Array.isArray(mcp.tools) ? mcp.tools.filter((t): t is string => typeof t === 'string') : undefined,
     }
   }
@@ -221,6 +233,37 @@ function str(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined
 }
 
+// ---------------------------------------------------------------------------
+// MCP OAuth well-known helpers (pure) — shared by observe + judge
+// ---------------------------------------------------------------------------
+
+/**
+ * The well-known URL at a base's ORIGIN, e.g. wellKnownAt('https://h/mcp',
+ * 'oauth-protected-resource') => 'https://h/.well-known/oauth-protected-resource'.
+ * RFC 9728 / 8414 anchor discovery documents at the origin root. Returns
+ * undefined for an unparseable base (the caller then fetches nothing).
+ */
+export function wellKnownAt(base: string, name: string): string | undefined {
+  try {
+    return `${new URL(base).origin}/.well-known/${name}`
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The first entry of RFC 9728 `authorization_servers[]` from parsed
+ * protected-resource metadata, or undefined. The chase is DELIBERATELY bounded
+ * to ONE declared AS — never an arbitrary walk of the whole array (SSRF: each
+ * extra hop is another attacker-chosen fetch).
+ */
+export function firstAuthorizationServer(protectedResource: unknown): string | undefined {
+  if (!protectedResource || typeof protectedResource !== 'object') return undefined
+  const arr = (protectedResource as Record<string, unknown>).authorization_servers
+  if (!Array.isArray(arr) || arr.length === 0) return undefined
+  return typeof arr[0] === 'string' ? arr[0] : undefined
+}
+
 function absolutize(url: string, origin: string): string {
   try {
     return new URL(url, origin).toString()
@@ -303,6 +346,42 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
       method: agents.offerProbe.method,
       accept: 'application/json',
     })
+  }
+
+  // 4. MCP authorization model (RFC 9728 → 8414 → PKCE/DCR/Resource Indicators).
+  //    Only when the card declares an HTTP/SSE MCP interface (interfaces.mcp.url).
+  //    stdio-only MCP has no url and is not an OAuth resource server — nothing
+  //    is observed and the checks skip.
+  //
+  //    SSRF: the mcpUrl is CARD-DERIVED (adversarial). It is the target's OWN
+  //    MCP endpoint, so it MUST be SAME-ORIGIN with the verification target —
+  //    the identical gate every other card-derived probe passes. A mcpUrl that
+  //    is off-origin or private is DROPPED here (never fetched); checks.ts still
+  //    FAILS the card for it (decided from the URL string alone).
+  const mcpUrl = agents.mcp?.url
+  if (mcpUrl && isPubliclyRoutableSameOrigin(mcpUrl, origin)) {
+    // (d) Probe the MCP endpoint UNAUTHENTICATED — expect 401 + WWW-Authenticate.
+    await observer.observe(ROLE.mcpUnauth, mcpUrl, { accept: 'application/json' })
+    // (a) RFC 9728 protected-resource metadata at the MCP origin (same-origin).
+    const prUrl = wellKnownAt(mcpUrl, 'oauth-protected-resource')
+    const prEv = prUrl ? await observer.observe(ROLE.mcpProtectedResource, prUrl, { accept: 'application/json' }) : undefined
+    // (b) Follow authorization_servers[0] to AS metadata. This ONE declared AS
+    //     MAY be a DIFFERENT origin (a dedicated authorization server), so the
+    //     same-origin gate is INTENTIONALLY not applied here — but the narrow
+    //     off-origin gate still refuses cleartext and any private/loopback/
+    //     link-local/metadata address, and the observer's own initial-url
+    //     backstop refuses private hosts underneath it. The chase is bounded to
+    //     this single AS and https-only; no arbitrary redirect walk.
+    const asBase = firstAuthorizationServer(parseJsonBody(prEv))
+    if (asBase && isPublicHttpsOffOriginAllowed(asBase)) {
+      const asUrl = wellKnownAt(asBase, 'oauth-authorization-server')
+      const asEv = asUrl ? await observer.observe(ROLE.mcpAsMetadata, asUrl, { accept: 'application/json' }) : undefined
+      // RFC 8414 fallback: OpenID Connect discovery document.
+      if (!asEv || asEv.status === null || asEv.status < 200 || asEv.status >= 300) {
+        const oidcUrl = wellKnownAt(asBase, 'openid-configuration')
+        if (oidcUrl) await observer.observe(ROLE.mcpAsMetadataOidc, oidcUrl, { accept: 'application/json' })
+      }
+    }
   }
 
   return { target: origin, fetchedAt: new Date().toISOString(), seed, items: observer.items }
