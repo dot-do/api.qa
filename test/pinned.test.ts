@@ -477,6 +477,204 @@ describe('kind:probe — card-declared probe requirements', () => {
 })
 
 // ---------------------------------------------------------------------------
+// endpoint capture + chaining — a created id feeds a later read/list
+// ---------------------------------------------------------------------------
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+}
+
+/**
+ * A stateful `/listings` collection layered over the good target's surfaces, so
+ * discovery still works. POST creates (returns a server-minted id), GET
+ * /listings/{id} reads it back, GET /listings lists the ids. A fetch-spy records
+ * every URL the observer actually put on the wire.
+ */
+function crudFetcher(opts: {
+  postResponse?: (body: Record<string, unknown>, id: string) => { status: number; body: unknown }
+  readResponse?: (id: string, data: Record<string, unknown>) => { status: number; body: unknown } | undefined
+  collection?: (ids: string[]) => { status: number; body: unknown }
+} = {}): { fetcher: Fetcher; fetched: string[] } {
+  const base = makeFetcher(goodTargetRoutes())
+  const store: Array<{ id: string; data: Record<string, unknown> }> = []
+  const fetched: string[] = []
+  let counter = 0
+  const fetcher: Fetcher = async (url, init) => {
+    fetched.push(url)
+    const u = new URL(url)
+    const method = (init?.method ?? 'GET').toUpperCase()
+    if (u.pathname === '/listings' && method === 'POST') {
+      counter += 1
+      const id = `l${counter}`
+      const data = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as Record<string, unknown>
+      store.push({ id, data })
+      const out = opts.postResponse ? opts.postResponse(data, id) : { status: 200, body: { id, ...data } }
+      return jsonResponse(out.status, out.body)
+    }
+    if (u.pathname === '/listings' && method === 'GET') {
+      const ids = store.map((s) => s.id)
+      const out = opts.collection ? opts.collection(ids) : { status: 200, body: { ids } }
+      return jsonResponse(out.status, out.body)
+    }
+    const m = u.pathname.match(/^\/listings\/(.+)$/)
+    if (m && method === 'GET') {
+      const id = decodeURIComponent(m[1]!)
+      const rec = store.find((s) => s.id === id)
+      const out = opts.readResponse
+        ? opts.readResponse(id, rec?.data ?? {})
+        : rec
+          ? { status: 200, body: { id: rec.id, ...rec.data } }
+          : { status: 404, body: { error: 'not found' } }
+      if (!out) return jsonResponse(404, { error: 'not found' })
+      return jsonResponse(out.status, out.body)
+    }
+    return base(url, init)
+  }
+  return { fetcher, fetched }
+}
+
+/** POST /listings capturing id → GET /listings/{{id}} → GET /listings has it. */
+const CRUD_CHAIN = [
+  {
+    id: 'create', kind: 'endpoint', method: 'POST', path: '/listings',
+    body: { title: 'Blue widget' },
+    capture: { create_id: 'id' },
+    expect: { status: 200, paths: [{ path: 'id', exists: true }] },
+  },
+  {
+    id: 'read', kind: 'endpoint', method: 'GET', path: '/listings/{{create_id}}',
+    expect: {
+      status: 200,
+      schema: { type: 'object', required: ['id', 'title'] },
+      paths: [{ path: 'id', equals: '{{create_id}}' }],
+    },
+  },
+  {
+    id: 'list-has', kind: 'endpoint', method: 'GET', path: '/listings',
+    expect: { status: 200, paths: [{ path: 'ids.0', equals: '{{create_id}}' }] },
+  },
+]
+
+describe('endpoint capture + chaining', () => {
+  it('runs the full CRUD chain GREEN: create captures id, read + list chain on {{create_id}}', async () => {
+    const { fetcher } = crudFetcher()
+    const report = await verifyPinnedSpec(GOOD, probeSpec(CRUD_CHAIN), {
+      fetcher, delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
+    // The capture is recorded as bundle DATA…
+    expect(report.evidence.bindings).toEqual({ create_id: 'l1' })
+    // …and the read fetched the RESOLVED, interpolated URL (never the token).
+    const read = report.evidence.items.find((e) => e.role === 'pinned:read')!
+    expect(read.url).toBe(`${GOOD}/listings/l1`)
+    expect(read.url).not.toContain('{{')
+  })
+
+  it('fails with a MISMATCH detail against a target that does not implement the read', async () => {
+    const { fetcher, fetched } = crudFetcher({
+      readResponse: () => ({ status: 404, body: { error: 'not found' } }),
+    })
+    const report = await verifyPinnedSpec(GOOD, probeSpec(CRUD_CHAIN), {
+      fetcher, delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(report.passed).toBe(false)
+    const read = report.requirements.find((r) => r.id === 'read')!
+    expect(read.verdict).toBe('fail')
+    expect(read.detail).toMatch(/status 404, wanted 200/)
+    // It still resolved + fetched the real interpolated URL (fail is a mismatch,
+    // not an unresolved-var).
+    expect(fetched.some((u) => u === `${GOOD}/listings/l1`)).toBe(true)
+  })
+
+  it('a reference to an undefined capture var FAILS closed with a naming detail — token never fetched', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([
+      { id: 'bad', kind: 'endpoint', method: 'GET', path: '/listings/{{never_produced}}', expect: { status: 200 } },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(report.passed).toBe(false)
+    const bad = report.requirements.find((r) => r.id === 'bad')!
+    expect(bad.verdict).toBe('fail')
+    expect(bad.detail).toMatch(/requirement bad references undefined capture var \{\{never_produced\}\}/)
+    // The literal token was never put on the wire, nor was any /listings/ read.
+    expect(fetched.some((u) => u.includes('{{') || u.includes('never_produced'))).toBe(false)
+    expect(fetched.some((u) => u.startsWith(`${GOOD}/listings/`))).toBe(false)
+  })
+
+  it('captures a dot-path into a NESTED array body and interpolates it into a path + expected value', async () => {
+    const base = makeFetcher(goodTargetRoutes())
+    const fetched: string[] = []
+    const fetcher: Fetcher = async (url, init) => {
+      fetched.push(url)
+      const u = new URL(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (u.pathname === '/thing' && method === 'POST') {
+        return jsonResponse(200, { data: [{ id: 'abc-123' }, { id: 'zzz-999' }] })
+      }
+      const m = u.pathname.match(/^\/thing\/(.+)$/)
+      if (m && method === 'GET') return jsonResponse(200, { id: decodeURIComponent(m[1]!), ok: true })
+      return base(url, init)
+    }
+    const spec = probeSpec([
+      {
+        id: 'make', kind: 'endpoint', method: 'POST', path: '/thing', body: {},
+        capture: { nid: 'data.0.id' },
+        expect: { status: 200 },
+      },
+      {
+        id: 'fetch-nested', kind: 'endpoint', method: 'GET', path: '/thing/{{nid}}',
+        expect: { status: 200, paths: [{ path: 'id', equals: '{{nid}}' }] },
+      },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
+    expect(report.evidence.bindings).toEqual({ nid: 'abc-123' })
+    expect(fetched.some((u) => u === `${GOOD}/thing/abc-123`)).toBe(true)
+  })
+
+  it('is DETERMINISTIC: two runs record identical bindings, resolved URLs, and verdicts (replay-safe)', async () => {
+    const run = () =>
+      verifyPinnedSpec(GOOD, probeSpec(CRUD_CHAIN), {
+        fetcher: crudFetcher().fetcher, delayMs: 0, seed: 1, mode: 'local',
+      })
+    const a = await run()
+    const b = await run()
+    expect(a.evidence.bindings).toEqual(b.evidence.bindings)
+    const pinnedUrls = (r: typeof a) =>
+      r.evidence.items.filter((e) => e.role.startsWith('pinned:')).map((e) => [e.role, e.url])
+    expect(pinnedUrls(a)).toEqual(pinnedUrls(b))
+    const verdicts = (r: typeof a) => r.requirements.map((x) => [x.id, x.verdict, x.detail])
+    expect(verdicts(a)).toEqual(verdicts(b))
+  })
+
+  it('SSRF: a TARGET-CONTROLLED captured value that resolves off-origin/private is REFUSED without a fetch', async () => {
+    for (const evil of ['http://169.254.169.254/latest/meta-data/', 'https://evil.example/exfil', '//evil.example/x']) {
+      const { fetcher, fetched } = crudFetcher({
+        // The target smuggles an absolute off-origin/private URL back in its body.
+        postResponse: (_body, id) => ({ status: 200, body: { id, next: evil } }),
+      })
+      const spec = probeSpec([
+        {
+          id: 'create', kind: 'endpoint', method: 'POST', path: '/listings', body: {},
+          capture: { next: 'next' },
+          expect: { status: 200 },
+        },
+        // The whole path is the captured value — the classic smuggle vector.
+        { id: 'follow', kind: 'endpoint', method: 'GET', path: '{{next}}', expect: { status: 200 } },
+      ])
+      const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+      expect(report.passed).toBe(false)
+      const follow = report.requirements.find((r) => r.id === 'follow')!
+      expect(follow.verdict).toBe('fail')
+      expect(follow.detail).toMatch(/off-origin\/private|fail closed/)
+      // The dangerous host was NEVER fetched.
+      expect(fetched.some((u) => u.includes('169.254.169.254')), `fetched ${evil}`).toBe(false)
+      expect(fetched.some((u) => u.includes('evil.example')), `fetched ${evil}`).toBe(false)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // probe-manifest check (checks.ts) — the manifest validity judge
 // ---------------------------------------------------------------------------
 

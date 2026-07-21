@@ -39,6 +39,16 @@ export interface EvidenceBundle {
   /** Seed used for any sampled probes; recorded so replays reproduce. */
   seed: number
   items: Evidence[]
+  /**
+   * Pinned-mode variable-capture scope: `varName -> value` bound by `endpoint`
+   * requirements whose `capture` map extracted a value AFTER their assertions
+   * passed. Recorded as DATA in the bundle so replay re-judges identically
+   * WITHOUT re-fetching — the determinism contract holds because captured
+   * values, the resolved (post-interpolation) URLs (Evidence.url), and the
+   * response bodies are all in the bundle. The judge rebuilds this same scope
+   * purely from the stored evidence; this field is the transparent record.
+   */
+  bindings?: Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +226,24 @@ export type PinnedRequirement =
       /** JSON body for POST/PUT probes (pinned mode is consent mode). */
       body?: unknown
       expect: EndpointExpect
+      /**
+       * Response variable-capture. `varName -> dot-path` into the parsed JSON
+       * response body (e.g. `{ id: 'id' }` or `{ id: 'data.0.id' }`). AFTER this
+       * requirement's assertions pass, each dot-path is extracted and bound into
+       * the per-run capture scope. A later requirement chains on the value with a
+       * `{{varName}}` token in its `method` / `path` / `body` / `expect` (paths
+       * and expected values) — e.g. POST /listings capturing `id`, then
+       * GET /listings/{{id}}. Interpolation is resolved at OBSERVE time, in
+       * requirement-array order, AFTER the producing requirement has run.
+       *
+       * Fail-closed contract: a `{{var}}` reference to an undefined / not-yet-
+       * produced var FAILS the referencing requirement with a clear detail — the
+       * literal token is NEVER sent on the wire. And the resolved (post-
+       * interpolation) URL is re-gated same-origin + publicly-routable + non-
+       * private, so a TARGET-CONTROLLED captured value cannot smuggle an
+       * off-origin / private-IP request: it fails closed WITHOUT being fetched.
+       */
+      capture?: Record<string, string>
     }
   | {
       id: string

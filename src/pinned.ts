@@ -19,7 +19,12 @@
  * spec digest passing on the deployed api.qa against the deployed target.
  */
 
-import { Observer, normalizeTarget, isPubliclyRoutableSameOrigin, type ObserverOpts } from './http.js'
+import {
+  Observer,
+  normalizeTarget,
+  isPubliclyRoutableSameOrigin,
+  type ObserverOpts,
+} from './http.js'
 import { observeTarget, ROLE, parseAgentsJson, parseJsonBody, parseOpenapi } from './discovery.js'
 import { runChecks } from './checks.js'
 import { axScoreOf } from './grade.js'
@@ -100,13 +105,33 @@ export async function verifyPinnedSpec(
   const bundle = await observeTarget(origin, observer, seed)
 
   // Extra observations demanded by the spec's endpoint requirements.
+  //
+  // Endpoint requirements run in requirement-array order and share a per-run
+  // BINDING SCOPE: a requirement may `capture` values out of its response, and a
+  // LATER requirement may interpolate them with `{{var}}` tokens into its
+  // method/path/body/expect. Interpolation happens HERE, at observe time, after
+  // the producing requirement has already run — the loop is sequential, so the
+  // scope is populated in dependency order.
+  const bindings: Bindings = {}
   for (const req of spec.requirements) {
-    if (req.kind === 'endpoint') {
-      await observer.observe(`pinned:${req.id}`, `${origin}${req.path}`, {
-        method: req.method,
-        accept: 'application/json',
-        body: req.body,
-      })
+    if (req.kind !== 'endpoint') continue
+    const resolved = resolveEndpoint(req, origin, bindings)
+    // Fail-closed: an undefined-var reference, an unparseable resolved path, or
+    // a resolved URL that is off-origin/private is NEVER fetched. No evidence is
+    // recorded; the judge re-derives the identical resolution failure purely
+    // from the bundle and reports the same detail. This is the SSRF gate for a
+    // TARGET-CONTROLLED captured value: it cannot smuggle an off-origin request.
+    if (!resolved.ok) continue
+    const ev = await observer.observe(`pinned:${req.id}`, resolved.url, {
+      method: resolved.method,
+      accept: 'application/json',
+      body: resolved.body,
+    })
+    // Capture AFTER assertions pass (judgeExpect is pure — safe to call here to
+    // gate the capture). A capture path that does not resolve simply leaves the
+    // var unbound, so a downstream reference fails closed, never silently skips.
+    if (req.capture && judgeExpect(ev, resolved.expect).length === 0) {
+      captureInto(bindings, req.capture, ev)
     }
   }
 
@@ -185,12 +210,20 @@ export async function verifyPinnedSpec(
       await observer.observe(`pinned:${req.id}:${i}`, url, { accept: 'application/json' })
     }
   }
-  const fullBundle: EvidenceBundle = { ...bundle, items: observer.items }
+  const fullBundle: EvidenceBundle = { ...bundle, items: observer.items, bindings }
 
   // Judge (pure over the bundle).
   const surfaceChecks = runChecks(fullBundle)
   const axScore = axScoreOf(surfaceChecks)
   const results: CheckResult[] = []
+
+  // The judge rebuilds the capture scope INCREMENTALLY, in the same requirement
+  // order, reading response bodies straight out of the bundle. This is what
+  // makes judging pure over the bundle AND order-respecting: a `{{var}}`
+  // referenced before it is produced fails closed with the same undefined-var
+  // detail the observe phase saw, and a replay of a stored bundle re-judges
+  // identically without any re-fetch.
+  const judgeBindings: Bindings = {}
 
   for (const req of spec.requirements) {
     if (req.kind === 'surface') {
@@ -239,11 +272,27 @@ export async function verifyPinnedSpec(
         evidence: c?.evidence ?? [],
       })
     } else if (req.kind === 'endpoint') {
+      // Re-resolve interpolation/capture-chaining PURELY from the judge scope
+      // (rebuilt from the bundle). A resolution failure — undefined `{{var}}`,
+      // unparseable path, or an off-origin/private resolved URL — is a hard fail
+      // that was NEVER fetched.
+      const resolved = resolveEndpoint(req, origin, judgeBindings)
+      if (!resolved.ok) {
+        results.push({
+          id: req.id, title: `${req.method} ${req.path}`, verdict: 'fail',
+          detail: resolved.detail, evidence: [],
+        })
+        continue
+      }
       const ev = fullBundle.items.find((e) => e.role === `pinned:${req.id}`)
-      const problems = judgeExpect(ev, req.expect)
+      const problems = judgeExpect(ev, resolved.expect)
       const verdict: Verdict = problems.length === 0 ? 'pass' : 'fail'
+      // Bind captures for downstream requirements — mirrors the observe phase
+      // exactly (same bodies, same capture-on-pass gate), so the two scopes are
+      // identical by construction.
+      if (verdict === 'pass' && req.capture) captureInto(judgeBindings, req.capture, ev)
       results.push({
-        id: req.id, title: `${req.method} ${req.path}`, verdict,
+        id: req.id, title: `${req.method} ${resolved.url}`, verdict,
         detail: verdict === 'pass' ? 'behaved as pinned' : problems.join('; '),
         evidence: [`pinned:${req.id}`],
       })
@@ -368,6 +417,126 @@ function okPathnamesOf(bundle: EvidenceBundle): Set<string> {
   }
   okPathnamesCache.set(bundle, out)
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Variable-capture + chaining (endpoint requirements)
+// ---------------------------------------------------------------------------
+
+/** Per-run capture scope: `varName -> value` extracted from a response body. */
+type Bindings = Record<string, unknown>
+
+type EndpointReq = Extract<PinnedRequirement, { kind: 'endpoint' }>
+
+/** `{{var}}` token — dot/word chars only (matches a capture var name). */
+const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g
+
+/**
+ * Interpolate every `{{var}}` in a string from the binding scope. A reference
+ * to an unbound var is an ERROR (fail-closed) — the literal token is never
+ * emitted onto the wire. Bound values render as their primitive text; a bound
+ * object/array renders as compact JSON.
+ */
+function interpolateString(s: string, bindings: Bindings): { value: string } | { error: string } {
+  let undef: string | undefined
+  const value = s.replace(VAR_TOKEN, (_m, name: string) => {
+    if (!Object.hasOwn(bindings, name)) {
+      undef ??= name
+      return ''
+    }
+    const v = bindings[name]
+    if (v === null || v === undefined) return ''
+    return typeof v === 'object' ? JSON.stringify(v) : String(v)
+  })
+  if (undef !== undefined) return { error: `undefined capture var {{${undef}}}` }
+  return { value }
+}
+
+/** Deep-interpolate strings inside an arbitrary JSON value (body / expect). */
+function interpolateDeep(value: unknown, bindings: Bindings): { value: unknown } | { error: string } {
+  if (typeof value === 'string') return interpolateString(value, bindings)
+  if (Array.isArray(value)) {
+    const out: unknown[] = []
+    for (const item of value) {
+      const r = interpolateDeep(item, bindings)
+      if ('error' in r) return r
+      out.push(r.value)
+    }
+    return { value: out }
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value)) {
+      const r = interpolateDeep(v, bindings)
+      if ('error' in r) return r
+      out[k] = r.value
+    }
+    return { value: out }
+  }
+  return { value }
+}
+
+type ResolvedEndpoint =
+  | { ok: true; method: string; url: string; body: unknown; expect: EndpointExpect }
+  | { ok: false; detail: string }
+
+/**
+ * Resolve an endpoint requirement against the current binding scope: interpolate
+ * method/path/body/expect, build the concrete URL, and RE-GATE it through the
+ * SAME same-origin + publicly-routable + non-private check every pinned fetch
+ * uses. Because a captured value is target-controlled, this gate is what stops a
+ * malicious target from steering an interpolated path off-origin or at a
+ * private/metadata address — such a resolution fails closed and is never
+ * fetched. Deterministic in `bindings`, so observe and judge agree.
+ */
+function resolveEndpoint(req: EndpointReq, origin: string, bindings: Bindings): ResolvedEndpoint {
+  const under = (detail: string): ResolvedEndpoint => ({
+    ok: false,
+    detail: `requirement ${req.id} references ${detail}`,
+  })
+  const m = interpolateString(req.method, bindings)
+  if ('error' in m) return under(m.error)
+  const p = interpolateString(req.path, bindings)
+  if ('error' in p) return under(p.error)
+  const b = interpolateDeep(req.body, bindings)
+  if ('error' in b) return under(b.error)
+  const e = interpolateDeep(req.expect, bindings)
+  if ('error' in e) return under(e.error)
+
+  let url: URL
+  try {
+    url = new URL(p.value, `${origin}/`)
+  } catch {
+    return { ok: false, detail: `requirement ${req.id} resolved to an unparseable url from path "${p.value}"` }
+  }
+  const resolvedUrl = url.toString()
+  if (!isPubliclyRoutableSameOrigin(resolvedUrl, origin)) {
+    return {
+      ok: false,
+      detail:
+        `requirement ${req.id} resolved to off-origin/private url ${resolvedUrl} ` +
+        '(a captured value must not steer the request off-origin) — refused, fail closed',
+    }
+  }
+  return { ok: true, method: m.value.toUpperCase(), url: resolvedUrl, body: b.value, expect: e.value as EndpointExpect }
+}
+
+/**
+ * Extract each `capture` dot-path from an observed response body and bind it.
+ * A path that does not resolve (or a non-JSON body) leaves the var UNBOUND, so a
+ * downstream `{{var}}` reference fails closed rather than silently skipping.
+ */
+function captureInto(bindings: Bindings, capture: Record<string, string>, ev: Evidence | undefined): void {
+  let body: unknown
+  try {
+    body = JSON.parse(ev?.body ?? '')
+  } catch {
+    return
+  }
+  for (const [varName, path] of Object.entries(capture)) {
+    const r = readPath(body, path)
+    if (r.found) bindings[varName] = r.value
+  }
 }
 
 /**
