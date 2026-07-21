@@ -19,7 +19,8 @@
 
 import { verifyTarget, rejudge } from './verify.js'
 import { verifyPinnedSpec, type PinnedReport } from './pinned.js'
-import { reportMarkdown, reportHtml, pinnedMarkdown } from './render.js'
+import { reportMarkdown, pinnedMarkdown } from './render.js'
+import { landingHtml, reportPageHtml } from './views.js'
 import { generateSigningKey, importSigningKeyPair } from './attest.js'
 import { sha256Hex } from './digest.js'
 import type { Fetcher } from './http.js'
@@ -42,7 +43,6 @@ import {
   SELF_ORIGIN,
   selfAgentsJson,
   selfIcpJson,
-  selfLandingHtml,
   selfLlmsTxt,
   selfOffer,
   selfOpenapi,
@@ -118,7 +118,7 @@ export function createApp(
         if (request.method === 'GET' || request.method === 'HEAD') {
           if (path === '/') {
             return accept.includes('text/html')
-              ? html(selfLandingHtml())
+              ? html(landingHtml())
               : text(selfLlmsTxt())
           }
           if (path === '/llms.txt') return text(selfLlmsTxt())
@@ -294,7 +294,7 @@ function cacheHeaders(meta?: CacheMeta): Record<string, string> {
 function respondReport(report: VerificationReport, accept: string, meta?: CacheMeta): Response {
   const headers = cacheHeaders(meta)
   if (accept.includes('application/json')) return json(report, 200, headers)
-  if (accept.includes('text/html')) return html(reportHtml(report), 200, headers)
+  if (accept.includes('text/html')) return html(reportPageHtml(report), 200, headers)
   return text(reportMarkdown(report), 200, headers)
 }
 

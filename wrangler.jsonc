@@ -46,7 +46,7 @@
   // DOs), deleted by tag `v2-verifier` with the 2026-07-19 supersede deploy.
   // Tag `v3-cooldown` introduces the new SQLite-backed DomainCooldown class.
   "migrations": [
-    { "tag": "v2-verifier", "deleted_classes": ["ScannerDurable", "StatisticsDurable"] },
+    { "tag": "v2-verifier" },
     { "tag": "v3-cooldown", "new_sqlite_classes": ["DomainCooldown"] }
   ]
 }
