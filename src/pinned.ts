@@ -69,16 +69,31 @@ export function parsePinnedSpec(text: string): PinnedSpec {
   if (doc.$type !== 'PinnedSpec' || !Array.isArray(doc.requirements)) {
     throw new Error('not a PinnedSpec: expected {"$type":"PinnedSpec","requirements":[...]}')
   }
-  // Requirement ids MUST be unique. Observe captures/fetches by loop POSITION,
-  // but the judge indexes evidence by `find(role === 'pinned:<id>')`, which
-  // returns the FIRST match. A duplicate id would make the two phases resolve
-  // to different items — self-contradictory reports that violate the
-  // observe/judge determinism invariant. Reject the spec up front, naming the
-  // offender, rather than verify something incoherent.
+  // Every requirement id MUST be a UNIQUE, NON-EMPTY STRING. The role key
+  // (`pinned:<id>`) is what observe records evidence under and what the judge
+  // looks up by `find(role === 'pinned:<id>')` (FIRST match). A PinnedSpec is
+  // EXTERNAL JSON parsed at runtime, so the `id: string` TS type is a
+  // compile-time fiction: a runtime id can be a number, boolean, null, missing,
+  // or the empty string. Any of those, or a duplicate, would let two
+  // requirements share one role — observe records under it by loop POSITION,
+  // the judge resolves BOTH to the first match — a self-contradictory report
+  // that re-opens the observe/judge divergence. Two numeric `1`s collapse to
+  // `pinned:1`; two missing ids to `pinned:undefined`. So reject any id that is
+  // not a unique non-empty string LOUDLY at parse, naming the offender — never
+  // `continue`-skip it. (Numeric `1` and string `"1"` both become the same
+  // role, so rejecting every non-string id also stops that cross-type
+  // collision.)
   const seen = new Set<string>()
   for (const req of doc.requirements) {
     const id = (req as { id?: unknown }).id
-    if (typeof id !== 'string') continue
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new Error(
+        `invalid requirement id ${JSON.stringify(id)} in PinnedSpec — every requirement id must be ` +
+          'a unique NON-EMPTY STRING. This spec is external JSON: a numeric/boolean/null/missing/empty ' +
+          'id collapses to a shared role (pinned:<id>), making observe and the judge resolve different ' +
+          'requirements — refusing to verify something incoherent',
+      )
+    }
     if (seen.has(id)) {
       throw new Error(
         `duplicate requirement id "${id}" in PinnedSpec — requirement ids must be unique ` +
@@ -486,9 +501,16 @@ function interpolateString(s: string, bindings: Bindings): { value: string } | {
  * value is judged/serialized as the value it is — not falsely stringified to
  * `"1"` where `judgeExpect` would then mismatch `1`. Any other string (a
  * partial/embedded token, or plain text) falls through to string coercion.
+ *
+ * Surrounding whitespace is incidental, not embedding: `'{{tid}} '` or
+ * `' {{x}} '` is still a lone whole-value token meant AS the value, so it is
+ * TRIMMED before classification — otherwise the trailing space would push it
+ * onto the string-coercing path and silently false-FAIL a compliant numeric
+ * target (`"1 "` vs `1`). A token adjacent to NON-whitespace text (`'v{{n}}'`,
+ * `'{{a}}{{b}}'`) is genuine embedded interpolation and still coerces.
  */
 function interpolateTypedString(s: string, bindings: Bindings): { value: unknown } | { error: string } {
-  const whole = WHOLE_VALUE_TOKEN.exec(s)
+  const whole = WHOLE_VALUE_TOKEN.exec(s.trim())
   if (whole) {
     const name = whole[1]!
     if (!Object.hasOwn(bindings, name)) return { error: `undefined capture var {{${name}}}` }
