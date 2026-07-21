@@ -39,7 +39,7 @@ specific attack.
 | 6 | **Tamper with the local verifier** (wrap `npx api.qa`, patch the binary, or fake its output in the hill-climb loop) | Local mode is *advisory by construction*: local reports carry `attested: false` and no signature, and nothing downstream should accept them as evidence. The only signing key lives as a deploy secret on the held-out service. The weekend build's definition of done is "the deployed api.qa says green," not "my local api.qa says green." | built |
 | 7 | **Forge or cherry-pick reports** (doctor a JSON report, or re-run until a flaky pass) | Reports are Ed25519-signed over the canonical report digest; `verifyAttestation` + `rejudge` let anyone (a) check the signature, (b) re-run the pure judge over the embedded evidence and confirm the grade reproduces. Determinism removes the flake-mining channel: same evidence cannot re-judge to a different verdict. | built |
 | 8 | **Compromise the verifier itself** (the fleet gains write access to api.qa's repo) | Two layers. (a) The signing key is never in the repo — a fleet that owns the code still can't mint attested history, and key rotation invalidates the window. (b) The self-referential gate: api.qa's test suite verifies api.qa through its own public protocols (`test/self.test.ts`); a corrupted judge that grades dishonestly must also fool the judge's own published contract. Honest residual: a fully compromised verifier + key is game over — that's why the repo/key governance sits with the studio, not with any build fleet (seam: grant/attestation core). | partially built |
-| 9 | **Use api.qa as a weapon** (SSRF into internal networks, probe-cannon DoS against third parties) | `normalizeTarget` refuses private hosts, IP literals, single-label names, `.local`/`.internal` (deployed mode). The Observer is read-only (GET/HEAD) outside pinned-consent mode, budgeted (24 req/run), spaced (150ms), body-capped (256KB), timeout-bounded. Write probes exist only in pinned-spec mode, where the target is by definition the caller's own. | built (per-domain global cooldown is a deploy seam — needs a DO) |
+| 9 | **Use api.qa as a weapon** (SSRF into internal networks, probe-cannon DoS against third parties) | `normalizeTarget` refuses private hosts, IP literals, single-label names, `.local`/`.internal` (deployed mode). The Observer is read-only (GET/HEAD) outside pinned-consent mode, budgeted (24 req/run), spaced (150ms), body-capped (256KB), timeout-bounded. Write probes exist only in pinned-spec mode, where the target is by definition the caller's own. **Per-domain global cooldown is now wired** (`src/cooldown.ts`, `DomainCooldown` DO): one DO instance per domain (`idFromName(host)`) enforces a minimum inter-probe interval across every isolate, so fanning a probe-cannon across the edge is denied globally, not per-isolate. A domain in cooldown is served a stale cached verdict (`src/cache.ts` KV) or a `429` with `Retry-After` — the third party is never re-probed. | built (SSRF guards + Observer budget + cross-isolate cooldown DO + KV cache) |
 | 10 | **Time-shift the state** (present good state to the verifier at T0, degrade at T1, keep waving the T0 report) | A report attests *a target state at a time*: evidence digest + timestamp are in the signed body. Consumers of the evidence (fixation gate, R19 counters, CI gates) must demand freshness — the reverify-policy machinery in services-as-software v3 is exactly this consumer, and the CI-webhook offer productizes it. | designed (reverify wiring is a seam) |
 | 11 | **Goodhart the AX score itself** (surfaces that exist but lie) | The two non-scoring honesty checks: `schema-conformance` (sampled responses must match the published schemas) and `claims-honesty` (claimed endpoints must exist). Either failing **caps the grade at C** no matter the score — a lying surface is worse than a missing one. Honest residual: `mcp-declared` and 402 `declared-only` are presence-grade in the MVP (noted in their own verdict text); behavioral MCP spawn and paid-boundary probes are seams. | built, with named residuals |
 
@@ -172,10 +172,37 @@ Run it today (advisory, from this repo): `npx api.qa auto.dev`.
 2. **x402 / payment settlement.** `/offers/attested-run` returns the correct
    402 shape with a placeholder `checkoutUrl`. Wiring: x402 agent-wallet
    settlement + Stripe checkout for the B2H2A path.
-3. **Deploy.** `wrangler.jsonc` pins the shape; needs: `SIGNING_KEY` secret
-   (mint once, never in repo), KV report cache + per-domain cooldown DO
-   (politeness across isolates), custom-domain route, key-rotation story.
-   .qa DNS sits at Netim — cutover rides the #9 evacuation like the .ax roots.
+3. **Deploy.** *Reconciled 2026-07-21.* The historical contradiction: the old
+   `wrangler.jsonc` header said "Nothing deploys from this spike," yet commit
+   9ad59bb ("deploy: supersede legacy api-qa worker…") turned `workers_dev`
+   on, bound the custom domain `api.qa`, set the `SIGNING_KEY` secret, and
+   applied migration `v2-verifier` to delete the legacy 2022–2024 worker's DOs.
+   The truth per git is that a real supersede deploy happened; the "nothing
+   deploys" line predated it and was stale. `wrangler.jsonc` now pins the
+   coherent production shape:
+   - `routes: [{ pattern: "api.qa", custom_domain: true }]`, `workers_dev: true`
+   - **Secret** `SIGNING_KEY` (base64 pkcs8 Ed25519 — `wrangler secret put`,
+     never in repo; a single held-out key the fleet cannot read).
+   - **KV** `REPORTS` — the report cache (per-target cooldown horizon +
+     content-addressed replay store: `report:{host}:{evidenceDigest}` with a
+     `head:{host}` pointer; pinned runs `pinned:{host}:{specDigest}`).
+     `src/cache.ts`. Provision: `wrangler kv namespace create REPORTS`, paste
+     the id (the placeholder in `wrangler.jsonc` must be replaced before deploy).
+   - **DO** `COOLDOWN` (class `DomainCooldown`, migration tag `v3-cooldown`,
+     `new_sqlite_classes`) — the per-domain politeness budget across isolates.
+     `src/cooldown.ts`.
+   - Optional vars `CACHE_TTL_SECONDS` (default 300), `COOLDOWN_MIN_INTERVAL_MS`
+     (default 60000). Both cache and cooldown are **absent-safe**: with no
+     binding the Worker behaves exactly as the pre-wiring spike (every isolate
+     probes fresh) — which is why the hermetic test suite still runs unchanged.
+   Still open on this seam: minting/rotating the signing key (key-rotation
+   story), and provisioning the two real resource IDs. **Nothing here deploys
+   automatically** — this repo makes the config coherent; the operator runs
+   `wrangler deploy`. .qa DNS sits at Netim — cutover rides the #9 evacuation
+   like the .ax roots. The purity boundary is intact: the KV cache and the DO
+   only decide *whether to mint a fresh verdict or serve a stored one*; the
+   judge is still a pure function of the EvidenceBundle (same bundle →
+   byte-identical verdict), and `rejudge()` still reproduces any cached report.
 4. **Reverify policy.** services-as-software v3's `reverify-policy` +
    `EvaluatorPanel` are the abstract layer this productizes; the CI-webhook
    offer is reverify-as-a-subscription. Panel personas would upgrade pinned

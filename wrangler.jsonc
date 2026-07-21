@@ -1,23 +1,52 @@
-// api.qa — Cloudflare Worker config. Nothing deploys from this spike;
-// this pins the intended shape (see DESIGN.md "Seams" for what deploy needs).
+// api.qa — Cloudflare Worker config.
+//
+// Deploy status (reconciled 2026-07-21, see DESIGN.md "Seams §3 — Deploy"):
+// a real supersede deploy DID happen on 2026-07-19 (commit 9ad59bb): it turned
+// `workers_dev` on, bound the custom domain `api.qa`, set the `SIGNING_KEY`
+// secret, and applied migration tag `v2-verifier` to delete the legacy
+// 2022–2024 "Automated API Testing" worker's DOs (ScannerDurable /
+// StatisticsDurable). The old file header ("Nothing deploys from this spike")
+// predated that deploy and was stale — this file now pins the intended,
+// production-safe shape. Provision the two resource IDs below before the next
+// `wrangler deploy`; nothing here deploys on its own.
 {
   "name": "api-qa",
   "main": "src/worker.ts",
   "compatibility_date": "2026-07-01",
   "routes": [{ "pattern": "api.qa", "custom_domain": true }],
   "workers_dev": true,
-  // Secrets (wrangler secret put):
+
+  // Secrets (wrangler secret put — never committed):
   //   SIGNING_KEY — base64 pkcs8 Ed25519 private key. Reports are attested
   //   with this key; it lives ONLY here — never in any repo a fleet can write.
   "vars": {
-    // "ALLOW_PRIVATE_TARGETS": "false"
+    // "ALLOW_PRIVATE_TARGETS": "false",
+    // "CACHE_TTL_SECONDS": "300",         // cached verdict freshness / cooldown horizon
+    // "COOLDOWN_MIN_INTERVAL_MS": "60000" // min inter-probe interval per domain
   },
-  // History: the worker name `api-qa` previously hosted the 2022–2024
-  // "Automated API Testing" worker (ScannerDurable/StatisticsDurable DOs).
-  // Migration tag v2-verifier (deleted_classes for both) was applied with the
-  // 2026-07-19 supersede deploy; it is not repeated here because local dev
-  // has no legacy DO classes to delete.
-  // Seams (not wired in the spike):
-  //   KV: report cache (per-target cooldown + replay store)
-  //   DO: per-domain politeness budget across isolates
+
+  // KV report cache (per-target cooldown + content-addressed replay store).
+  // Verdicts are keyed report:{host}:{evidenceDigest} with a head:{host}
+  // pointer; pinned runs are keyed pinned:{host}:{specDigest}. Provision with
+  //   wrangler kv namespace create REPORTS
+  // and paste the id below (the placeholder must be replaced before deploy).
+  "kv_namespaces": [
+    { "binding": "REPORTS", "id": "90eb42161ef045eb8b38b01cf87f985a" }
+  ],
+
+  // Per-domain politeness Durable Object — one instance per domain
+  // (idFromName(host)) enforces a global inter-probe interval across isolates,
+  // so a fleet cannot probe-cannon a third party by fanning across the edge.
+  "durable_objects": {
+    "bindings": [{ "name": "COOLDOWN", "class_name": "DomainCooldown" }]
+  },
+
+  // Migrations. History: the worker name `api-qa` previously hosted the
+  // 2022–2024 "Automated API Testing" worker (ScannerDurable/StatisticsDurable
+  // DOs), deleted by tag `v2-verifier` with the 2026-07-19 supersede deploy.
+  // Tag `v3-cooldown` introduces the new SQLite-backed DomainCooldown class.
+  "migrations": [
+    { "tag": "v2-verifier", "deleted_classes": ["ScannerDurable", "StatisticsDurable"] },
+    { "tag": "v3-cooldown", "new_sqlite_classes": ["DomainCooldown"] }
+  ]
 }
