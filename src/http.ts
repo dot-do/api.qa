@@ -199,7 +199,12 @@ export class Observer {
 // ---------------------------------------------------------------------------
 
 const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\]|\[fe80:|\[fc|\[fd|.*\.(local|internal|localhost))/i
-const IP_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$|^\[/
+// Dotted-quad, ANY bracketed IPv6 literal, and — critically — a bare all-digit
+// host (a DECIMAL-encoded IPv4, e.g. 2852039166 === 169.254.169.254) or an
+// 0x-hex host. A purely numeric label is never a public DNS name, so treating
+// it as an IP literal closes the decimal/hex SSRF bypass of the dotted-quad
+// checks in PRIVATE_HOST above.
+const IP_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$|^\[|^\d+$|^0x[0-9a-f]+$/i
 
 /** A private/loopback/link-local/metadata host — never a public probe target. */
 export function isPrivateHost(host: string): boolean {
@@ -242,6 +247,29 @@ export function isPubliclyRoutableSameOrigin(rawUrl: string, origin: string): bo
     if (!consentedPrivateSameOrigin) return false
   }
   if (u.origin !== base.origin) return false
+  return true
+}
+
+/**
+ * The narrowly-scoped OFF-ORIGIN gate: "off-origin allowed, but PUBLIC-only".
+ *
+ * Unlike `isPubliclyRoutableSameOrigin`, this does NOT require same-origin — it
+ * exists for the ONE OAuth case where the target LEGITIMATELY delegates to a
+ * different origin: `authorization_servers[0]` in RFC 9728 protected-resource
+ * metadata (a dedicated authorization server). That single declared AS may live
+ * off the verification target's origin, so the same-origin gate would wrongly
+ * refuse it. This gate keeps the SSRF backstop that DOES apply: the AS url must
+ * parse, be https (no cleartext), and MUST NOT point at a private / loopback /
+ * link-local / metadata address (169.254.169.254, 10.x, 127.x, ::1, …). It is a
+ * DELIBERATELY narrow hole — use it ONLY for the AS-metadata role, never as a
+ * general off-origin fetch permission, and the observer's own initial-url
+ * private-host backstop still runs underneath it as defense in depth.
+ */
+export function isPublicHttpsOffOriginAllowed(rawUrl: string): boolean {
+  let u: URL
+  try { u = new URL(rawUrl) } catch { return false }
+  if (u.protocol !== 'https:') return false
+  if (isPrivateHost(u.hostname)) return false
   return true
 }
 
