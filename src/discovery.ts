@@ -39,6 +39,15 @@ export const ROLE = {
   mcpAsMetadata: 'surface:mcp:oauth-authorization-server',
   /** RFC 8414 fallback well-known: /.well-known/openid-configuration. */
   mcpAsMetadataOidc: 'surface:mcp:openid-configuration',
+  // Agent Auth Protocol (AAP) discovery — same-origin /.well-known/agent-
+  // configuration (ax-e6b.21.1). Fixed origin-relative path, fetched always.
+  agentConfiguration: 'surface:agent-configuration',
+  /**
+   * auth.md agent-identity probe: the identity_endpoint declared in the AS
+   * metadata's `agent_auth` block, probed (metadata-derived, AS-origin gated)
+   * only to confirm it RESOLVES. Advertisement/shape-grade — no ID-JAG mint.
+   */
+  agentIdentity: 'surface:agent-identity',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -160,6 +169,42 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
     out.openapiUrl = absolutize(surfaces.openapi, origin)
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// auth.md agent-identity claims (pure) — the `agent_auth` block an RFC 8414
+// authorization server carries to advertise itself as an agent-identity
+// provider. Shared by observe (to know which identity_endpoint to probe) and
+// judge (to grade the advertisement). Endpoints stay as raw declared strings —
+// the check applies the non-empty-absolute-https validation, mirroring the
+// MCP-OAuth members.
+// ---------------------------------------------------------------------------
+
+export interface AgentAuthClaims {
+  identity_endpoint?: string
+  claim_endpoint?: string
+  events_endpoint?: string
+  /** The raw agent_auth object, so a judge can scan for ID-JAG advertisement. */
+  raw: Record<string, unknown>
+}
+
+/**
+ * The `agent_auth` block off parsed RFC 8414 AS metadata, or undefined when the
+ * metadata carries no such block (=> not an agent-identity provider => the
+ * check SKIPs). A present-but-defective block returns a value (the check then
+ * FAILS the specific defect), so "absent" and "malformed" never collapse.
+ */
+export function parseAgentAuth(asMeta: unknown): AgentAuthClaims | undefined {
+  if (!asMeta || typeof asMeta !== 'object') return undefined
+  const block = (asMeta as Record<string, unknown>).agent_auth
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return undefined
+  const b = block as Record<string, unknown>
+  return {
+    identity_endpoint: str(b.identity_endpoint),
+    claim_endpoint: str(b.claim_endpoint),
+    events_endpoint: str(b.events_endpoint),
+    raw: b,
+  }
 }
 
 export interface OpenapiSummary {
@@ -290,6 +335,18 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   })
   await observer.observe(ROLE.icpJson, `${origin}/icp.json`, { accept: 'application/json' })
 
+  // AAP discovery — GET {origin}/.well-known/agent-configuration. A FIXED,
+  // origin-relative well-known (like agents.json/icp.json), so it is same-origin
+  // by construction. It is still routed through the SHARED same-origin gate as
+  // defense in depth: a consented private/local target fetches its own document
+  // (the gate's consented-private-same-origin branch), while the deployed
+  // Worker's structural backstop under Observer.observe refuses a private/
+  // metadata origin regardless of this call site. Absent doc => the check SKIPs.
+  const agentConfigUrl = `${origin}/.well-known/agent-configuration`
+  if (isPubliclyRoutableSameOrigin(agentConfigUrl, origin)) {
+    await observer.observe(ROLE.agentConfiguration, agentConfigUrl, { accept: 'application/json' })
+  }
+
   const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
   // openapiUrl is CARD-DERIVED (openapi / openapiUrl / surfaces.openapi), and
   // absolutize() preserves an ABSOLUTE attacker-chosen url. It is fetched
@@ -377,9 +434,28 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
       const asUrl = wellKnownAt(asBase, 'oauth-authorization-server')
       const asEv = asUrl ? await observer.observe(ROLE.mcpAsMetadata, asUrl, { accept: 'application/json' }) : undefined
       // RFC 8414 fallback: OpenID Connect discovery document.
+      let asMetaEv = asEv
       if (!asEv || asEv.status === null || asEv.status < 200 || asEv.status >= 300) {
         const oidcUrl = wellKnownAt(asBase, 'openid-configuration')
-        if (oidcUrl) await observer.observe(ROLE.mcpAsMetadataOidc, oidcUrl, { accept: 'application/json' })
+        if (oidcUrl) {
+          const oidcEv = await observer.observe(ROLE.mcpAsMetadataOidc, oidcUrl, { accept: 'application/json' })
+          if (oidcEv.status !== null && oidcEv.status >= 200 && oidcEv.status < 300) asMetaEv = oidcEv
+        }
+      }
+
+      // auth.md agent-identity (ax-e6b.21.1): if the AS metadata carries an
+      // `agent_auth` block, probe its declared identity_endpoint ONCE to confirm
+      // it RESOLVES (advertisement/shape-grade — no ID-JAG mint). The endpoint is
+      // METADATA-DERIVED (adversarial), so it is gated to be SAME-ORIGIN with the
+      // delegating authorization server (`asBase`) — the AS delegation model —
+      // and NEVER a private/loopback/link-local/metadata address. A hostile
+      // identity_endpoint is DROPPED here (never fetched, no fallback); the
+      // authmd-agent-identity check still FAILS it from the URL string alone.
+      const agentAuth = parseAgentAuth(parseJsonBody(asMetaEv))
+      const idEndpoint = agentAuth?.identity_endpoint
+      const asOrigin = (() => { try { return new URL(asBase).origin } catch { return undefined } })()
+      if (idEndpoint && asOrigin && isPubliclyRoutableSameOrigin(idEndpoint, asOrigin)) {
+        await observer.observe(ROLE.agentIdentity, idEndpoint, { accept: 'application/json' })
       }
     }
   }

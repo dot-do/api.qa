@@ -16,6 +16,7 @@ import {
   hasAgentClasses,
   firstAuthorizationServer,
   wellKnownAt,
+  parseAgentAuth,
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
@@ -268,6 +269,53 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       })
   }
 
+  // ── AAP discovery (ax-e6b.21.1) ───────────────────────────────────────────
+  //    A target that ships /.well-known/agent-configuration claims the Agent
+  //    Auth Protocol. The doc must advertise the identity/key/approval surface
+  //    an agent needs. PURE over the recorded agent-configuration evidence.
+  //    ABSENT document (not fetched / non-2xx / 404) => SKIP (the target does
+  //    not claim AAP); a 200 that is missing/malformed any REQUIRED field =>
+  //    FAIL. Not an AX-score item (axItem undefined) — an advisory conformance
+  //    check bindable via kind:'check'.
+  {
+    const acEv = findEvidence(bundle, ROLE.agentConfiguration)
+    const result = !ok(acEv)
+      ? { verdict: 'skip' as Verdict, detail: 'no /.well-known/agent-configuration document (2xx) — target does not claim the Agent Auth Protocol' }
+      : judgeAapDiscovery(parseJsonBody(acEv))
+    checks.push(check('aap-discovery', 'AAP discovery advertises Ed25519 + approval methods + register/status/revoke + jwks_uri', undefined,
+      [ROLE.agentConfiguration], result))
+  }
+
+  // ── auth.md agent-identity (ax-e6b.21.1) ──────────────────────────────────
+  //    REUSES the RFC 8414 authorization-server metadata the MCP-OAuth check
+  //    already fetched (no duplicate fetch). An agent-identity provider carries
+  //    an `agent_auth` block (identity/claim/events endpoints) AND advertises
+  //    ID-JAG as the accepted assertion AND SET-based revocation (RFC 8417/8935)
+  //    via the events_endpoint; the declared identity_endpoint must RESOLVE
+  //    (advertisement/shape-grade — no live ID-JAG mint). ABSENT agent_auth
+  //    (or no AS metadata resolved) => SKIP (not an agent-identity provider);
+  //    a present-but-defective block => FAIL the specific defect.
+  {
+    const asEv = findEvidence(bundle, ROLE.mcpAsMetadata)
+    const asOidcEv = findEvidence(bundle, ROLE.mcpAsMetadataOidc)
+    const resolvedAsEv = ok(asEv) ? asEv : ok(asOidcEv) ? asOidcEv : undefined
+    const asMeta = parseJsonBody(resolvedAsEv)
+    const agentAuth = parseAgentAuth(asMeta)
+    const idEv = findEvidence(bundle, ROLE.agentIdentity)
+    const evidence = [ROLE.mcpAsMetadata, ROLE.mcpAsMetadataOidc, ...(idEv ? [ROLE.agentIdentity] : [])]
+    const result: { verdict: Verdict; detail: string } = !agentAuth
+      ? {
+          verdict: 'skip',
+          detail: resolvedAsEv === undefined
+            ? 'no authorization-server metadata resolved (no MCP/OAuth AS declared) — nothing advertises an agent_auth block'
+            : 'authorization-server metadata carries no agent_auth block — not an auth.md agent-identity provider',
+        }
+      : judgeAuthmdAgentIdentity(agentAuth, asMeta, resolvedAsEv, idEv)
+    checks.push(check('authmd-agent-identity',
+      'auth.md agent-identity advertised (agent_auth identity/claim/events + ID-JAG + SET revocation)', undefined,
+      evidence, result))
+  }
+
   // ── AX 7: keyless flow ───────────────────────────────────────────────────
   {
     const succeeded = probes.filter((p) => p.status !== null && p.status >= 200 && p.status < 300)
@@ -482,6 +530,152 @@ function originOf(url: string): string {
 function isAbsoluteHttpsUrl(v: unknown): boolean {
   if (typeof v !== 'string' || v.length === 0) return false
   try { return new URL(v).protocol === 'https:' } catch { return false }
+}
+
+/**
+ * A non-empty TRIMMED string (the floor for AAP required string members). A
+ * whitespace-only value ("   ") is `typeof 'string'` yet carries no advertised
+ * identity/version/name — it must not inflate the grade, so it is rejected.
+ */
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0
+}
+
+// The two ways an authorization server advertises ID-JAG as its accepted
+// assertion: the RFC token-exchange subject token type urn, or the SET/JWT
+// `typ`. Either value appearing in a field that SEMANTICALLY carries accepted
+// subject-token / assertion types is the advertisement (advertisement-grade —
+// no live mint).
+const IDJAG_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:id-jag'
+const IDJAG_TYP = 'oauth-id-jag+jwt'
+
+// The ONLY fields whose values semantically declare an accepted subject-token /
+// assertion type. Scanning every pooled string (issuer, provider_name, an
+// unrelated scope, …) would let the urn appearing in an irrelevant field
+// falsely count as advertising ID-JAG — so the scan is scoped to these keys.
+const IDJAG_AS_KEYS = ['subject_token_types_supported'] as const
+const IDJAG_AGENT_AUTH_KEYS = [
+  'subject_token_types',
+  'subject_token_types_supported',
+  'accepted_assertion_types',
+  'assertion_types',
+] as const
+
+/**
+ * True when the AS metadata or its agent_auth block advertises ID-JAG — an
+ * EXACT-value scan restricted to the accepted-subject-token / assertion-type
+ * fields (RFC 8693 subject_token_types_supported on the AS; the designated
+ * agent_auth subject-token / assertion keys). The urn or `oauth-id-jag+jwt` typ
+ * appearing in ANY OTHER field (issuer, provider_name, a scope) does NOT satisfy
+ * the requirement — declaring the value in a type field IS the advertisement.
+ */
+function advertisesIdJag(asMeta: unknown, agentAuthRaw: Record<string, unknown>): boolean {
+  const pool: unknown[] = []
+  const collectKeys = (o: unknown, keys: readonly string[]): void => {
+    if (!o || typeof o !== 'object') return
+    const rec = o as Record<string, unknown>
+    for (const key of keys) {
+      const v = rec[key]
+      if (typeof v === 'string') pool.push(v)
+      else if (Array.isArray(v)) for (const e of v) if (typeof e === 'string') pool.push(e)
+    }
+  }
+  collectKeys(asMeta, IDJAG_AS_KEYS)
+  collectKeys(agentAuthRaw, IDJAG_AGENT_AUTH_KEYS)
+  return pool.some((v) => v === IDJAG_TOKEN_TYPE || v === IDJAG_TYP)
+}
+
+/**
+ * Judge the AAP discovery document (pure). The doc must advertise, per AAP
+ * v1.0-draft (id.org.ai worker/routes/aap.ts:39-82): version + issuer +
+ * provider_name (non-empty strings); an algorithms array including 'Ed25519';
+ * a non-empty approval_methods array (enum device_authorization | ciba, custom
+ * values tolerated); an endpoints object whose register/status/revoke are
+ * non-null strings; and a non-empty jwks_uri. Any missing/malformed required
+ * field FAILS with an evidence-cited detail.
+ */
+function judgeAapDiscovery(doc: unknown): { verdict: Verdict; detail: string } {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    return { verdict: 'fail', detail: '/.well-known/agent-configuration returned 200 but the body is not a JSON object' }
+  }
+  const d = doc as Record<string, unknown>
+  const problems: string[] = []
+  for (const key of ['version', 'issuer', 'provider_name'] as const) {
+    if (!isNonEmptyString(d[key])) problems.push(`${key} is missing or not a non-empty string`)
+  }
+  const algs = Array.isArray(d.algorithms) ? d.algorithms : []
+  if (!algs.includes('Ed25519')) {
+    problems.push(`algorithms ${algs.length ? `[${algs.join(', ')}]` : 'missing/empty'} does not include 'Ed25519' (AAP requires Ed25519 key material)`)
+  }
+  // approval_methods must carry at least one USABLE method: a non-empty trimmed
+  // STRING (enum device_authorization | ciba; custom string values tolerated). A
+  // [null] / [""] / ["   "] / [123] / [{}] array is `length > 0` yet advertises
+  // no method an agent can actually approve against — it must FAIL, not pass.
+  const approvals = Array.isArray(d.approval_methods) ? d.approval_methods : undefined
+  const usableApprovals = approvals?.filter((a) => typeof a === 'string' && a.trim().length > 0) ?? []
+  if (usableApprovals.length === 0) {
+    problems.push('approval_methods is missing, empty, or has no non-empty string element (expected device_authorization | ciba; custom string values tolerated, but null/whitespace/non-string junk is not a method an agent can approve against)')
+  }
+  const endpoints = d.endpoints && typeof d.endpoints === 'object' && !Array.isArray(d.endpoints)
+    ? (d.endpoints as Record<string, unknown>)
+    : undefined
+  if (!endpoints) {
+    problems.push('endpoints object is missing')
+  } else {
+    for (const key of ['register', 'status', 'revoke'] as const) {
+      if (!isAbsoluteHttpsUrl(endpoints[key])) problems.push(`endpoints.${key} is missing or not an absolute https URL (an agent cannot register/poll/revoke against a relative or non-https endpoint)`)
+    }
+  }
+  if (!isAbsoluteHttpsUrl(d.jwks_uri)) problems.push('jwks_uri is missing or not an absolute https URL (the jwt-verification key host must be an https URL)')
+  if (problems.length) return { verdict: 'fail', detail: `AAP discovery malformed: ${problems.slice(0, 8).join('; ')}` }
+  return pass(`AAP discovery advertises version/issuer/provider_name, Ed25519, ${usableApprovals.length} approval method(s), register/status/revoke endpoints, and jwks_uri`)
+}
+
+/**
+ * Judge the auth.md agent-identity advertisement (pure) over the RFC 8414 AS
+ * metadata's `agent_auth` block plus the identity_endpoint probe evidence. The
+ * identity_endpoint probe is METADATA-DERIVED and same-origin-with-AS gated in
+ * observeTarget; a hostile (off-AS-origin / private) endpoint is refused
+ * WITHOUT fetching, and this judge re-derives that refusal from the URL string
+ * alone (the hostile URL is never requested), matching the MCP-OAuth posture.
+ */
+function judgeAuthmdAgentIdentity(
+  agentAuth: { identity_endpoint?: string; claim_endpoint?: string; events_endpoint?: string; raw: Record<string, unknown> },
+  asMeta: unknown,
+  resolvedAsEv: Evidence | undefined,
+  idEv: Evidence | undefined,
+): { verdict: Verdict; detail: string } {
+  const problems: string[] = []
+  // (1) identity + claim endpoints must be non-empty absolute https URLs.
+  for (const key of ['identity_endpoint', 'claim_endpoint'] as const) {
+    if (!isAbsoluteHttpsUrl(agentAuth[key])) {
+      problems.push(`agent_auth.${key} ${typeof agentAuth[key] === 'string' ? `"${agentAuth[key]}" is not a non-empty absolute https URL` : 'is missing'}`)
+    }
+  }
+  // (4) SET-based revocation (RFC 8417/8935) is advertised via the events_endpoint
+  //     — a non-empty absolute https URL IS the SET delivery endpoint.
+  if (!isAbsoluteHttpsUrl(agentAuth.events_endpoint)) {
+    problems.push(`agent_auth.events_endpoint ${typeof agentAuth.events_endpoint === 'string' ? `"${agentAuth.events_endpoint}" is not a non-empty absolute https URL` : 'is missing'} — SET-based revocation (RFC 8417/8935) delivery is not advertised`)
+  }
+  // (2) the declared identity_endpoint must RESOLVE. A hostile endpoint (off the
+  //     delegating AS origin, or a private/metadata address) is refused WITHOUT
+  //     fetching — re-derived here from the URL string, so no idEv exists.
+  const idUrl = agentAuth.identity_endpoint
+  if (isAbsoluteHttpsUrl(idUrl)) {
+    const asOrigin = resolvedAsEv ? originOf(resolvedAsEv.url) : undefined
+    if (asOrigin && !isPubliclyRoutableSameOrigin(idUrl!, asOrigin)) {
+      problems.push(`agent_auth.identity_endpoint ${idUrl} is not same-origin with the delegating authorization server ${asOrigin} — refused without fetching (SSRF guard: a probed identity endpoint follows the AS delegation model, never a private/metadata host)`)
+    } else if (!idEv || idEv.status === null || idEv.status === 404 || idEv.status >= 500) {
+      const got = !idEv ? 'not fetched' : idEv.status === null ? `error ${idEv.error ?? 'unknown'}` : `status ${idEv.status}`
+      problems.push(`agent_auth.identity_endpoint ${idUrl} did not resolve — got: ${got}`)
+    }
+  }
+  // (3) ID-JAG advertised as the accepted assertion.
+  if (!advertisesIdJag(asMeta, agentAuth.raw)) {
+    problems.push(`ID-JAG assertion not advertised — neither the token type '${IDJAG_TOKEN_TYPE}' nor typ '${IDJAG_TYP}' appears in the AS metadata or agent_auth block`)
+  }
+  if (problems.length) return { verdict: 'fail', detail: `auth.md agent-identity advertisement incomplete: ${problems.slice(0, 8).join('; ')}` }
+  return pass(`agent_auth advertises identity/claim/events endpoints, ID-JAG as the accepted assertion, and SET-based revocation (RFC 8417/8935) via events_endpoint ${agentAuth.events_endpoint}`)
 }
 
 /**
