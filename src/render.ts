@@ -20,7 +20,7 @@ export function reportMarkdown(r: VerificationReport): string {
     `- verifier: api.qa v${r.verifierVersion} · seed ${r.seed} (replayable)`,
     `- evidence digest: \`${r.discovery.evidenceDigest}\``,
     ...(r.attestation ? [`- report digest: \`${r.attestation.reportDigest}\` (Ed25519-signed)`] : []),
-    ...(r.pinnedSpecDigest ? [`- pinned spec digest: \`${r.pinnedSpecDigest}\``] : []),
+    ...(r.pinnedSpecDigest ? [`- pinned spec digest: \`${r.pinnedSpecDigest}\` (the ratified digest this verdict binds to)`] : []),
     '',
     '## AX score (the 10-point checklist)',
     '',

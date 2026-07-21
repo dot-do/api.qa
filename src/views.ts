@@ -517,11 +517,11 @@ export function landingHtml(): string {
     <div class="tracks">
       <div class="track">
         <span class="tag">B2A &middot; the agent</span>
-        <h3>Zero-shot: read the grade, act on it</h3>
+        <h3>Zero-shot: read the grade, enforce the gate</h3>
         <ol>
-          <li><b><code>curl https://api.qa/{domain}</code></b> — grade, AX score, per-check FAILs (the punch list), and the evidence bundle. Keyless first value: no key, no account.</li>
-          <li><b>Integrate on the verdict.</b> A Listing admitted to the catalog is conformant by admission — ${JUDGED} — so skip re-vetting. Call: keyless first value, then pay by 402 inside your ceiling.</li>
-          <li><b><code>curl -H 'accept: application/json' api.qa/{domain} | npx autonomous-qa rejudge</code></b> — carry the proof; any third party can re-judge it offline.</li>
+          <li><b><code>curl https://api.qa/{domain}</code></b> — pull the grade, AX score, per-check FAILs (the punch list), and the evidence bundle. Keyless first value: no key, no account.</li>
+          <li><b>Run the gate yourself.</b> <code>curl -H 'accept: application/json' api.qa/{domain}</code> — read <code>grade</code> and <code>attested</code> and integrate only on a verdict that clears your bar. Skip re-vetting a Listing already in the catalog — conformant by admission, ${JUDGED}. Then call: take the keyless first value, pay by 402 inside your ceiling.</li>
+          <li><b><code>curl -H 'accept: application/json' api.qa/{domain} | npx autonomous-qa rejudge</code></b> — re-judge the verdict yourself and carry proof any third party can re-check offline.</li>
         </ol>
       </div>
       <div class="track">
@@ -530,7 +530,7 @@ export function landingHtml(): string {
         <ol>
           <li><b>Ratify + pin.</b> <code>npx autonomous-qa spec-digest golden-scenario.spec.json</code> — mint the pin once. The ratified digest lives with you, never in the workers’ repos.</li>
           <li><b>Hill-climb locally.</b> <code>npx autonomous-qa verify http://localhost:8787 --spec golden-scenario.spec.json --expect-digest &lt;pin&gt;</code> — loop until exit 0. Advisory; local runs never sign.</li>
-          <li><b>Accept on the held-out verifier.</b> Done is <code>${esc(ADMISSION)}</code> — <code>POST /verify</code> from a service the fleet has no write access to.</li>
+          <li><b>Accept on the held-out verifier.</b> <code>curl -X POST https://api.qa/verify -d '{"target":…,"spec":…,"expectedDigest":"&lt;pin&gt;"}'</code> — hold the gate: done is <code>${esc(ADMISSION)}</code>, from a service the fleet has no write access to.</li>
         </ol>
       </div>
     </div>
