@@ -8,7 +8,7 @@
  * bundle — the verifier never judges anything it didn't record.
  */
 
-import { Observer } from './http.js'
+import { Observer, isPubliclyRoutableSameOrigin } from './http.js'
 import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
 import type {
   ClaimedEndpoint,
@@ -106,7 +106,17 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
   }
   const probe = monetization?.probe as Record<string, unknown> | undefined
   if (probe && typeof probe.url === 'string') {
-    out.offerProbe = { method: str(probe.method) ?? 'GET', url: absolutize(probe.url, origin) }
+    // AXP Appendix A.5: monetization.probe MUST be a same-origin GET. The card
+    // is adversarial input — an off-origin URL, a non-GET method, or a
+    // private/metadata address (169.254.169.254, 10.x, 127.x, ::1, …) would
+    // steer the verifier into an SSRF. Mirror the probes.* rule EXACTLY and
+    // DROP any violating probe: it is never stored as offerProbe, so it is
+    // never fetched. checks.ts still FAILS the card for the dropped probe.
+    const method = (str(probe.method) ?? 'GET').toUpperCase()
+    const url = absolutize(probe.url, origin)
+    if (method === 'GET' && isPubliclyRoutableSameOrigin(url, origin)) {
+      out.offerProbe = { method, url }
+    }
   }
 
   // Probe manifest — the card-declared channel a pinned verifier resolves
@@ -258,8 +268,15 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     await observer.observe(ROLE.keyless('GET', path), `${origin}${path}`, { accept: 'application/json' })
   }
 
-  // 3. The 402 boundary probe, if the target declares one.
-  if (agents.offerProbe) {
+  // 3. The 402 boundary probe, if the target declares one. Defense in depth:
+  //    the fetch site itself re-checks same-origin GET, so even a probe that
+  //    reached this point unfiltered can never send a request off-origin or
+  //    at a private/metadata address (SSRF).
+  if (
+    agents.offerProbe &&
+    agents.offerProbe.method === 'GET' &&
+    isPubliclyRoutableSameOrigin(agents.offerProbe.url, origin)
+  ) {
     await observer.observe(ROLE.offer, agents.offerProbe.url, {
       method: agents.offerProbe.method,
       accept: 'application/json',

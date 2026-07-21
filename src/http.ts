@@ -118,8 +118,40 @@ export class Observer {
 // Target guards (SSRF — DESIGN.md attack #9)
 // ---------------------------------------------------------------------------
 
-const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\]|.*\.(local|internal|localhost))/i
+const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\]|\[fe80:|\[fc|\[fd|.*\.(local|internal|localhost))/i
 const IP_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$|^\[/
+
+/** A private/loopback/link-local/metadata host — never a public probe target. */
+export function isPrivateHost(host: string): boolean {
+  return PRIVATE_HOST.test(host) || IP_LITERAL.test(host)
+}
+
+/**
+ * The single same-origin + publicly-routable gate. A capability card is
+ * ADVERSARIAL input: any probe URL it declares (monetization.probe AND every
+ * `probes.<channel>` entry) is resolved through THIS function so the two
+ * cannot drift apart (AXP Appendix A.5 requires monetization.probe be
+ * same-origin, exactly as the probe manifest already is).
+ *
+ * Returns true only when `rawUrl` parses, is same-origin with `origin`, and
+ * does not point at a private/loopback/link-local/metadata address (e.g.
+ * 169.254.169.254, 10.x, 127.x, ::1). The same-origin gate alone blocks the
+ * off-origin SSRF (evil.example, off-origin metadata IPs); the private-host
+ * block is defense in depth and — because same-origin means same host — only
+ * ever engages when the target origin is itself public yet the declared probe
+ * host is a private literal. A consented private/local target (origin itself
+ * private, the dev-mode escape hatch) still serves its own same-origin probes.
+ * The method (GET-only) is enforced by the caller, mirroring the manifest rule.
+ */
+export function isPubliclyRoutableSameOrigin(rawUrl: string, origin: string): boolean {
+  let u: URL
+  try { u = new URL(rawUrl) } catch { return false }
+  let base: URL
+  try { base = new URL(origin) } catch { return false }
+  if (u.origin !== base.origin) return false
+  if (!isPrivateHost(base.hostname) && isPrivateHost(u.hostname)) return false
+  return true
+}
 
 /**
  * Normalise a target to an https origin. `allowPrivate` is the local-mode

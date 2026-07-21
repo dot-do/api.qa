@@ -15,8 +15,37 @@ import {
   looksLikeLlmsTxt,
   hasAgentClasses,
 } from './discovery.js'
+import { isPubliclyRoutableSameOrigin } from './http.js'
 import { validateSchema } from './schema.js'
 import type { CheckResult, Evidence, EvidenceBundle, Verdict } from './types.js'
+
+/**
+ * Read the RAW monetization.probe off the card (pre-drop) and, if present,
+ * return why it is inadmissible as a same-origin GET — or undefined if it is
+ * fine. Pure string validation: the hostile URL is NEVER fetched to decide.
+ * Mirrors the probes.* rule via the SHARED same-origin helper (AXP A.5).
+ */
+function monetizationProbeViolation(doc: unknown, origin: string): string | undefined {
+  if (!doc || typeof doc !== 'object') return undefined
+  const m = (doc as Record<string, unknown>).monetization
+  if (!m || typeof m !== 'object') return undefined
+  const p = (m as Record<string, unknown>).probe
+  if (!p || typeof p !== 'object') return undefined
+  const rawUrl = (p as Record<string, unknown>).url
+  if (typeof rawUrl !== 'string') return undefined // no url → nothing declared to verify
+  const method = typeof (p as Record<string, unknown>).method === 'string'
+    ? ((p as Record<string, unknown>).method as string).toUpperCase()
+    : 'GET'
+  let abs: string
+  try { abs = new URL(rawUrl, origin).toString() } catch { return `monetization.probe url ${rawUrl} is not a valid URL` }
+  if (method !== 'GET') {
+    return `monetization.probe uses method ${method} — must be a same-origin GET (AXP Appendix A.5); refused without fetching`
+  }
+  if (!isPubliclyRoutableSameOrigin(abs, origin)) {
+    return `monetization.probe url ${rawUrl} is not a same-origin, publicly-routable target for ${origin} — refused without fetching (SSRF guard, AXP Appendix A.5)`
+  }
+  return undefined
+}
 
 export function runChecks(bundle: EvidenceBundle): CheckResult[] {
   const agentsEv = findEvidence(bundle, ROLE.agentsJson)
@@ -95,8 +124,16 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
   {
     const offerEv = findEvidence(bundle, ROLE.offer)
     const declared = (agents.offers?.length ?? 0) > 0
+    // A declared monetization.probe that is off-origin / non-GET / private-IP
+    // is an SSRF vector (AXP A.5). It was DROPPED at parse time (never
+    // fetched); the card must still FAIL here — never silently downgrade to
+    // declared-only. Decided from the URL string alone; the hostile URL is
+    // never requested.
+    const probeViolation = monetizationProbeViolation(agentsDoc, bundle.target)
     let result: { verdict: Verdict; detail: string }
-    if (!declared) {
+    if (probeViolation) {
+      result = { verdict: 'fail', detail: probeViolation }
+    } else if (!declared) {
       result = fail(agentsEv, 'no monetization.offers declared — payment boundaries are dead ends, not offers')
     } else if (agents.offerProbe) {
       const body = parseJsonBody(offerEv) as Record<string, unknown> | undefined
@@ -230,7 +267,9 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         for (const e of entries) {
           let u: URL | undefined
           try { u = new URL(e.url) } catch { /* fallthrough */ }
-          if (!u || u.origin !== origin) { problems.push(`probes.${ch} url ${e.url} is not same-origin with ${origin}`); continue }
+          // SHARED same-origin gate — identical to monetization.probe (AXP A.5)
+          // so the two can never drift; also rejects private/metadata hosts.
+          if (!u || !isPubliclyRoutableSameOrigin(e.url, origin)) { problems.push(`probes.${ch} url ${e.url} is not a same-origin, publicly-routable target for ${origin}`); continue }
           if (e.method !== 'GET') problems.push(`probes.${ch} ${e.url} uses method ${e.method} — probe manifests are GET-only`)
           if (!declaredPaths.has(u.pathname)) {
             problems.push(`probes.${ch} path ${u.pathname} is not an operation declared in the OpenAPI contract or interfaces.http`)
