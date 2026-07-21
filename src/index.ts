@@ -5,8 +5,13 @@ export { verifyTarget, rejudge, VERIFIER_VERSION, type VerifyTargetOpts } from '
 export {
   verifyPinnedSpec,
   parsePinnedSpec,
+  validateRequirements,
+  verifySuite,
+  parseSuite,
   type PinnedReport,
   type VerifyPinnedOpts,
+  type SuiteReport,
+  type VerifySuiteOpts,
 } from './pinned.js'
 export {
   observeTarget,
@@ -27,7 +32,7 @@ export {
   exportPrivateKey,
   reportBody,
 } from './attest.js'
-export { reportMarkdown, reportHtml, pinnedMarkdown } from './render.js'
+export { reportMarkdown, reportHtml, pinnedMarkdown, suiteMarkdown } from './render.js'
 export { Observer, normalizeTarget, type Fetcher, type ObserverOpts } from './http.js'
 export { canonicalJson, sha256Hex, seededRandom, sampleSeeded } from './digest.js'
 export { validateSchema, readPath } from './schema.js'

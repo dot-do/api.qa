@@ -19,7 +19,7 @@
  */
 
 import type { VerificationReport } from './types.js'
-import type { PinnedReport } from './pinned.js'
+import type { PinnedReport, SuiteReport } from './pinned.js'
 
 /** Structural subset of Cloudflare's `KVNamespace` — injectable for tests. */
 export interface KVLike {
@@ -121,6 +121,56 @@ export class ReportCache {
     await this.kv.put(
       this.pinnedK(domain, specDigest),
       JSON.stringify({ report, storedAtMs: nowMs } satisfies CachedReport<PinnedReport>),
+      { expirationTtl: this.ttlSeconds },
+    )
+  }
+
+  // --- Reusable suites -----------------------------------------------------
+
+  private suiteTextK(digest: string): string {
+    return `suitetext:${digest}`
+  }
+  private suiteK(target: string, suiteDigest: string, envName: string): string {
+    return `suite:${hostKey(target)}:${suiteDigest}:${envName}`
+  }
+
+  /**
+   * The suite REGISTRY: content-addressed suite text stored by its digest so a
+   * later request can run a STORED suite by digest alone. This is a durable
+   * registry, not the freshness cache, so it is not TTL-expired here — the
+   * digest is the identity, and the SAME digest is always the SAME suite text.
+   */
+  async putSuiteText(digest: string, text: string): Promise<void> {
+    await this.kv.put(this.suiteTextK(digest), text)
+  }
+  async getSuiteText(digest: string): Promise<string | null> {
+    return this.kv.get(this.suiteTextK(digest))
+  }
+
+  /** A prior suite verdict, keyed by (target, suite digest, environment). */
+  async getSuite(
+    target: string,
+    suiteDigest: string,
+    envName: string,
+    nowMs: number = Date.now(),
+  ): Promise<CacheHit<SuiteReport> | null> {
+    const raw = await this.kv.get(this.suiteK(target, suiteDigest, envName))
+    if (!raw) return null
+    const cached = JSON.parse(raw) as CachedReport<SuiteReport>
+    const ageMs = Math.max(0, nowMs - cached.storedAtMs)
+    return { report: cached.report, ageMs, fresh: ageMs < this.ttlSeconds * 1000 }
+  }
+
+  async putSuite(
+    target: string,
+    suiteDigest: string,
+    envName: string,
+    report: SuiteReport,
+    nowMs: number = Date.now(),
+  ): Promise<void> {
+    await this.kv.put(
+      this.suiteK(target, suiteDigest, envName),
+      JSON.stringify({ report, storedAtMs: nowMs } satisfies CachedReport<SuiteReport>),
       { expirationTtl: this.ttlSeconds },
     )
   }

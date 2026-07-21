@@ -1,0 +1,60 @@
+{
+  "$type": "Suite",
+  "name": "primitives-golden-scenario-suite",
+  "version": "1",
+  "description": "The completion-ladder golden scenario as a REUSABLE suite/collection. The ordered probes (surface → run → receipt) are the SAME PinnedRequirement shape a PinnedSpec uses — assertions, capture, {{var}} chaining, all reused. Named ENVIRONMENTS supply the target (baseUrl), the scenario name, and a seed, so the ONE ratified suite (pinned by sha256 of this text) runs against staging AND prod without editing what passing means. Run: npx autonomous-qa suite examples/golden-scenario.suite.json --env staging --expect-digest <pin>",
+  "environments": {
+    "staging": {
+      "vars": { "baseUrl": "https://apis.directory", "scenario": "dealer-slice", "seed": 1 }
+    },
+    "prod": {
+      "vars": { "baseUrl": "https://apis.directory", "scenario": "dealer-slice", "seed": 7 }
+    }
+  },
+  "requirements": [
+    {
+      "id": "openapi-published",
+      "kind": "surface",
+      "surface": "openapi",
+      "must": "valid"
+    },
+    {
+      "id": "golden-run-settles",
+      "kind": "endpoint",
+      "method": "POST",
+      "path": "/golden/run",
+      "body": { "scenario": "{{scenario}}", "seed": "{{seed}}" },
+      "capture": { "runId": "runId" },
+      "expect": {
+        "status": 200,
+        "contentTypeIncludes": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["settled", "ledgerBalanced", "runId"],
+          "properties": {
+            "settled": { "type": "boolean" },
+            "ledgerBalanced": { "type": "boolean" },
+            "runId": { "type": "string" }
+          }
+        },
+        "paths": [
+          { "path": "settled", "equals": true },
+          { "path": "ledgerBalanced", "equals": true }
+        ]
+      }
+    },
+    {
+      "id": "run-receipt-fetchable",
+      "kind": "endpoint",
+      "method": "GET",
+      "path": "/golden/run/{{runId}}",
+      "expect": {
+        "status": 200,
+        "paths": [
+          { "path": "runId", "equals": "{{runId}}" },
+          { "path": "settled", "equals": true }
+        ]
+      }
+    }
+  ]
+}
