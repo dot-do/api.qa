@@ -19,7 +19,7 @@
  * spec digest passing on the deployed api.qa against the deployed target.
  */
 
-import { Observer, normalizeTarget, type ObserverOpts } from './http.js'
+import { Observer, normalizeTarget, isPubliclyRoutableSameOrigin, type ObserverOpts } from './http.js'
 import { observeTarget, ROLE, parseAgentsJson, parseJsonBody, parseOpenapi } from './discovery.js'
 import { runChecks } from './checks.js'
 import { axScoreOf } from './grade.js'
@@ -89,8 +89,14 @@ export async function verifyPinnedSpec(
   const origin = normalized.origin
 
   const seed = opts.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0)
-  // Pinned mode is consent mode: the target is yours, POST probes allowed.
-  const observer = new Observer({ ...opts, allowWrites: true, budget: opts.budget ?? 48 })
+  // Pinned mode is consent mode: the target is yours, POST probes allowed. The
+  // same consent gates the structural SSRF backstop for a private/local target.
+  const observer = new Observer({
+    ...opts,
+    allowWrites: true,
+    allowPrivate: opts.allowPrivateTargets ?? mode === 'local',
+    budget: opts.budget ?? 48,
+  })
   const bundle = await observeTarget(origin, observer, seed)
 
   // Extra observations demanded by the spec's endpoint requirements.
@@ -137,10 +143,11 @@ export async function verifyPinnedSpec(
     }
     for (let i = 0; i < plan.declared.length; i++) {
       const entry = plan.declared[i]!
-      let entryOrigin: string | undefined
-      try { entryOrigin = new URL(entry.url).origin } catch { /* unparseable → refused below */ }
-      if (entryOrigin !== origin || entry.method !== 'GET') {
-        // Refused WITHOUT fetching — a manifest cannot steer the verifier off-origin.
+      // SHARED same-origin + publicly-routable gate (same helper as
+      // monetization.probe and the probe-manifest check — no drift). Refused
+      // WITHOUT fetching: a manifest cannot steer the verifier off-origin or
+      // at a private/metadata address.
+      if (!isPubliclyRoutableSameOrigin(entry.url, origin) || entry.method !== 'GET') {
         plan.entryProblems.set(i, `probe url ${entry.url} is not a same-origin GET — refused, fail closed`)
         continue
       }
