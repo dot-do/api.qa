@@ -676,59 +676,94 @@ describe('endpoint capture + chaining', () => {
     expect(verdicts(a)).toEqual(verdicts(b))
   })
 
-  it('SSRF: a TARGET-CONTROLLED captured value that resolves off-origin/private is REFUSED without a fetch', async () => {
-    for (const evil of ['http://169.254.169.254/latest/meta-data/', 'https://evil.example/exfil', '//evil.example/x']) {
+  // The FULL SSRF vector matrix for a TARGET-CONTROLLED captured value that is
+  // interpolated as the whole request path (`path: '{{next}}'`) — the classic
+  // smuggle vector. Every vector must be REFUSED by the resolveEndpoint
+  // same-origin gate before any fetch, in BOTH local and remote mode. The gate
+  // is the SOLE/PRIMARY defense (off-origin public hosts the private-host
+  // backstop never bites); in remote mode the Observer initial-host backstop is
+  // additionally armed for the private/metadata vectors as redundant depth.
+  const SSRF_VECTORS: Array<{ label: string; url: string; marker: string }> = [
+    { label: 'off-origin https', url: 'https://evil.example/exfil', marker: 'evil.example' },
+    { label: 'metadata 169.254.169.254', url: 'http://169.254.169.254/latest/meta-data/', marker: '169.254.169.254' },
+    { label: 'decimal-encoded IPv4', url: 'http://2852039166/', marker: '2852039166' },
+    { label: 'hex-encoded IPv4', url: 'http://0xA9FEA9FE/', marker: '0xa9fea9fe' },
+    { label: 'protocol-relative //evil', url: '//evil.example/x', marker: 'evil.example' },
+    { label: 'ipv6 loopback [::1]', url: 'http://[::1]/', marker: '[::1]' },
+    { label: 'userinfo good@evil', url: 'https://good.example@evil.example/x', marker: 'evil.example' },
+    { label: 'reverse-userinfo evil@169.254', url: 'https://evil.example@169.254.169.254/x', marker: '169.254.169.254' },
+    { label: 'port-smuggle good.example:22', url: 'https://good.example:22/x', marker: 'good.example:22' },
+    { label: 'http downgrade', url: 'http://good.example/x', marker: 'http://good.example' },
+    { label: 'file scheme', url: 'file:///etc/passwd', marker: 'file:' },
+  ]
+
+  for (const mode of ['local', 'remote'] as const) {
+    for (const { label, url, marker } of SSRF_VECTORS) {
+      it(`SSRF (${mode}): captured "${label}" is REFUSED with NO off-origin fetch`, async () => {
+        const { fetcher, fetched } = crudFetcher({
+          // The target smuggles the hostile URL back in its response body.
+          postResponse: (_body, id) => ({ status: 200, body: { id, next: url } }),
+        })
+        const spec = probeSpec([
+          {
+            id: 'create', kind: 'endpoint', method: 'POST', path: '/listings', body: {},
+            capture: { next: 'next' }, expect: { status: 200 },
+          },
+          { id: 'follow', kind: 'endpoint', method: 'GET', path: '{{next}}', expect: { status: 200 } },
+        ])
+        const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode })
+        expect(report.passed).toBe(false)
+        const follow = report.requirements.find((r) => r.id === 'follow')!
+        expect(follow.verdict).toBe('fail')
+        expect(follow.detail).toMatch(/off-origin\/private|fail closed/)
+        // NOTHING was ever fetched off the consented origin (the strong invariant).
+        for (const u of fetched) {
+          expect(new URL(u).origin, `${mode}/${label} leaked ${u}`).toBe(GOOD)
+        }
+        // …and the dangerous marker was never put on the wire.
+        expect(fetched.some((u) => u.toLowerCase().includes(marker.toLowerCase())), `${mode}/${label}`).toBe(false)
+      })
+    }
+  }
+
+  it('SSRF: a CRLF/backslash captured value is WHATWG-same-origin-only (fetched to the consented target, never off-origin)', async () => {
+    // WHATWG URL parsing STRIPS \r and \n, so a CRLF-injected value collapses to
+    // a same-origin PATH — it is fetched to the consented target, never a
+    // smuggled Host. A backslash is treated as '/', so a leading '\\evil'
+    // becomes '//evil' (protocol-relative → off-origin) and the gate REFUSES it
+    // unfetched. Either way: NO off-origin fetch.
+    const cases: Array<{ label: string; captured: string; fetchedSameOrigin: boolean }> = [
+      { label: 'crlf-host-injection', captured: '/things/1\r\nHost: evil.example', fetchedSameOrigin: true },
+      { label: 'backslash-breakout', captured: '\\\\evil.example\\x', fetchedSameOrigin: false },
+    ]
+    for (const { label, captured, fetchedSameOrigin } of cases) {
       const { fetcher, fetched } = crudFetcher({
-        // The target smuggles an absolute off-origin/private URL back in its body.
-        postResponse: (_body, id) => ({ status: 200, body: { id, next: evil } }),
+        postResponse: (_body, id) => ({ status: 200, body: { id, next: captured } }),
       })
       const spec = probeSpec([
         {
           id: 'create', kind: 'endpoint', method: 'POST', path: '/listings', body: {},
-          capture: { next: 'next' },
-          expect: { status: 200 },
+          capture: { next: 'next' }, expect: { status: 200 },
         },
-        // The whole path is the captured value — the classic smuggle vector.
         { id: 'follow', kind: 'endpoint', method: 'GET', path: '{{next}}', expect: { status: 200 } },
       ])
       const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' })
-      expect(report.passed).toBe(false)
-      const follow = report.requirements.find((r) => r.id === 'follow')!
-      expect(follow.verdict).toBe('fail')
-      expect(follow.detail).toMatch(/off-origin\/private|fail closed/)
-      // The dangerous host was NEVER fetched.
-      expect(fetched.some((u) => u.includes('169.254.169.254')), `fetched ${evil}`).toBe(false)
-      expect(fetched.some((u) => u.includes('evil.example')), `fetched ${evil}`).toBe(false)
-    }
-  })
-
-  it('SSRF (remote mode): off-origin AND private captured values are refused by the resolveEndpoint gate (private target also gets the redundant Observer backstop)', async () => {
-    for (const evil of ['http://169.254.169.254/latest/meta-data/', 'https://evil.example/exfil', '//evil.example/x']) {
-      const { fetcher, fetched } = crudFetcher({
-        postResponse: (_body, id) => ({ status: 200, body: { id, next: evil } }),
-      })
-      const spec = probeSpec([
-        {
-          id: 'create', kind: 'endpoint', method: 'POST', path: '/listings', body: {},
-          capture: { next: 'next' },
-          expect: { status: 200 },
-        },
-        { id: 'follow', kind: 'endpoint', method: 'GET', path: '{{next}}', expect: { status: 200 } },
-      ])
-      // The resolveEndpoint same-origin gate is the PRIMARY defense and refuses
-      // ALL of these before any fetch — it is the SOLE defense for the
-      // off-origin evil.example vectors (a public host the private-host backstop
-      // never bites). For the private/metadata target (169.254.169.254),
-      // mode:'remote' (allowPrivate FALSE) additionally arms the Observer
-      // initial-host backstop as REDUNDANT depth behind the gate. Either way the
-      // captured value is refused and neither dangerous host reaches the spy.
-      const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'remote' })
-      expect(report.passed).toBe(false)
-      const follow = report.requirements.find((r) => r.id === 'follow')!
-      expect(follow.verdict).toBe('fail')
-      expect(follow.detail).toMatch(/off-origin\/private|fail closed/)
-      expect(fetched.some((u) => u.includes('169.254.169.254')), `fetched ${evil}`).toBe(false)
-      expect(fetched.some((u) => u.includes('evil.example')), `fetched ${evil}`).toBe(false)
+      // The invariant that holds for BOTH outcomes: no fetch ever left the
+      // origin (a CRLF path may legitimately carry the text 'evil.example' as a
+      // PATH substring on a good.example fetch — what matters is the HOST).
+      for (const u of fetched) {
+        expect(new URL(u).origin, `${label} leaked ${u}`).toBe(GOOD)
+      }
+      expect(fetched.some((u) => new URL(u).hostname === 'evil.example'), label).toBe(false)
+      if (fetchedSameOrigin) {
+        // CRLF collapsed to a same-origin path and WAS fetched to good.example.
+        expect(fetched.some((u) => u.startsWith(`${GOOD}/things/1`)), label).toBe(true)
+      } else {
+        // Backslash resolved off-origin and was refused before any fetch.
+        const follow = report.requirements.find((r) => r.id === 'follow')!
+        expect(follow.verdict).toBe('fail')
+        expect(follow.detail).toMatch(/off-origin\/private|fail closed/)
+      }
     }
   })
 
@@ -913,6 +948,81 @@ describe('endpoint capture + chaining', () => {
     expect(fetched.length).toBe(0)
   })
 
+  // The role key is DERIVED (endpoint → pinned:<id>, probe → pinned:<id>:<i>)
+  // and non-injective ACROSS KINDS, so raw-id uniqueness is not enough: two
+  // requirements of DIFFERENT kinds with distinct raw ids can still collapse
+  // onto one derived role key. parsePinnedSpec must reject the whole class.
+  it('rejects an endpoint "x:0" + probe "x" that both derive role pinned:x:0', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([
+      { id: 'x:0', kind: 'endpoint', method: 'GET', path: '/a', expect: { status: 200 } },
+      { id: 'x', kind: 'probe', probe: 'knownEmpty', expect: { status: 200 } },
+    ])
+    await expect(
+      verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' }),
+    ).rejects.toThrow(/role-key collision.*"x:0".*"x".*pinned:x:0/s)
+    expect(fetched.length).toBe(0)
+  })
+
+  it('rejects an id containing the ":" role separator (even when it collides with nothing)', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([
+      { id: 'a:b', kind: 'endpoint', method: 'GET', path: '/a', expect: { status: 200 } },
+    ])
+    await expect(
+      verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' }),
+    ).rejects.toThrow(/"a:b".*contains the ':' role-key separator/s)
+    expect(fetched.length).toBe(0)
+  })
+
+  it('rejects two probes whose <id>:<i> namespaces nest (probe "a" vs probe "a:0")', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([
+      { id: 'a', kind: 'probe', probe: 'knownEmpty', expect: { status: 200 } },
+      { id: 'a:0', kind: 'probe', probe: 'knownForbidden', expect: { status: 200 } },
+    ])
+    await expect(
+      verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' }),
+    ).rejects.toThrow(/role-key collision.*"a".*"a:0"|role-key collision.*"a:0".*"a"/s)
+    expect(fetched.length).toBe(0)
+  })
+
+  it('a valid MIXED endpoint+probe spec with non-colliding derived roles still parses + runs green', async () => {
+    const routes = withProbes(goodTargetRoutes(), {
+      knownEmpty: [{ url: '/api/widgets?zone=none' }, { url: '/api/widgets?zone=void' }],
+    })
+    const base = urlAware(makeFetcher(routes), (u) =>
+      u.pathname === '/api/widgets' && u.searchParams.has('zone')
+        ? { status: 200, body: { type: 'EMPTY', items: [] } }
+        : undefined)
+    // Layer a /listings collection on top so the endpoint requirement runs too.
+    const store: Array<{ id: string }> = []
+    let counter = 0
+    const fetcher: Fetcher = async (url, init) => {
+      const u = new URL(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (u.pathname === '/listings' && method === 'POST') {
+        counter += 1
+        const id = `l${counter}`
+        store.push({ id })
+        return jsonResponse(200, { id })
+      }
+      return base(url, init)
+    }
+    const spec = probeSpec([
+      {
+        id: 'create', kind: 'endpoint', method: 'POST', path: '/listings', body: {},
+        expect: { status: 200, paths: [{ path: 'id', exists: true }] },
+      },
+      { ...EMPTY_PROBE_REQ },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
+    // Both requirements' derived roles are present and DISTINCT.
+    expect(report.evidence.items.some((e) => e.role === 'pinned:create')).toBe(true)
+    expect(report.evidence.items.some((e) => e.role === 'pinned:typed-empty:0')).toBe(true)
+  })
+
   it('a valid spec with UNIQUE STRING ids still parses and the numeric CRUD chain runs green', async () => {
     const report = await verifyPinnedSpec(GOOD, probeSpec([
       {
@@ -948,6 +1058,51 @@ describe('endpoint capture + chaining', () => {
       },
     ]), { fetcher: thingsFetcher(), delayMs: 0, seed: 1, mode: 'local' })
     expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
+  })
+
+  it('a lone STRING token with surrounding whitespace PRESERVES the whitespace (not trimmed like a non-string)', async () => {
+    const base = makeFetcher(goodTargetRoutes())
+    const fetcher: Fetcher = async (url, init) => {
+      const u = new URL(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      // sid is a STRING ('hello'); /padded echoes it with the intended spaces,
+      // /tight echoes it without.
+      if (u.pathname === '/mk' && method === 'POST') return jsonResponse(200, { sid: 'hello' })
+      if (u.pathname === '/padded' && method === 'GET') return jsonResponse(200, { v: ' hello ' })
+      if (u.pathname === '/tight' && method === 'GET') return jsonResponse(200, { v: 'hello' })
+      return base(url, init)
+    }
+    const mk = {
+      id: 'mk', kind: 'endpoint', method: 'POST', path: '/mk', body: {},
+      capture: { sid: 'sid' }, expect: { status: 200 },
+    }
+    // ' {{sid}} ' is a lone token but the binding is a STRING, so the surrounding
+    // whitespace is a literal: it resolves to ' hello ' and PASSES a ' hello '
+    // target — proving the whitespace was preserved, not trimmed to 'hello'.
+    const preserved = await verifyPinnedSpec(GOOD, probeSpec([
+      mk,
+      { id: 'read', kind: 'endpoint', method: 'GET', path: '/padded',
+        expect: { status: 200, paths: [{ path: 'v', equals: ' {{sid}} ' }] } },
+    ]), { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(preserved.passed, JSON.stringify(preserved.requirements, null, 2)).toBe(true)
+
+    // Same ' {{sid}} ' against a 'hello' target FAILS — the preserved ' hello '
+    // does not equal 'hello' (a trimming regression would have wrongly PASSED).
+    const failsTrimmed = await verifyPinnedSpec(GOOD, probeSpec([
+      mk,
+      { id: 'read', kind: 'endpoint', method: 'GET', path: '/tight',
+        expect: { status: 200, paths: [{ path: 'v', equals: ' {{sid}} ' }] } },
+    ]), { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(failsTrimmed.passed).toBe(false)
+    expect(failsTrimmed.requirements.find((r) => r.id === 'read')?.detail).toMatch(/wanted " hello "/)
+
+    // Edge-to-edge '{{sid}}' is UNCHANGED — coerces to the raw string 'hello'.
+    const edge = await verifyPinnedSpec(GOOD, probeSpec([
+      mk,
+      { id: 'read', kind: 'endpoint', method: 'GET', path: '/tight',
+        expect: { status: 200, paths: [{ path: 'v', equals: '{{sid}}' }] } },
+    ]), { fetcher, delayMs: 0, seed: 1, mode: 'local' })
+    expect(edge.passed, JSON.stringify(edge.requirements, null, 2)).toBe(true)
   })
 
   it('a token adjacent to NON-whitespace text still stringifies (genuine embedding is untouched)', async () => {

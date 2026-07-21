@@ -102,7 +102,101 @@ export function parsePinnedSpec(text: string): PinnedSpec {
     }
     seen.add(id)
   }
+
+  // DERIVED-ROLE COLLISION GUARD. Raw-id uniqueness (above) is NOT enough: the
+  // role key a requirement records/is-judged under is DERIVED, not the raw id,
+  // and it is NON-INJECTIVE ACROSS KINDS:
+  //   endpoint id X → the single role key  `pinned:X`              (observe/judge
+  //                   both use `pinned:${id}`)
+  //   probe    id Y → the role-key NAMESPACE `pinned:Y:<i>` (one per manifest
+  //                   entry i), modeled here as the PREFIX `pinned:Y:`
+  //   surface / ax-floor / check → record NO `pinned:` role at all, so they can
+  //                   never collide on a derived role key.
+  // So endpoint "x:0" derives `pinned:x:0`, which is ALSO probe "x"'s entry-0
+  // role: both raw ids are distinct strings, the dup guard accepts the spec,
+  // then the judge's find(role === 'pinned:x:0') resolves BOTH requirements to
+  // the FIRST-recorded item — a probe judged against an endpoint's body (a
+  // false-FAIL, or a vacuous false-PASS: a conformance requirement that never
+  // judges the thing it names). Reject at parse if any two requirements' derived
+  // role keys can collide — an endpoint's point key falling inside a probe's
+  // namespace, or one probe namespace nested inside another.
+  const reservations: RoleReservation[] = []
+  for (const req of doc.requirements) {
+    const kind = (req as { kind?: unknown }).kind
+    const id = (req as { id: string }).id
+    if (kind === 'endpoint') reservations.push({ id, kind: 'endpoint', point: `pinned:${id}` })
+    else if (kind === 'probe') reservations.push({ id, kind: 'probe', prefix: `pinned:${id}:` })
+  }
+  for (let i = 0; i < reservations.length; i++) {
+    for (let j = i + 1; j < reservations.length; j++) {
+      const a = reservations[i]!
+      const b = reservations[j]!
+      const shared = roleKeysCollide(a, b)
+      if (shared !== undefined) {
+        throw new Error(
+          `derived role-key collision in PinnedSpec: requirement "${a.id}" (${a.kind}) and ` +
+            `requirement "${b.id}" (${b.kind}) both derive role key(s) under "${shared}". The role ` +
+            'key is DERIVED (endpoint → pinned:<id>, probe → pinned:<id>:<i>), not the raw id, so ' +
+            'two distinct raw ids can still share a role and make observe and the judge resolve ' +
+            'different requirements — refusing to verify something incoherent',
+        )
+      }
+    }
+  }
+
+  // Belt-and-suspenders: ':' is the role-key separator (`pinned:<id>[:<i>]`), so
+  // a colon INSIDE a raw id is the only way a derived role key can ever be
+  // ambiguous. The collision guard above already rejects the concrete colliding
+  // cases; this closes the whole class categorically — including ids like "a:b"
+  // that happen to collide with nothing yet still muddy role parsing.
+  for (const req of doc.requirements) {
+    const id = (req as { id: string }).id
+    if (id.includes(':')) {
+      throw new Error(
+        `requirement id "${id}" in PinnedSpec contains the ':' role-key separator — a requirement ` +
+          'id must not contain ":" (the derived role key is pinned:<id>[:<i>]; a colon in the raw ' +
+          'id makes that key ambiguous). Rename the requirement.',
+      )
+    }
+  }
   return doc
+}
+
+/**
+ * One requirement's reservation in the DERIVED role-key space. An `endpoint`
+ * reserves a single POINT (`pinned:<id>`); a `probe` reserves a whole NAMESPACE
+ * (`pinned:<id>:<i>` for every manifest entry i), modeled as the PREFIX
+ * `pinned:<id>:`.
+ */
+interface RoleReservation {
+  id: string
+  kind: 'endpoint' | 'probe'
+  point?: string
+  prefix?: string
+}
+
+/**
+ * Return the shared role key (a descriptive string) if two reservations' derived
+ * role-key spaces intersect, else undefined. A point falls inside a namespace
+ * when it starts with the namespace prefix; two namespaces collide when one
+ * prefix is a prefix of the other (nested). Two points can only match on an
+ * identical raw id, which the dup guard already rejects.
+ */
+function roleKeysCollide(a: RoleReservation, b: RoleReservation): string | undefined {
+  if (a.point !== undefined && b.point !== undefined) {
+    return a.point === b.point ? a.point : undefined
+  }
+  if (a.point !== undefined && b.prefix !== undefined) {
+    return a.point.startsWith(b.prefix) ? a.point : undefined
+  }
+  if (b.point !== undefined && a.prefix !== undefined) {
+    return b.point.startsWith(a.prefix) ? b.point : undefined
+  }
+  if (a.prefix !== undefined && b.prefix !== undefined) {
+    if (a.prefix.startsWith(b.prefix)) return `${a.prefix}<i>`
+    if (b.prefix.startsWith(a.prefix)) return `${b.prefix}<i>`
+  }
+  return undefined
 }
 
 export async function verifyPinnedSpec(
@@ -502,19 +596,31 @@ function interpolateString(s: string, bindings: Bindings): { value: string } | {
  * `"1"` where `judgeExpect` would then mismatch `1`. Any other string (a
  * partial/embedded token, or plain text) falls through to string coercion.
  *
- * Surrounding whitespace is incidental, not embedding: `'{{tid}} '` or
- * `' {{x}} '` is still a lone whole-value token meant AS the value, so it is
- * TRIMMED before classification — otherwise the trailing space would push it
- * onto the string-coercing path and silently false-FAIL a compliant numeric
- * target (`"1 "` vs `1`). A token adjacent to NON-whitespace text (`'v{{n}}'`,
- * `'{{a}}{{b}}'`) is genuine embedded interpolation and still coerces.
+ * Surrounding whitespace is incidental ONLY for a NON-STRING binding: `'{{n}} '`
+ * or `' {{n}} '` bound to a number/boolean/object/null is still a lone
+ * whole-value token meant AS that value — whitespace cannot be part of the
+ * intended literal — so it is TRIMMED before classification and the RAW typed
+ * value is substituted (otherwise the trailing space would push it onto the
+ * string-coercing path and silently false-FAIL a compliant numeric target,
+ * `"1 "` vs `1`). But for a STRING binding the surrounding whitespace MAY be an
+ * intended literal (`' {{tid}} '` with tid = 'hello' meaning the literal
+ * ' hello '), so a string value keeps the string-coercing in-place path, which
+ * substitutes the token where it sits and PRESERVES the surrounding whitespace.
+ * (An edge-to-edge string token `'{{tid}}'` coerces to the identical raw string,
+ * so it is unaffected either way.) A token adjacent to NON-whitespace text
+ * (`'v{{n}}'`, `'{{a}}{{b}}'`) is genuine embedded interpolation and coerces.
  */
 function interpolateTypedString(s: string, bindings: Bindings): { value: unknown } | { error: string } {
   const whole = WHOLE_VALUE_TOKEN.exec(s.trim())
   if (whole) {
     const name = whole[1]!
     if (!Object.hasOwn(bindings, name)) return { error: `undefined capture var {{${name}}}` }
-    return { value: bindings[name] }
+    const v = bindings[name]
+    // Preserve TYPE (trimming incidental whitespace) only when whitespace cannot
+    // be part of an intended literal — i.e. the bound value is NON-STRING. A
+    // STRING binding falls through to the string-coercing path below, which
+    // preserves any surrounding whitespace in `s`.
+    if (typeof v !== 'string') return { value: v }
   }
   return interpolateString(s, bindings)
 }
