@@ -17,11 +17,17 @@ import {
   firstAuthorizationServer,
   wellKnownAt,
   parseAgentAuth,
+  parseServerJson,
+  parseReverseDnsName,
+  namespaceDomain,
+  isGithubNamespace,
+  githubNamespaceOwner,
+  type ServerJsonClaims,
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
 import { contractDiff } from './contract.js'
-import type { CheckResult, Evidence, EvidenceBundle, Verdict } from './types.js'
+import type { CheckResult, Evidence, EvidenceBundle, MiniSchema, Verdict } from './types.js'
 
 /**
  * Read the RAW monetization.probe off the card (pre-drop) and, if present,
@@ -463,6 +469,54 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     checks.push(c)
   }
 
+  // ── MCP-registry publishability (ax-e6b.38) ──────────────────────────────
+  //    A listing can pass AX-6 'mcp-declared' (presence-grade) yet NOT be
+  //    publishable to / discoverable via the official MCP Registry
+  //    (registry.modelcontextprotocol.io) that the agent-native hubs ingest
+  //    from. This dimension grades the missing piece — DERIVED entirely from the
+  //    target's PUBLISHED surfaces + DNS (verifier-independent, no repo-local
+  //    tests). It ACTIVATES only when the target serves a server.json manifest
+  //    (an affirmative registry claim); a target that ships none SKIPs every
+  //    sub-check (AX-6 still records its presence-only MCP declaration), so a
+  //    non-registry MCP server is never over-blocked. When active, each sub-
+  //    check is an HONESTY cap (axItem undefined): a presence-only pass must not
+  //    masquerade as publishable, so an invalid manifest / a dead live remote /
+  //    an unprovable namespace ownership FAILs and caps the grade.
+  {
+    const sjEv = findEvidence(bundle, ROLE.mcpServerJson)
+    const server = parseServerJson(parseJsonBody(sjEv))
+
+    // (a) server.json validity — required registry fields + reverse-DNS name.
+    checks.push(check('mcp-server-json',
+      'MCP registry manifest (server.json) is valid and registry-publishable', undefined,
+      [ROLE.mcpServerJson], judgeServerJson(sjEv, server)))
+
+    // (b) LIVE MCP remote resolution — upgrade from AX-6 presence-only.
+    const initEv = findEvidence(bundle, ROLE.mcpRemoteInit)
+    const toolsEv = findEvidence(bundle, ROLE.mcpRemoteToolsList)
+    checks.push(check('mcp-remote-live',
+      'declared MCP remote resolves live (initialize → tools/list advertises tools)', undefined,
+      [ROLE.mcpServerJson, ROLE.mcpRemoteInit, ROLE.mcpRemoteToolsList],
+      judgeMcpRemoteLive(sjEv, server, initEv, toolsEv)))
+
+    // (c) DNS-challenge / well-known ownership provability.
+    const authEv = findEvidence(bundle, ROLE.mcpRegistryAuthWellKnown)
+    const dnsEv = findEvidence(bundle, ROLE.mcpRegistryDnsTxt)
+    checks.push(check('mcp-registry-ownership',
+      'domain can prove ownership to publish under its reverse-DNS namespace (DNS-TXT or /.well-known)', undefined,
+      [ROLE.mcpServerJson, ROLE.mcpRegistryAuthWellKnown, ROLE.mcpRegistryDnsTxt],
+      judgeRegistryOwnership(sjEv, server, authEv, dnsEv)))
+
+    // (d) OPTIONAL/informational — actual presence in the official registry.
+    //     NEVER fails (pass when found, skip otherwise) — it does not gate the
+    //     grade: publishability is graded from the target's own surfaces.
+    const presenceEv = findEvidence(bundle, ROLE.mcpRegistryPresence)
+    checks.push(check('mcp-registry-presence',
+      'server is present in the official MCP registry (informational)', undefined,
+      [ROLE.mcpServerJson, ROLE.mcpRegistryPresence],
+      judgeRegistryPresence(sjEv, server, presenceEv)))
+  }
+
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
   {
     // The manifest is ADVERSARIAL input: a pinned standard that resolves its
@@ -774,6 +828,287 @@ function mcpUrlSameOriginViolation(rawUrl: string | undefined, origin: string): 
     return `interfaces.mcp.url ${rawUrl} is not a same-origin, publicly-routable MCP endpoint for ${origin} — refused without fetching (SSRF guard: an MCP resource server MUST be same-origin with the target)`
   }
   return undefined
+}
+
+// ---------------------------------------------------------------------------
+// MCP-registry publishability judges (pure) — ax-e6b.38
+// ---------------------------------------------------------------------------
+
+/**
+ * The server.json publishability schema. `name` + `version` are the registry's
+ * hard-required fields; `title`/`description`/`repository`/`websiteUrl`/`remotes`
+ * are the registry-QUALITY bar this dimension holds a publishable listing to (a
+ * bare name+version validates against the loose schema but is not a discoverable
+ * listing). minLength/minItems reject the present-but-empty inflation
+ * (`title: ""`, `remotes: []`) the way the MCP-OAuth members reject `''`.
+ */
+const SERVER_JSON_SCHEMA: MiniSchema = {
+  type: 'object',
+  required: ['name', 'version', 'title', 'description', 'repository', 'websiteUrl', 'remotes'],
+  properties: {
+    name: { type: 'string', minLength: 1 },
+    version: { type: 'string', minLength: 1 },
+    title: { type: 'string', minLength: 1 },
+    description: { type: 'string', minLength: 1 },
+    websiteUrl: { type: 'string', minLength: 1 },
+    repository: {
+      type: 'object',
+      required: ['url'],
+      properties: { url: { type: 'string', minLength: 1 }, source: { type: 'string' } },
+    },
+    remotes: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        required: ['type', 'url'],
+        properties: { type: { type: 'string', minLength: 1 }, url: { type: 'string', minLength: 1 } },
+      },
+    },
+  },
+}
+
+/**
+ * (a) server.json validity. ABSENT manifest (non-2xx / not fetched) => SKIP: the
+ * target is not claiming MCP-registry publishability. A served-but-invalid
+ * manifest FAILs (and, as an honesty check, caps the grade) — a listing that
+ * claims to be registry-publishable but is not, is a lying surface.
+ */
+function judgeServerJson(sjEv: Evidence | undefined, server: ServerJsonClaims | undefined): { verdict: Verdict; detail: string } {
+  if (!ok(sjEv)) {
+    return { verdict: 'skip', detail: 'no server.json manifest served at the well-known/declared path — target is not claiming MCP-registry publishability' }
+  }
+  if (!server) {
+    return { verdict: 'fail', detail: 'server.json was served (2xx) but is not a valid JSON object' }
+  }
+  const violations = validateSchema(server.raw, SERVER_JSON_SCHEMA).map((v) => `${v.path} ${v.message}`)
+  // Reverse-DNS namespace shape of `name` (io.github.owner/server, com.example/server).
+  if (typeof server.name === 'string' && server.name.length > 0 && !parseReverseDnsName(server.name)) {
+    violations.push(`name "${server.name}" is not a valid reverse-DNS namespace (expected e.g. io.github.owner/server or com.example/server)`)
+  }
+  // Remote transport values, when present, must be a known registry transport.
+  for (const r of server.remotes) {
+    if (r.type !== undefined && r.type !== 'streamable-http' && r.type !== 'sse') {
+      violations.push(`remotes[].type "${r.type}" is not a registry transport (expected streamable-http | sse)`)
+    }
+  }
+  if (violations.length) {
+    return { verdict: 'fail', detail: `server.json is not registry-publishable: ${violations.slice(0, 6).join('; ')}` }
+  }
+  return pass(`server.json valid: name="${server.name}" v${server.version}, ${server.remotes.length} remote(s), repository + websiteUrl present`)
+}
+
+/**
+ * Parse a JSON-RPC message out of an MCP handshake Evidence body, tolerating
+ * BOTH a plain `application/json` response and an SSE (`text/event-stream`)
+ * framing where the JSON rides on `data:` lines. Returns the parsed message
+ * object, or undefined.
+ */
+function parseMcpMessage(ev: Evidence | undefined): Record<string, unknown> | undefined {
+  if (!ev || ev.body === null) return undefined
+  const body = ev.body
+  // Plain JSON first.
+  try {
+    const parsed = JSON.parse(body)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+  } catch { /* fall through to SSE parsing */ }
+  // SSE: take the LAST `data:` payload that parses as a JSON object.
+  let found: Record<string, unknown> | undefined
+  for (const line of body.split(/\r?\n/)) {
+    const m = /^data:\s?(.*)$/.exec(line)
+    if (!m || !m[1]) continue
+    try {
+      const parsed = JSON.parse(m[1])
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) found = parsed as Record<string, unknown>
+    } catch { /* ignore non-JSON data lines */ }
+  }
+  return found
+}
+
+/** The `result.tools[]` (each tool's `name`) advertised by a tools/list message. */
+function toolsFrom(message: Record<string, unknown> | undefined): string[] {
+  const result = message?.result
+  if (!result || typeof result !== 'object') return []
+  const tools = (result as Record<string, unknown>).tools
+  if (!Array.isArray(tools)) return []
+  return tools
+    .map((t) => (t && typeof t === 'object' ? (t as Record<string, unknown>).name : undefined))
+    .filter((n): n is string => typeof n === 'string' && n.length > 0)
+}
+
+/**
+ * (b) LIVE MCP remote resolution — the upgrade from AX-6 presence-only. ABSENT
+ * server.json => SKIP. A server.json with NO http remote (packages-only) => SKIP
+ * (still registry-publishable, just nothing live to resolve). A declared remote
+ * is graded on the recorded initialize/tools-list handshake:
+ *   - initialize 401/403        => PASS (reachable + auth-protected, not dead)
+ *   - initialize 2xx + tools    => PASS (genuinely resolves and advertises tools)
+ *   - initialize 2xx, no tools  => FAIL (resolves but advertises nothing)
+ *   - unreachable / 3xx / 4xx / 5xx / SSRF-refused => FAIL (declared-but-dead)
+ */
+function judgeMcpRemoteLive(
+  sjEv: Evidence | undefined,
+  server: ServerJsonClaims | undefined,
+  initEv: Evidence | undefined,
+  toolsEv: Evidence | undefined,
+): { verdict: Verdict; detail: string } {
+  if (!ok(sjEv) || !server) {
+    return { verdict: 'skip', detail: 'no server.json manifest — no registry remote to resolve' }
+  }
+  const remote = server.remotes.find((r) => typeof r.url === 'string' && r.url.length > 0)
+  if (!remote?.url) {
+    return { verdict: 'skip', detail: 'server.json declares no http remote (packages-only listing) — no live remote to resolve' }
+  }
+  // SSRF re-derivation from the URL string (the hostile remote is never fetched,
+  // so no initEv exists): the remote must be https + public + non-private.
+  if (!isPublicHttpsOffOriginAllowed(remote.url)) {
+    return { verdict: 'fail', detail: `server.json remote url ${remote.url} is not a public https endpoint (no cleartext, no private/metadata host) — refused without fetching (SSRF guard)` }
+  }
+  if (!initEv || initEv.status === null) {
+    return { verdict: 'fail', detail: `declared MCP remote ${remote.url} is unreachable: ${initEv?.error ?? 'no initialize response'}` }
+  }
+  const status = initEv.status
+  if (status === 401 || status === 403) {
+    return pass(`remote ${remote.url} is reachable and auth-protected (HTTP ${status}) — a live, protected MCP endpoint (reachable+protected, not dead)`)
+  }
+  if (status < 200 || status >= 300) {
+    const kind = status >= 300 && status < 400 ? 'a redirect (not followed)' : `HTTP ${status}`
+    return { verdict: 'fail', detail: `declared MCP remote ${remote.url} did not resolve — initialize returned ${kind}` }
+  }
+  // initialize resolved 2xx — require tools/list to advertise ≥1 tool.
+  const initMsg = parseMcpMessage(initEv)
+  if (initMsg?.error) {
+    return { verdict: 'fail', detail: `declared MCP remote ${remote.url} returned a JSON-RPC error on initialize — not a resolvable MCP endpoint` }
+  }
+  const tools = toolsFrom(parseMcpMessage(toolsEv))
+  if (tools.length === 0) {
+    return { verdict: 'fail', detail: `MCP remote ${remote.url} resolved (initialize 2xx) but tools/list advertised no tools — a live MCP server must expose at least one tool` }
+  }
+  return pass(`live remote ${remote.url} resolved: initialize ok, tools/list advertises ${tools.length} tool(s) [${tools.slice(0, 8).join(', ')}]`)
+}
+
+/** The origin host (lowercased) of a repository url, plus its first path segment. */
+function repoOwnerHost(repoUrl: string | undefined): { host: string; owner: string } | undefined {
+  if (typeof repoUrl !== 'string' || repoUrl.length === 0) return undefined
+  let u: URL
+  try { u = new URL(repoUrl) } catch { return undefined }
+  const seg = u.pathname.split('/').filter((s) => s.length > 0)
+  return { host: u.hostname.toLowerCase(), owner: (seg[0] ?? '').toLowerCase() }
+}
+
+/** True when a DoH TXT response or a well-known body carries the MCPv1 proof. */
+function carriesMcpv1Proof(body: string | null | undefined): boolean {
+  return typeof body === 'string' && /v=MCPv1/i.test(body)
+}
+
+/**
+ * (c) Ownership provability. ABSENT server.json => SKIP. When active, the domain
+ * must be able to prove it can publish under its reverse-DNS namespace, via ANY
+ * of: an HTTPS /.well-known/mcp-registry-auth carrying `v=MCPv1`; a DNS-TXT proof
+ * (v=MCPv1) resolved over DoH for a custom-domain namespace; or — for the
+ * GitHub-account-backed `io.github.<owner>` namespace — a repository url on
+ * github.com under that same owner (the self-consistent GitHub-namespace proof).
+ * Unprovable => FAIL (capped): a server cannot publish under a namespace it
+ * cannot prove it owns.
+ */
+function judgeRegistryOwnership(
+  sjEv: Evidence | undefined,
+  server: ServerJsonClaims | undefined,
+  authEv: Evidence | undefined,
+  dnsEv: Evidence | undefined,
+): { verdict: Verdict; detail: string } {
+  if (!ok(sjEv) || !server) {
+    return { verdict: 'skip', detail: 'no server.json manifest — no namespace ownership to prove' }
+  }
+  const parsed = parseReverseDnsName(server.name)
+  if (!parsed) {
+    // The name is malformed — mcp-server-json already fails+caps for it; do not
+    // double-jeopardy here.
+    return { verdict: 'skip', detail: 'server.json name is not a valid reverse-DNS namespace — ownership is not assessable (see mcp-server-json)' }
+  }
+
+  // Well-known HTTPS proof at the origin (v=MCPv1; k=…; p=…).
+  const wellKnownProof = ok(authEv) && carriesMcpv1Proof(authEv?.body)
+
+  if (isGithubNamespace(server.name)) {
+    const owner = githubNamespaceOwner(server.name)
+    const repo = repoOwnerHost(server.repository?.url)
+    const githubProof = !!owner && !!repo && repo.host === 'github.com' && repo.owner === owner
+    if (githubProof) {
+      return pass(`io.github.${owner} namespace is provable: repository url is github.com/${owner}/… (GitHub-account-backed ownership)`)
+    }
+    if (wellKnownProof) {
+      return pass(`ownership provable via ${authEv!.url} (v=MCPv1 well-known proof)`)
+    }
+    return { verdict: 'fail', detail: `cannot prove ownership of GitHub namespace "${server.name}": repository url ${server.repository?.url ?? '(none)'} is not github.com/${owner}/… and no /.well-known/mcp-registry-auth (v=MCPv1) is served — the server cannot publish under a namespace it cannot prove` }
+  }
+
+  // Custom-domain namespace: DNS-TXT (via DoH) OR the well-known HTTPS proof.
+  const domain = namespaceDomain(server.name)
+  const dnsProof = ok(dnsEv) && dnsTxtCarriesProof(dnsEv)
+  if (dnsProof) {
+    return pass(`ownership provable via DNS-TXT (v=MCPv1) for ${domain} — the domain can publish under com.-namespace ${parsed.namespace}`)
+  }
+  if (wellKnownProof) {
+    return pass(`ownership provable via ${authEv!.url} (v=MCPv1 well-known proof) for ${domain}`)
+  }
+  return { verdict: 'fail', detail: `cannot prove ownership of namespace "${server.name}" (domain ${domain ?? '?'}): no DNS-TXT (v=MCPv1) proof and no /.well-known/mcp-registry-auth (v=MCPv1) — the server cannot publish under a namespace it cannot prove` }
+}
+
+/** True when a DoH TXT JSON response carries an Answer TXT record with v=MCPv1. */
+function dnsTxtCarriesProof(dnsEv: Evidence | undefined): boolean {
+  if (!dnsEv || dnsEv.body === null) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(dnsEv.body) } catch { return false }
+  if (!parsed || typeof parsed !== 'object') return false
+  const answer = (parsed as Record<string, unknown>).Answer
+  if (!Array.isArray(answer)) return false
+  // DoH TXT `type` is 16; `data` carries the (possibly quoted) TXT string.
+  return answer.some((a) => {
+    if (!a || typeof a !== 'object') return false
+    const rec = a as Record<string, unknown>
+    return rec.type === 16 && carriesMcpv1Proof(typeof rec.data === 'string' ? rec.data : undefined)
+  })
+}
+
+/**
+ * (d) OPTIONAL/informational registry presence. NEVER fails (so it never caps
+ * the grade): PASS when the server name is found in the official registry
+ * response, SKIP otherwise (not present, unreachable, or not checked).
+ */
+function judgeRegistryPresence(
+  sjEv: Evidence | undefined,
+  server: ServerJsonClaims | undefined,
+  presenceEv: Evidence | undefined,
+): { verdict: Verdict; detail: string } {
+  if (!ok(sjEv) || !server || typeof server.name !== 'string') {
+    return { verdict: 'skip', detail: 'no server.json manifest — registry presence not applicable' }
+  }
+  if (!ok(presenceEv) || presenceEv?.body == null) {
+    return { verdict: 'skip', detail: 'official registry not reached (informational — publishability is graded from the target’s own surfaces, not registry membership)' }
+  }
+  // Look for the exact server name anywhere in the (JSON) registry response.
+  let present = false
+  try {
+    const doc = JSON.parse(presenceEv.body)
+    present = registryDocMentions(doc, server.name)
+  } catch { present = false }
+  return present
+    ? pass(`server "${server.name}" is present in the official MCP registry`)
+    : { verdict: 'skip', detail: `server "${server.name}" not found in the official MCP registry (informational — not required for the publishability grade)` }
+}
+
+/** True when a parsed registry response lists a server whose `name` matches. */
+function registryDocMentions(doc: unknown, name: string): boolean {
+  const scan = (arr: unknown): boolean =>
+    Array.isArray(arr) && arr.some((s) => s && typeof s === 'object' && (s as Record<string, unknown>).name === name)
+  if (scan(doc)) return true
+  if (doc && typeof doc === 'object') {
+    const d = doc as Record<string, unknown>
+    if (scan(d.servers)) return true
+    if (scan(d.data)) return true
+  }
+  return false
 }
 
 function looksLikeHtml(body: string): boolean {
