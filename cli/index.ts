@@ -10,6 +10,9 @@
  *                                                              or a running local dev server by URL)
  *   npx autonomous-qa suite <file> --env <name>          reusable suite/collection mode
  *       [--iteration-data <dataset>] [--target <t>] [--expect-digest <sha256>]
+ *   npx autonomous-qa contract-diff <spec> <target>      did this deploy break the published contract?
+ *       [--json] [--reporter ...]                         (exit NON-ZERO on any breaking op diff)
+ *   npx autonomous-qa mock <spec> --port <n>             local deterministic mock server from a spec
  *   npx autonomous-qa spec-digest <file>                 print the sha256 pin for a spec
  *   npx autonomous-qa rejudge                            re-judge a JSON report from stdin
  *   npx autonomous-qa mcp                                MCP server (stdio)
@@ -37,7 +40,10 @@ import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/
 import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
-import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from '../src/render.js'
+import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown, contractDiffMarkdown } from '../src/render.js'
+import { runContractDiff } from '../src/contract-cli.js'
+import { startMockServer } from '../src/mock-server.js'
+import { DEFAULT_MOCK_SEED } from '../src/mock.js'
 import {
   exitCodeFor,
   junitXml,
@@ -204,6 +210,75 @@ async function main(): Promise<number> {
     return emit(report, suiteMarkdown(report), flags)
   }
 
+  if (cmd === 'contract-diff') {
+    // contract-diff <openapi-spec> <target> (ax-gyh): the highest-value CI gate
+    // — "did this deploy break the published contract?". The spec is LOCAL (a
+    // file, the published contract); the target is FETCHED live through the
+    // SSRF-gated Observer (runContractDiff — no new un-gated fetch). Exit
+    // NON-ZERO on ANY breaking operation diff (exitCodeFor over the report).
+    const specFile = rest[0]
+    const target = rest[1] ?? flags.get('target')
+    if (!specFile || !target) return die('contract-diff needs <openapi-spec> <target>')
+    const specText = readFileSync(specFile, 'utf8')
+    // A localhost/private target URL opts into the private-host allowance the
+    // same anchored-hostname way `dev <url>` does — never inferred from a
+    // remote target (the SSRF invariant).
+    const allowPrivate = isUrl(target) && isPrivateUrlHost(target)
+    const report = await runContractDiff(specText, target, {
+      seed,
+      allowPrivate,
+      delayMs: isLocalTarget(target) ? 0 : 150,
+    })
+    // A gate that verified NOTHING must never exit 0/PASSED (the CLI's own
+    // silent-green fix): `breaking` is trivially 0 whenever no operation was
+    // probed, so an un-diffable spec (wrong file, lost `paths`, unrecognized
+    // shape) or a spec whose every declared operation is unprobeable would
+    // otherwise print a clean PASSED report. die() loudly instead of emitting
+    // a "clean" report; exitCodeFor() below is ALSO fixed (defense in depth
+    // for any other caller of the raw report).
+    if (!report.openapiValid) {
+      return die(`contract-diff: ${specFile} has no valid OpenAPI contract to diff — refusing to report a clean pass`)
+    }
+    if (report.operationsProbed === 0) {
+      return die(
+        `contract-diff: zero probeable operations in ${specFile} against ${target} — refusing to report a clean pass`,
+      )
+    }
+    return emit(report, contractDiffMarkdown(report), flags)
+  }
+
+  if (cmd === 'mock') {
+    // mock <spec> --port <n> (ax-gyh): stand up a LOCAL deterministic mock HTTP
+    // server from a published OpenAPI spec, so the offline loop `mock -> run
+    // suite against it -> teardown` works in a network-isolated pipeline. The
+    // mock only SERVES locally generated responses (no outbound fetch, no SSRF
+    // surface). Long-running: it serves until the process is signalled.
+    const specFile = rest[0]
+    const portRaw = flags.get('port')
+    if (!specFile || !portRaw || portRaw === 'true') return die('mock needs <spec> and --port <n>')
+    const port = Number(portRaw)
+    if (!Number.isInteger(port) || port < 0 || port > 65535) return die(`mock: invalid --port "${portRaw}" (expected 0–65535)`)
+    const specText = readFileSync(specFile, 'utf8')
+    let doc: unknown
+    try {
+      doc = JSON.parse(specText)
+    } catch (err) {
+      return die(`mock: spec is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    const started = await startMockServer(doc, port, seed !== undefined ? { seed } : {})
+    console.error(
+      `autonomous-qa: deterministic mock for ${specFile} → http://127.0.0.1:${started.port} ` +
+        `(seed ${seed ?? DEFAULT_MOCK_SEED}); serves declared operations, 404s the rest. Ctrl-C to stop.`,
+    )
+    const stop = (): void => {
+      void started.close().finally(() => process.exit(0))
+    }
+    process.once('SIGINT', stop)
+    process.once('SIGTERM', stop)
+    // Serve until signalled — never resolve, so the process stays alive.
+    return new Promise<number>(() => {})
+  }
+
   if (cmd === 'dev') {
     const entry = rest[0]
     if (!entry) return die('dev needs an entry module path or a localhost URL')
@@ -310,6 +385,11 @@ function usage(): string {
       [--iteration-data <dataset.csv|.json>]          run once per dataset row (data-driven)
       [--target <target>] [--expect-digest <sha256>] [--seed <n>]
       (target defaults to the selected environment's baseUrl var)
+  npx autonomous-qa contract-diff <spec> <target>    did this deploy break the published contract?
+      [--json] [--reporter ...] [--seed <n>]          EXITS NON-ZERO on any breaking operation diff
+      (spec is the published OpenAPI file; target is fetched live, SSRF-gated)
+  npx autonomous-qa mock <spec> --port <n>            local deterministic mock server from an OpenAPI spec
+      [--seed <n>]                                    serves declared operations; undeclared paths 404
   npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite
   npx autonomous-qa rejudge                           re-judge a JSON report from stdin
   npx autonomous-qa mcp                               MCP server (stdio)

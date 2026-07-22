@@ -92,18 +92,55 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       : fail(icpEv, 'expected valid JSON with agent_classes at /icp.json')))
 
   // ── AX 4: content negotiation at the root ────────────────────────────────
+  //    Three probes: Accept: */* (curl/agent → non-HTML text), Accept: text/html
+  //    (browser → HTML), and — ax-c7m — Accept: application/json (agent asking
+  //    for JSON). The blind-spot the JSON probe closes: a root that IGNORES
+  //    Accept: application/json and hands a JSON-requesting agent a wall of HTML.
+  //    That is graded DOWN (FAIL). A root that legitimately has NO JSON
+  //    representation but still answers with agent-actionable non-HTML text
+  //    (markdown) is NOT false-failed — it keeps the point, with a sub-signal
+  //    in the detail noting JSON is not served (partial credit). Grade what's
+  //    declared: only serving HTML to an explicit application/json request is
+  //    penalized, never the absence of a JSON body itself.
   {
     const asAgent = findEvidence(bundle, ROLE.rootAgent)
     const asBrowser = findEvidence(bundle, ROLE.rootBrowser)
+    const asJson = findEvidence(bundle, ROLE.rootJson)
     const agentGotText = ok(asAgent) && asAgent?.body != null && !looksLikeHtml(asAgent.body)
     const browserGotHtml = ok(asBrowser) && asBrowser?.body != null && looksLikeHtml(asBrowser.body)
-    checks.push(check('content-negotiation', 'root content-negotiates (curl → markdown, browser → HTML)', 4,
-      [ROLE.rootAgent, ROLE.rootBrowser],
-      agentGotText && browserGotHtml
-        ? pass('Accept: */* got non-HTML text; Accept: text/html got HTML')
-        : fail(asAgent, agentGotText
-            ? 'browser Accept did not receive HTML'
-            : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')))
+    // JSON sub-signal (only meaningful when the JSON probe actually resolved).
+    const jsonProbed = ok(asJson) && asJson?.body != null
+    const jsonIsHtml = jsonProbed && looksLikeHtml(asJson!.body!)
+    const jsonCt = asJson?.contentType?.toLowerCase() ?? ''
+    const jsonBodyParses = jsonProbed && parseJsonBody(asJson) !== undefined
+    const jsonServed = jsonProbed && jsonCt.includes('json') && jsonBodyParses
+    const mdHtmlOk = agentGotText && browserGotHtml
+    let result: { verdict: Verdict; detail: string }
+    if (!mdHtmlOk) {
+      result = fail(asAgent, agentGotText
+        ? 'browser Accept did not receive HTML'
+        : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')
+    } else if (jsonIsHtml) {
+      // The blind-spot: Accept: application/json was ignored and answered with
+      // a wall of HTML. Grade DOWN.
+      result = { verdict: 'fail', detail: 'root ignores Accept: application/json — a JSON-requesting agent received a wall of HTML instead of a JSON (or at least non-HTML, agent-actionable) representation' }
+    } else if (jsonServed) {
+      result = pass('Accept: */* got non-HTML text; Accept: text/html got HTML; Accept: application/json got a parseable JSON body')
+    } else if (jsonBodyParses) {
+      // A JSON body WAS served (it parses) but not labeled with a JSON
+      // content-type — distinct from "no JSON body at all". Not a false-fail
+      // (the content itself is agent-actionable), but the detail must say what
+      // actually happened rather than claim no JSON body was served.
+      result = pass('Accept: */* got non-HTML text; Accept: text/html got HTML; Accept: application/json served a parseable JSON body under a non-JSON content-type (partial credit)')
+    } else {
+      // md/html negotiate correctly and the JSON probe did NOT return HTML
+      // (it returned non-HTML text, e.g. markdown, or a non-2xx). No JSON
+      // representation at the root, but not a false-fail — keep the point with
+      // a clear sub-signal.
+      result = pass('Accept: */* got non-HTML text; Accept: text/html got HTML; Accept: application/json served no JSON body but did NOT return HTML (agent-actionable non-HTML fallback — partial credit)')
+    }
+    checks.push(check('content-negotiation', 'root content-negotiates (curl → markdown, browser → HTML, agent JSON → JSON/non-HTML)', 4,
+      [ROLE.rootAgent, ROLE.rootBrowser, ROLE.rootJson], result))
   }
 
   // ── AX 5: OpenAPI contract ───────────────────────────────────────────────
