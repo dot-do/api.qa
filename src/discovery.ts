@@ -38,6 +38,14 @@ export const ROLE = {
    * `probe:endpoint:` role instead of being probed again.
    */
   contract: (method: string, path: string) => `contract:${method} ${path}`,
+  /**
+   * Clause-3 typed-body legibility (ax-fsg): a seeded sample of declared
+   * typed-body endpoints fetched under BOTH the agent Accept (star/star) and
+   * the browser Accept (text/html), so machine-legibility is verified beyond
+   * the root — an API path must stay JSON, never vary into HTML by Accept.
+   */
+  typedBodyAgent: (path: string) => `probe:typed-body-agent ${path}`,
+  typedBodyBrowser: (path: string) => `probe:typed-body-browser ${path}`,
   offer: 'probe:402-offer',
   // MCP OAuth conformance (RFC 9728 / 8414 / 7591 / 7636 / 8707). Recorded only
   // when agents.json declares an HTTP/SSE MCP interface (interfaces.mcp.url).
@@ -508,6 +516,28 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     const url = `${origin}${path}`
     if (!isPubliclyRoutableSameOrigin(url, origin)) continue
     await observer.observe(ROLE.contract('GET', path), url, { accept: 'application/json' })
+  }
+
+  // 2c. Clause-3 typed-body legibility beyond the root (ax-fsg): a target that
+  //     claims the agent-first API contract (declares a probe manifest) must
+  //     answer machine-legible non-HTML on its TYPED BODIES too, not just the
+  //     home. Fetch a bounded, seed-replayable sample of declared typed-body
+  //     paths under BOTH Accept: */* (agent) and Accept: text/html (browser);
+  //     the machine-legible-home judge (checks.ts) then requires every sampled
+  //     typed body to be non-HTML under both. Gated on the probe manifest so
+  //     page surfaces (no manifest) are exempt, mirroring the check's skip
+  //     semantics. Same SSRF posture as every card-derived probe. A card with a
+  //     manifest but zero non-templated declared paths samples nothing (neutral,
+  //     home-only) — it does not regress minimal cards.
+  if (agents.probes) {
+    for (const path of sampleSeeded(candidatePaths, 2, seed)) {
+      const u = `${origin}${path}`
+      if (!isPubliclyRoutableSameOrigin(u, origin)) continue
+      await observer.observe(ROLE.typedBodyAgent(path), u, { accept: '*/*' })
+      await observer.observe(ROLE.typedBodyBrowser(path), u, {
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      })
+    }
   }
 
   // 3. The 402 boundary probe, if the target declares one. Defense in depth:

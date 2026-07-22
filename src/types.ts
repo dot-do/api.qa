@@ -339,9 +339,13 @@ export type PinnedRequirement =
        * When present, every declared entry for this channel must carry a
        * `param` member; the verifier sets that query parameter to this value.
        * Object form derives the value from another channel's observed JSON
-       * body — the VERIFIER, never the manifest, owns the amount.
+       * body — the VERIFIER, never the manifest, owns the amount. `multiply`
+       * is a fixed factor; `multiplyRange: [lo, hi]` derives a SEED-RANDOMIZED
+       * factor from the run seed (recorded in the report, so replayable), so the
+       * exact over-ceiling amount is NOT precomputable from the declared ceiling
+       * — a lookup-table target cannot pre-answer it (ax-0v2).
        */
-      paramValue?: number | { fromProbe: string; path: string; multiply?: number }
+      paramValue?: number | { fromProbe: string; path: string; multiply?: number; multiplyRange?: [number, number] }
       /**
        * Conditional applicability. When present, this requirement is judged
        * ONLY if another channel's observed body reports `path === equals`;
