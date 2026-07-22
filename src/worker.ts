@@ -24,7 +24,7 @@ import { verifyTarget, rejudge } from './verify.js'
 import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type SuiteReport } from './pinned.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
-import { generateSigningKey, importSigningKeyPair } from './attest.js'
+import { generateSigningKey, importSigningKeyPair, verdictDigest } from './attest.js'
 import { sha256Hex } from './digest.js'
 import type { Fetcher } from './http.js'
 import {
@@ -60,6 +60,14 @@ import {
   type SeriesQueryOpts,
 } from './timeseries.js'
 import { normalizeTarget } from './http.js'
+import {
+  AlertDispatcher,
+  AlertStateStore,
+  StubEmailChannel,
+  validateAlertRules,
+  DEFAULT_ALERT_WINDOW_MS,
+  type AlertRules,
+} from './alerts.js'
 import type { VerificationReport } from './types.js'
 import {
   SELF_ORIGIN,
@@ -183,6 +191,19 @@ export function createApp(
      * written on each scheduled run + read by the /series query endpoints.
      */
     timeseries?: TimeseriesStore
+    /**
+     * Injected for tests; falls back to an AlertDispatcher over env.REPORTS.
+     * Evaluates alert rules after each scheduled run + time-series write and
+     * delivers to the configured channels (bd ax-e6b.29.3). Tests inject one
+     * wired to a capturing fetcher to assert exactly-once / dedupe / SSRF-gating.
+     */
+    alerts?: AlertDispatcher
+    /**
+     * Convenience test seam: the outbound fetcher the DEFAULT AlertDispatcher
+     * POSTs channel deliveries through (a new outbound surface, distinct from
+     * the target-probing fetcher). Ignored when `alerts` is injected directly.
+     */
+    alertFetcher?: Fetcher
     /** Override the per-tick monitor cap (else env / default). */
     maxPerTick?: number
     /** Injectable clock so cache TTL / age is deterministic in tests. */
@@ -224,6 +245,22 @@ export function createApp(
   const seriesSource: SeriesSource | undefined = timeseries
     ? new ScheduledRunSeriesSource(timeseries)
     : undefined
+  // Alerting (bd ax-e6b.29.3): evaluate a monitor's alert rules after each
+  // scheduled run + time-series write and deliver to its configured channels.
+  // Channel delivery is a NEW outbound-POST surface, SSRF-gated in alerts.ts at
+  // config time AND before every POST. Default dispatcher POSTs through the real
+  // `fetch` (or opts.alertFetcher in tests); the email channel is the documented
+  // StubEmailChannel seam (no real provider wired here).
+  const alertAllowPrivate = env.ALLOW_PRIVATE_TARGETS === 'true'
+  const alerts =
+    opts.alerts ??
+    (env.REPORTS
+      ? new AlertDispatcher(new AlertStateStore(env.REPORTS), {
+          ...(opts.alertFetcher ? { fetcher: opts.alertFetcher } : {}),
+          allowPrivate: alertAllowPrivate,
+          email: new StubEmailChannel(),
+        })
+      : undefined)
   const maxPerTick =
     opts.maxPerTick ?? (env.MONITOR_MAX_PER_TICK ? Number(env.MONITOR_MAX_PER_TICK) : DEFAULT_MAX_PER_TICK)
   // LOW abuse-surface bound (bd ax-e6b.29.1): POST /monitors has no auth yet
@@ -339,12 +376,20 @@ export function createApp(
           }
         }
 
+        // The STABLE attested-verdict digest (seed-independent) — the anchor the
+        // NEXT run's attestation-change alert compares against (bd ax-e6b.29.3).
+        const vDigest = await verdictDigest(report)
+        // Capture the PRIOR run BEFORE appending this one — grade-regression /
+        // attestation-change compare this run against it.
+        const priorRun = (await monitors.listRuns(claimed.id)).at(-1)
+
         const run: MonitorRunRecord = {
           monitorId: claimed.id,
           at: nowMs,
           grade: report.grade,
           ...(suiteVerdict !== undefined ? { suiteVerdict } : {}),
           digest: report.discovery.evidenceDigest,
+          verdictDigest: vDigest,
         }
         await monitors.appendRun(run)
 
@@ -355,6 +400,47 @@ export function createApp(
         // no new fetch. Keyed by monitor id so GET /monitors/:id/series reads it.
         if (timeseries) {
           await timeseries.record(claimed.id, seriesPointsFromReport(report, nowMs))
+        }
+
+        // Alerting (bd ax-e6b.29.3): AFTER the run + time-series write, evaluate
+        // this monitor's alert rules over the stored series (uptime/latency/
+        // error-rate) plus this-run-vs-prior (grade regression / attested-verdict
+        // change) and deliver to the configured channels — deduped/debounced per
+        // (monitor, rule). Wrapped so a delivery failure can never break the tick.
+        if (alerts && claimed.alerts) {
+          try {
+            const windowMs = claimed.alerts.windowMs ?? DEFAULT_ALERT_WINDOW_MS
+            const stats = timeseries
+              ? await timeseries.query(claimed.id, { fromMs: nowMs - windowMs, toMs: nowMs, nowMs })
+              : undefined
+            await alerts.dispatch({
+              monitor: { id: claimed.id, target: claimed.target, alerts: claimed.alerts },
+              ...(stats
+                ? {
+                    series: {
+                      uptimePct: stats.uptimePct,
+                      errorRate: stats.errorRate,
+                      latencyP95: stats.latencyMs.p95,
+                      count: stats.count,
+                    },
+                  }
+                : {}),
+              run: { at: nowMs, grade: report.grade, digest: run.digest, verdictDigest: vDigest },
+              ...(priorRun
+                ? {
+                    prior: {
+                      grade: priorRun.grade,
+                      digest: priorRun.digest,
+                      ...(priorRun.verdictDigest !== undefined ? { verdictDigest: priorRun.verdictDigest } : {}),
+                    },
+                  }
+                : {}),
+              now: nowMs,
+            })
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err)
+            console.error(`scheduledTick: alert dispatch for monitor ${claimed.id} failed: ${m}`)
+          }
         }
 
         summary.runs.push(run)
@@ -593,10 +679,26 @@ export function createApp(
         if (path === '/monitors' && request.method === 'POST') {
           if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
           const body = (await request.json().catch(() => undefined)) as
-            | { target?: string; suiteDigest?: string; environment?: string; interval?: unknown }
+            | {
+                target?: string
+                suiteDigest?: string
+                environment?: string
+                interval?: unknown
+                alerts?: AlertRules
+              }
             | undefined
           if (!body?.target) return json({ error: 'body must include "target"' }, 400)
           if (body.interval === undefined) return json({ error: 'body must include "interval"' }, 400)
+
+          // SSRF belt at CONFIG time: an alert channel URL is user-configured and
+          // api.qa POSTs to it — a private/metadata channel URL would make api.qa
+          // an SSRF POST engine. Refuse an unsafe channel here (and re-gate before
+          // every send in alerts.ts). Same private-host primitive as the target
+          // gate. Nothing is registered when a channel is refused.
+          if (body.alerts !== undefined) {
+            const err = validateAlertRules(body.alerts, alertAllowPrivate)
+            if (err) return json({ error: err }, 400)
+          }
 
           // SSRF belt: refuse a private / IP-literal / off-scheme target at
           // REGISTRATION through the SAME gate /verify uses. A monitor must not
@@ -667,6 +769,7 @@ export function createApp(
             nextDueAt: now(),
             // Idle-eviction TTL, refreshed on every (re-)registration.
             expiresAt: now() + monitorTtlMs,
+            ...(body.alerts !== undefined ? { alerts: body.alerts } : {}),
           }
           await monitors.register(record)
           return json({ monitor: record }, 201)

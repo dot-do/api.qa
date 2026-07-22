@@ -18,6 +18,7 @@
 
 import type { KVLike } from './cache.js'
 import { hostKey } from './cache.js'
+import type { AlertRules } from './alerts.js'
 
 /** A registered monitor: re-verify `target` (+ optional stored suite) on `intervalSec`. */
 export interface MonitorRecord {
@@ -41,6 +42,14 @@ export interface MonitorRecord {
    * and every completed run, so an actively-monitored target never expires.
    */
   expiresAt: number
+  /**
+   * Optional alerting configuration (bd ax-e6b.29.3): threshold/regression/
+   * attestation-change rules + the delivery channels to notify. Evaluated in
+   * scheduledTick AFTER the run + time-series write. Channel URLs are SSRF-gated
+   * at registration (see worker.ts) and re-gated before each delivery POST (see
+   * alerts.ts). Absent → the monitor never alerts.
+   */
+  alerts?: AlertRules
 }
 
 /** One scheduled run's minimal, replay-consumable record. */
@@ -52,6 +61,14 @@ export interface MonitorRunRecord {
   suiteVerdict?: boolean
   /** The grade run's evidence digest — the attestation anchor for this run. */
   digest: string
+  /**
+   * The STABLE attested-verdict fingerprint for this run (grade + R-k item
+   * verdicts, seed-independent — see attest.ts `verdictDigest`). Carried so the
+   * NEXT run's attestation-change alert can compare against it without re-deriving
+   * the prior verdict. Optional: runs recorded before ax-e6b.29.3 lack it, and an
+   * absent prior verdictDigest never registers as a change (fail-safe).
+   */
+  verdictDigest?: string
 }
 
 /**
