@@ -85,6 +85,11 @@ A working GitHub Action is at
 [`.github/workflows/api-qa-example.yml`](./.github/workflows/api-qa-example.yml);
 full recipe (GitHub + GitLab) in [docs/ci.md](./docs/ci.md).
 
+> **Only `verify` / `suite` / `suite --iteration-data` are safe to gate CI on.**
+> The bare `npx autonomous-qa <domain>` grade command above is **advisory**: it
+> exits `0` for any grade A–D (only grade `F` is non-zero), so it must never be
+> the exit code a pipeline gates on — see [docs/ci.md](./docs/ci.md#the-one-property-that-matters-exit-codes).
+
 ## Development
 
 ```sh

@@ -17,7 +17,7 @@ import {
 } from '../src/reporters.js'
 import type { PinnedReport } from '../src/pinned.js'
 import type { CheckResult, EvidenceBundle } from '../src/types.js'
-import { goodTargetRoutes, makeFetcher, withOverrides, GOOD, type Routes } from './helpers.js'
+import { goodTargetRoutes, makeFetcher, withOverrides, GOOD, assertWellFormedXml, type Routes } from './helpers.js'
 
 const SPEC_PATH = fileURLToPath(new URL('../examples/golden-scenario.spec.json', import.meta.url))
 const specText = readFileSync(SPEC_PATH, 'utf8')
@@ -84,38 +84,6 @@ function apisDirectoryFetcher(): Fetcher {
       headers: { 'content-type': res.headers.get('content-type') ?? 'text/plain' },
     })
   }
-}
-
-// --- a minimal XML well-formedness checker (no XML-parser dependency) -----
-// Tokenizes tags + text, tracks the open-element stack, and rejects a raw `<`
-// or a bare `&` (one not starting a valid entity) in text or attribute values.
-// This is the property a CI XML parser relies on, so passing it means the
-// GitHub/GitLab test-report parser can consume the file.
-function assertWellFormedXml(xml: string): void {
-  const body = xml.replace(/^<\?xml[^?]*\?>\s*/, '')
-  const stack: string[] = []
-  const tagRe = /<(\/?)([a-zA-Z][\w.:-]*)((?:\s+[\w.:-]+="[^"<]*")*)\s*(\/?)>/g
-  let last = 0
-  let m: RegExpExecArray | null
-  const cleanText = (t: string) => {
-    if (/</.test(t)) throw new Error(`raw '<' in text: ${JSON.stringify(t)}`)
-    if (/&(?!(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);)/.test(t)) throw new Error(`bare '&' in text: ${JSON.stringify(t)}`)
-  }
-  while ((m = tagRe.exec(body))) {
-    cleanText(body.slice(last, m.index))
-    last = tagRe.lastIndex
-    const closing = m[1] === '/'
-    const selfClose = m[4] === '/'
-    const nameTag = m[2]!
-    if (closing) {
-      const top = stack.pop()
-      if (top !== nameTag) throw new Error(`mismatched close </${nameTag}> vs <${top ?? 'nothing'}>`)
-    } else if (!selfClose) {
-      stack.push(nameTag)
-    }
-  }
-  cleanText(body.slice(last))
-  if (stack.length) throw new Error(`unclosed tags: ${stack.join(', ')}`)
 }
 
 /** Count non-overlapping matches. */
@@ -277,6 +245,40 @@ describe('JUnit XML reporter', () => {
     expect(xml).toContain('&gt;')
     // attribute values escape quotes
     expect(xml).toContain('&quot;')
+  })
+
+  it('neutralizes XML-1.0-illegal control bytes from UNTRUSTED TARGET OUTPUT, staying well-formed', () => {
+    // A raw NUL (as could arrive embedded in JSON `resource` metadata) plus a
+    // C0 control byte (as could arrive raw inside a WWW-Authenticate header
+    // value) — both are ILLEGAL in XML 1.0 content/attributes. One such byte,
+    // left unescaped, corrupts the ENTIRE testsuites document for
+    // xmllint/ElementTree, which is how a real failure becomes a silently
+    // dropped/green report on GitHub/GitLab.
+    const nul = '\x00'
+    const wwwAuthenticateByte = '\x1f' // a C0 control from a hostile WWW-Authenticate value
+    const detail = `resource="widgets${nul}"; WWW-Authenticate: Bearer realm="x${wwwAuthenticateByte}y"`
+    const report = fakePinned([{ id: 'ctl', title: `probe ${nul}${wwwAuthenticateByte}`, verdict: 'fail', detail, evidence: [] }])
+    const xml = junitXml(report)
+    // no illegal control byte survives anywhere in the emitted document
+    expect(/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(xml)).toBe(false)
+    // the document is still well-formed and consumable by a CI XML parser
+    assertWellFormedXml(xml)
+    // structure and failure accounting are unaffected — nothing was dropped
+    expect(count(xml, /<testcase\b/g)).toBe(1)
+    expect(count(xml, /<failure\b/g)).toBe(1)
+    expect(xml).toMatch(/<testsuites[^>]*\bfailures="1"/)
+    // the replacement character stands in for the stripped bytes
+    expect(xml).toContain('�')
+  })
+
+  it('preserves legal whitespace control chars (\\t \\n \\r) while stripping illegal ones', () => {
+    const detail = 'line one\nline\ttwo\rline three\x00 NUL here'
+    const report = fakePinned([chk('ws', 'fail', detail)])
+    const xml = junitXml(report)
+    assertWellFormedXml(xml)
+    expect(xml).toContain('\n')
+    expect(xml).toContain('\t')
+    expect(/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(xml)).toBe(false)
   })
 
   it('renders a valid, parseable document for a real passing run', async () => {
@@ -459,5 +461,28 @@ describe('xml escaping primitives', () => {
   })
   it('xmlAttr additionally escapes quotes', () => {
     expect(xmlAttr('a "b" \'c\' & <d>')).toBe('a &quot;b&quot; &apos;c&apos; &amp; &lt;d&gt;')
+  })
+
+  it('xmlText replaces every XML-1.0-illegal C0 control byte with U+FFFD', () => {
+    // All illegal ranges: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F.
+    const illegal = [...Array(9).keys(), 0x0b, 0x0c, ...Array.from({ length: 0x1f - 0x0e + 1 }, (_, i) => 0x0e + i)]
+    for (const code of illegal) {
+      const ch = String.fromCharCode(code)
+      expect(xmlText(`a${ch}b`)).toBe('a�b')
+      expect(xmlAttr(`a${ch}b`)).toBe('a�b')
+    }
+  })
+
+  it('xmlText/xmlAttr preserve the legal whitespace controls (tab, LF, CR)', () => {
+    expect(xmlText('a\tb\nc\rd')).toBe('a\tb\nc\rd')
+    expect(xmlAttr('a\tb\nc\rd')).toBe('a\tb\nc\rd')
+  })
+
+  it('a NUL from untrusted target output cannot corrupt the document (regression guard)', () => {
+    // WWW-Authenticate-shaped hostile value with an embedded NUL.
+    const hostile = 'Bearer realm="x\x00y", error="invalid_token"'
+    const escaped = xmlAttr(hostile)
+    expect(escaped).not.toContain('\x00')
+    expect(escaped).toContain('�')
   })
 })

@@ -4,9 +4,83 @@
  * any surface and watch the specific check fail. No network anywhere.
  */
 
+import { spawnSync } from 'node:child_process'
 import type { Fetcher } from '../src/http.js'
 
 export const GOOD = 'https://good.example'
+
+// ---------------------------------------------------------------------------
+// assertWellFormedXml — a REAL well-formedness check, shared by
+// reporters.test.ts and cli-ci.test.ts. The property under test is exactly
+// what a CI XML consumer (GitHub/GitLab test-report parsers, xmllint,
+// ElementTree) enforces: no raw '<' or bare '&', balanced tags, AND no
+// XML-1.0-illegal control byte anywhere in the document. A single illegal
+// byte (e.g. a raw NUL leaking in from untrusted target output) corrupts the
+// WHOLE `testsuites` document for those parsers, which means the entire CI
+// report — not just one testcase — gets silently dropped on a real failure.
+// ---------------------------------------------------------------------------
+
+let xmllintAvailable: boolean | undefined
+
+function hasXmllint(): boolean {
+  if (xmllintAvailable === undefined) {
+    const r = spawnSync('xmllint', ['--version'], { stdio: 'ignore' })
+    xmllintAvailable = !r.error && r.status === 0
+  }
+  return xmllintAvailable
+}
+
+/** Every C0 control byte XML 1.0 forbids in content, EXCLUDING the three
+ * legal whitespace controls (\t \n \r). */
+const XML_ILLEGAL_CONTROL_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F]/
+
+/**
+ * Assert `xml` is a well-formed XML 1.0 document. Prefers `xmllint --noout`
+ * (a REAL, spec-conformant parser) when it's on PATH — this is the strongest
+ * check and is what actually runs in local dev / most CI images. When
+ * `xmllint` is unavailable (no XML-parser dependency in this repo, and some
+ * minimal CI images lack it), falls back to a hand-rolled check that still
+ * enforces the property that matters: balanced tags, no raw '<'/bare '&' in
+ * text or attributes, and — critically — NO XML-1.0-illegal control byte
+ * anywhere in the document (the fallback would otherwise silently accept the
+ * exact corruption this suite exists to catch).
+ */
+export function assertWellFormedXml(xml: string): void {
+  if (XML_ILLEGAL_CONTROL_CHARS.test(xml)) {
+    throw new Error('document contains an XML-1.0-illegal control character')
+  }
+  if (hasXmllint()) {
+    const r = spawnSync('xmllint', ['--noout', '-'], { input: xml, encoding: 'utf8' })
+    if (r.status !== 0) {
+      throw new Error(`xmllint rejected document as not well-formed:\n${r.stderr}`)
+    }
+    return
+  }
+  const body = xml.replace(/^<\?xml[^?]*\?>\s*/, '')
+  const stack: string[] = []
+  const tagRe = /<(\/?)([a-zA-Z][\w.:-]*)((?:\s+[\w.:-]+="[^"<]*")*)\s*(\/?)>/g
+  let last = 0
+  let m: RegExpExecArray | null
+  const cleanText = (t: string) => {
+    if (/</.test(t)) throw new Error(`raw '<' in text: ${JSON.stringify(t)}`)
+    if (/&(?!(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);)/.test(t)) throw new Error(`bare '&' in text: ${JSON.stringify(t)}`)
+  }
+  while ((m = tagRe.exec(body))) {
+    cleanText(body.slice(last, m.index))
+    last = tagRe.lastIndex
+    const closing = m[1] === '/'
+    const selfClose = m[4] === '/'
+    const nameTag = m[2]!
+    if (closing) {
+      const top = stack.pop()
+      if (top !== nameTag) throw new Error(`mismatched close </${nameTag}> vs <${top ?? 'nothing'}>`)
+    } else if (!selfClose) {
+      stack.push(nameTag)
+    }
+  }
+  cleanText(body.slice(last))
+  if (stack.length) throw new Error(`unclosed tags: ${stack.join(', ')}`)
+}
 
 type Handler = (req: { method: string; accept: string; body?: string }) => {
   status: number

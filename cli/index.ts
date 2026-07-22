@@ -26,7 +26,8 @@
  * digest passing on the deployed api.qa.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { verifyTarget, rejudge } from '../src/verify.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
@@ -100,6 +101,12 @@ function emit(report: AnyRunReport, markdown: string, flags: Flags): number {
     const text =
       spec.name === 'cli' ? markdown : spec.name === 'junit' ? junitXml(report) : jsonReportText(report)
     if (spec.out) {
+      // A fresh checkout has no `reports/` dir (or whatever parent the caller
+      // named); a shipped GitHub Action writing straight to `reports/x.xml`
+      // would ENOENT-crash on EVERY run with no artifacts — the worst kind of
+      // CI citizen (cries wolf, stuck red even when the suite passes). Create
+      // the parent unconditionally so every caller of `emit()` is covered.
+      mkdirSync(dirname(spec.out), { recursive: true })
       writeFileSync(spec.out, text)
       console.error(`autonomous-qa: ${spec.name} report → ${spec.out}`)
     } else {
@@ -191,8 +198,17 @@ async function main(): Promise<number> {
     return emit(report, suiteMarkdown(report), flags)
   }
 
-  // Default: grade a target (advisory).
+  // Default: grade a target (advisory). exitCodeFor() only fails on grade F,
+  // so a bare `autonomous-qa <target>` is silent-green for grades A-D even
+  // with failing checks — a footgun if a CI pipeline gates on it. Warn every
+  // time so gating on this command is a deliberate, informed choice, not a
+  // discovered-in-an-incident surprise.
   const target = cmd
+  console.error(
+    'autonomous-qa: ADVISORY grade mode — exits 0 for any grade A-D, even with failing checks; ' +
+      'only grade F exits non-zero. Do NOT gate CI on this command. ' +
+      'CI gates must use `verify` / `suite` / `suite --iteration-data` (see docs/ci.md).',
+  )
   const report = await verifyTarget(target, { mode: 'local', seed, delayMs: isLocalTarget(target) ? 0 : 150 })
   return emit(report, reportMarkdown(report), flags)
 }

@@ -21,6 +21,16 @@ unreachable target throws before a report exists; the CLI turns that into a
 non-zero exit too. Reporting never masks a failure — the exit code is computed
 from the run result independently of which reporters ran.
 
+> **ONLY `verify` / `suite` / `suite --iteration-data` are safe to gate CI on.**
+> The bare `autonomous-qa <target>` command is **advisory grade mode** — it
+> exits `0` for **any** grade A through D, even with failing checks, and only
+> exits non-zero on grade **F**. It exists to show *how close* a target is to
+> agent-first, not to pass/fail a pipeline. Gating CI on the bare grade command
+> is a silent-green footgun: a target can regress from A to D — real checks
+> failing along the way — and the job stays green. The CLI prints a stderr
+> warning every time the bare grade command runs, for exactly this reason. If
+> you want a CI gate, pin a spec or suite and use `verify`/`suite` instead.
+
 ## Reporters
 
 Pick one or more reporters, Newman-style. `--reporter` is repeatable and

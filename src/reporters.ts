@@ -233,12 +233,36 @@ export function toReporterModel(report: AnyRunReport): ReporterModel {
 // JUnit XML reporter
 // ---------------------------------------------------------------------------
 
-/** Escape for XML TEXT content (`&`, `<`, `>`). */
-export function xmlText(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+/**
+ * XML 1.0 declares most C0 control characters ILLEGAL in both element text and
+ * attribute values — NOT just the five entity-escaped characters (`& < > " '`).
+ * The only legal C0 controls are TAB (\t), LF (\n), CR (\r); every other byte
+ * in [U+0000-U+0008, U+000B, U+000C, U+000E-U+001F] makes the WHOLE document
+ * unparseable (xmllint/ElementTree reject it outright), which for a `testsuites`
+ * root means GitHub/GitLab silently drop the ENTIRE report — a real failure
+ * renders as an empty/green tab. These bytes can arrive from UNTRUSTED TARGET
+ * OUTPUT (e.g. a raw `WWW-Authenticate` header value, or JSON metadata) flowing
+ * into a `<failure>`/`<error>` detail or message, so they must be neutralized
+ * unconditionally, not merely assumed absent.
+ */
+const XML_ILLEGAL_CONTROL_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F]/g
+
+/** Replace every XML-1.0-illegal control byte with U+FFFD (the Unicode
+ * replacement character), preserving the three legal control whitespace
+ * chars (\t \n \r) untouched. */
+function stripIllegalXmlChars(s: string): string {
+  return s.replace(XML_ILLEGAL_CONTROL_CHARS, '�')
 }
 
-/** Escape for an XML ATTRIBUTE value (adds `"` and `'` to the text set). */
+/** Escape for XML TEXT content (`&`, `<`, `>`), after neutralizing any
+ * XML-1.0-illegal control byte so the document stays well-formed even when
+ * the source string is untrusted (target headers/body/metadata). */
+export function xmlText(s: string): string {
+  return stripIllegalXmlChars(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** Escape for an XML ATTRIBUTE value (adds `"` and `'` to the text set),
+ * after the same illegal-control-byte neutralization as `xmlText`. */
 export function xmlAttr(s: string): string {
   return xmlText(s).replace(/"/g, '&quot;').replace(/'/g, '&apos;')
 }

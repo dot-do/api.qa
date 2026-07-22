@@ -11,10 +11,11 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest'
 import { spawnSync, execSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { assertWellFormedXml } from './helpers.js'
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 const bin = join(repoRoot, 'dist', 'cli', 'index.js')
@@ -23,30 +24,6 @@ const spec = join(repoRoot, 'examples', 'golden-scenario.spec.json')
 function run(args: string[]): { status: number; stdout: string; stderr: string } {
   const r = spawnSync(process.execPath, [bin, ...args], { cwd: repoRoot, encoding: 'utf8' })
   return { status: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
-}
-
-/** Minimal XML well-formedness proxy (no XML-parser dep): tag/stack balance +
- * no raw `<` or bare `&` in text — the property a CI XML parser relies on. */
-function assertWellFormedXml(xml: string): void {
-  const body = xml.replace(/^<\?xml[^?]*\?>\s*/, '')
-  const stack: string[] = []
-  const tagRe = /<(\/?)([a-zA-Z][\w.:-]*)((?:\s+[\w.:-]+="[^"<]*")*)\s*(\/?)>/g
-  let last = 0
-  let m: RegExpExecArray | null
-  const clean = (t: string) => {
-    if (/</.test(t)) throw new Error(`raw '<' in text: ${JSON.stringify(t)}`)
-    if (/&(?!(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);)/.test(t)) throw new Error(`bare '&' in text: ${JSON.stringify(t)}`)
-  }
-  while ((m = tagRe.exec(body))) {
-    clean(body.slice(last, m.index))
-    last = tagRe.lastIndex
-    if (m[1] === '/') {
-      const top = stack.pop()
-      if (top !== m[2]) throw new Error(`mismatched close </${m[2]}> vs <${top ?? 'nothing'}>`)
-    } else if (m[4] !== '/') stack.push(m[2]!)
-  }
-  clean(body.slice(last))
-  if (stack.length) throw new Error(`unclosed tags: ${stack.join(', ')}`)
 }
 
 describe('CLI exit codes (spawned, real process status)', () => {
@@ -98,8 +75,12 @@ describe('CLI exit codes (spawned, real process status)', () => {
 
   it('file reporters write parseable JUnit + JSON and still exit non-zero on failure', () => {
     const dir = mkdtempSync(join(tmpdir(), 'apiqa-ci-'))
-    const junitPath = join(dir, 'r.junit.xml')
-    const jsonPath = join(dir, 'r.json')
+    // Target paths under NON-EXISTENT subdirectories of the mkdtemp'd base —
+    // mkdtempSync only guarantees `dir` itself exists, not `dir/nested/out/`,
+    // so this still exercises emit()'s parent-dir auto-create (LOW #2: writing
+    // straight into `dir` never exercised the ENOENT-crash path at all).
+    const junitPath = join(dir, 'nested', 'out', 'r.junit.xml')
+    const jsonPath = join(dir, 'nested', 'out2', 'r.json')
     const r = run([
       'http://localhost:9',
       '--reporter',
@@ -131,6 +112,28 @@ describe('CLI exit codes (spawned, real process status)', () => {
     expect(j.verdict).toBe('FAILED')
     expect(j.exitCode).toBe(1)
     expect(j.totals.tests).toBeGreaterThan(0)
+  })
+
+  it('auto-creates a NON-EXISTENT parent directory chain — the fresh-checkout / shipped-Action case', () => {
+    // Deliberately does NOT use mkdtempSync for this path: mkdtempSync always
+    // pre-creates its directory, which would silently avoid the exact bug
+    // this test exists to catch (HIGH: emit() writeFileSync'd straight into
+    // `reports/...` with no parent-dir creation — a fresh checkout has no
+    // `reports/` dir, so the shipped GitHub Action ENOENT-crashed on EVERY
+    // run: exit 1 with no artifacts, even when every probe passed).
+    const missingRoot = join(tmpdir(), `apiqa-ci-missing-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    const junitPath = join(missingRoot, 'reports', 'api-qa.junit.xml')
+    expect(existsSync(missingRoot)).toBe(false)
+    try {
+      const r = run(['http://localhost:9', '--reporter', 'junit', '--reporter-junit-out', junitPath])
+      expect(r.status).toBe(1)
+      expect(existsSync(junitPath)).toBe(true)
+      const xml = readFileSync(junitPath, 'utf8')
+      assertWellFormedXml(xml)
+      expect(xml).toMatch(/<testsuites[^>]*\bfailures="\d+"/)
+    } finally {
+      rmSync(missingRoot, { recursive: true, force: true })
+    }
   })
 
   it('a file reporter with no output path writes well-formed XML to stdout', () => {
