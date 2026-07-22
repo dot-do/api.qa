@@ -195,6 +195,55 @@ describe('conformant MCP target passes every MCP-OAuth check', () => {
 })
 
 // ---------------------------------------------------------------------------
+// AS-metadata off-origin body scrub (ax-2ck)
+// ---------------------------------------------------------------------------
+
+describe('the off-origin AS-metadata body is scrubbed to only the judged fields (ax-2ck)', () => {
+  const REFLECT = 'REFLECTED-OFF-ORIGIN-PAYLOAD-do-not-store-verbatim'
+
+  it('drops every non-judged field from the retained evidence while preserving verdicts', async () => {
+    const { bundle, checks } = await judge({
+      asMetadata: jsonOut({
+        // Judged RFC 8414 fields (must survive → verdicts unchanged):
+        issuer: AS,
+        authorization_endpoint: `${AS}/authorize`,
+        token_endpoint: `${AS}/token`,
+        code_challenge_methods_supported: ['S256'],
+        registration_endpoint: `${AS}/register`,
+        // Non-judged fields an attacker-controlled public AS host could return —
+        // a bounded reflection primitive if stored verbatim in the public bundle:
+        service_documentation: REFLECT,
+        op_policy_uri: REFLECT,
+        reflect_me: REFLECT,
+        agent_auth: { identity_endpoint: `${AS}/agent/identity`, junk: REFLECT },
+      }),
+    })
+
+    // The verbatim off-origin payload appears NOWHERE in the retained evidence.
+    for (const ev of bundle.items) expect(ev.body ?? '').not.toContain(REFLECT)
+
+    // The AS-metadata evidence retains ONLY the judged fields.
+    const asEv = bundle.items.find((e) => e.role === 'surface:mcp:oauth-authorization-server')
+    expect(asEv, 'AS-metadata evidence must exist').toBeDefined()
+    const kept = JSON.parse(asEv!.body!) as Record<string, unknown>
+    expect(kept.issuer).toBe(AS)
+    expect(kept.authorization_endpoint).toBe(`${AS}/authorize`)
+    expect(kept.token_endpoint).toBe(`${AS}/token`)
+    expect(kept.code_challenge_methods_supported).toEqual(['S256'])
+    expect(kept.registration_endpoint).toBe(`${AS}/register`)
+    expect(kept.reflect_me).toBeUndefined()
+    expect(kept.service_documentation).toBeUndefined()
+    expect((kept.agent_auth as Record<string, unknown>).identity_endpoint).toBe(`${AS}/agent/identity`)
+    expect((kept.agent_auth as Record<string, unknown>).junk).toBeUndefined()
+
+    // Because every judged field survived, the verdicts are exactly as before.
+    expect(verdictOf(checks, 'mcp-oauth-as-metadata'), detailOf(checks, 'mcp-oauth-as-metadata')).toBe('pass')
+    expect(verdictOf(checks, 'mcp-pkce')).toBe('pass')
+    expect(verdictOf(checks, 'mcp-oauth-dcr')).toBe('pass')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Non-conformant targets — each defect fails its OWN specific check
 // ---------------------------------------------------------------------------
 

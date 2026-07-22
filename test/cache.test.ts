@@ -83,6 +83,24 @@ describe('ReportCache — pinned mode', () => {
     expect(await cache.getPinned(GOOD, 'deadbeef', 1, 0)).toBeNull()
   })
 
+  it('keys pinned verdicts on the normalized ORIGIN — same host, different port/scheme is a MISS (no cross-serve, ax-4c4)', async () => {
+    const cache = new ReportCache(new MemoryKV(), 300)
+    const specText = JSON.stringify({
+      $type: 'PinnedSpec', name: 'mini', version: '1',
+      requirements: [{ id: 'status-ok', kind: 'endpoint', method: 'GET', path: '/api/status', expect: { status: 200 } }],
+    })
+    const specDigest = await sha256Hex(specText)
+    const report = await verifyPinnedSpec(GOOD, specText, { fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 1 })
+
+    await cache.putPinned('https://good.example:8787', specDigest, 1, report, 0)
+    // Same origin → HIT.
+    expect(await cache.getPinned('https://good.example:8787', specDigest, 1, 0)).not.toBeNull()
+    // Same host, DIFFERENT PORT → MISS (a different service; hostKey would have collided).
+    expect(await cache.getPinned('https://good.example:9999', specDigest, 1, 0)).toBeNull()
+    // Same host+port, DIFFERENT SCHEME → MISS.
+    expect(await cache.getPinned('http://good.example:8787', specDigest, 1, 0)).toBeNull()
+  })
+
   it('keys pinned verdicts by seed too — a different seed is a cache miss (never serves a stale seed field)', async () => {
     const cache = new ReportCache(new MemoryKV(), 300)
     const specText = JSON.stringify({

@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { Observer, type Fetcher } from '../src/http.js'
+import { Observer, isPrivateHost, type Fetcher } from '../src/http.js'
 import { observeTarget, deriveDiscovery, parseAgentsJson } from '../src/discovery.js'
 import { runChecks } from '../src/checks.js'
 import { GOOD, goodTargetRoutes, makeFetcher, withOverrides } from './helpers.js'
@@ -366,6 +366,35 @@ describe('SSRF: first-hop via card-derived openapi url (ax-6ql, third fix)', () 
     expect(calls.every((u) => new URL(u).hostname === 'good.example')).toBe(true)
     // No keyless evidence was recorded for the hostile key.
     expect(observer.items.some((e) => e.role.includes('@evil.example'))).toBe(false)
+  })
+})
+
+/**
+ * isPrivateHost self-defense (ax-2ck): the guard must decode numeric IPv4
+ * encodings ITSELF, so it is correct on a RAW host string a caller did not run
+ * through WHATWG-URL canonicalization. Every form below decodes to a private /
+ * link-local / loopback address and MUST be refused; a real public DNS host must
+ * still be admitted. The dotted octal/hex forms are the ones the flat IP_LITERAL
+ * regex could NOT catch before this hardening.
+ */
+describe('isPrivateHost self-defends against numeric IPv4 encodings (ax-2ck)', () => {
+  const PRIVATE_NUMERIC: Array<[string, string]> = [
+    ['2852039166', 'bare decimal → 169.254.169.254'],
+    ['0xA9FEA9FE', 'bare 0x-hex → 169.254.169.254'],
+    ['0251.0376.0251.0376', 'dotted octal → 169.254.169.254'],
+    ['0xA9.0xFE.0xA9.0xFE', 'dotted hex → 169.254.169.254'],
+    ['0177.0.0.1', 'dotted octal → 127.0.0.1 (loopback)'],
+    ['2130706433', 'bare decimal → 127.0.0.1 (loopback)'],
+    ['127.1', 'short-form → 127.0.0.1 (loopback)'],
+  ]
+  for (const [host, label] of PRIVATE_NUMERIC) {
+    it(`refuses ${host} (${label})`, () => {
+      expect(isPrivateHost(host)).toBe(true)
+    })
+  }
+  it('still ADMITS a legitimate public DNS host (no over-block)', () => {
+    expect(isPrivateHost('good.example')).toBe(false)
+    expect(isPrivateHost('api.example.com')).toBe(false)
   })
 })
 
