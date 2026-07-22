@@ -1431,7 +1431,8 @@ function scriptRemoteRefs(js: string): string[] {
  * Executable external references a srcDoc actually PULLS — the supply-chain +
  * exfil surface. Unlike a raw-string regex, this walks the HTML: it flags only
  * (a) network-loading ATTRIBUTES on real elements (src/href/srcset/data/…,
- * including protocol-relative `//host`), and (b) remote-URL string literals in
+ * including protocol-relative `//host`) — plus a remote `url(...)`/`@import` in
+ * an inline `style=""` attribute — and (b) remote-URL string literals in
  * executable `<script>` / `<style>` bodies (covering `fetch`, backtick
  * `fetch(\`…\`)`, `sendBeacon`, `XMLHttpRequest.open`, `new Image().src`,
  * `new WebSocket/EventSource`, dynamic `import()`). It IGNORES text nodes,
@@ -1482,6 +1483,10 @@ function externalRefsInSrcDoc(html: string): string[] {
     if (attrs.href !== undefined && HREF_LOAD_ELEMENTS.has(name) && isRemoteRef(attrs.href)) {
       refs.add(attrs.href)
     }
+    // An inline `style=""` ATTRIBUTE is a CSS declaration block: a remote
+    // `url(...)` or `@import` in it pulls a cookie-less remote GET (exfil beacon
+    // / tracker) exactly like a `<style>` tag body, so scan it the same way.
+    if (attrs.style !== undefined) for (const r of cssRemoteRefs(attrs.style)) refs.add(r)
     // <meta http-equiv="refresh" content="0;url=https://evil"> — a redirect load.
     if (name === 'meta' && (attrs['http-equiv'] ?? '').toLowerCase() === 'refresh' && attrs.content) {
       const um = /url\s*=\s*([^;,\s]+)/i.exec(attrs.content)

