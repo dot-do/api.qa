@@ -22,6 +22,13 @@ import {
   namespaceDomain,
   isGithubNamespace,
   githubNamespaceOwner,
+  parseJsonRpcMessage,
+  toolObjectsFrom,
+  uiTemplateOfTool,
+  resourceUriOfResult,
+  resourceContentOf,
+  externalUrlOf,
+  isMcpUiMime,
   type ServerJsonClaims,
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
@@ -555,6 +562,53 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       'server is present in the official MCP registry (informational)', undefined,
       [ROLE.mcpServerJson, ROLE.mcpRegistryPresence],
       judgeRegistryPresence(sjEv, server, presenceEv)))
+  }
+
+  // ── MCP-UI / streaming-component readiness (ax-odg, ADR-0022) ─────────────
+  //    "Renders trustworthily inside an agent host (ChatGPT/Claude/Goose/VS
+  //    Code)" made a gradeable claim — the trust primitive as the ecosystem
+  //    floods with unverified third-party widgets. This is an ADDITIVE readiness
+  //    dimension (every sub-check axItem undefined): a target with NO MCP-UI
+  //    (no tool advertises a `ui://` template) informationally SKIPs every
+  //    sub-check and is NEVER over-blocked — a non-MCP-UI API is unaffected.
+  //    A target that DECLARES MCP-UI but violates a sub-signal (broken/wrong-MIME
+  //    resource, remote code in the srcDoc, a secret leaked into a model-visible
+  //    channel, register divergence, no first-render tolerance) FAILs — an
+  //    honesty cap that grades the surface DOWN (a leaky/broken widget is worse
+  //    than none). DERIVED entirely from the target's published MCP surface.
+  {
+    const toolsEv = findEvidence(bundle, ROLE.mcpRemoteToolsList)
+    const callEv = findEvidence(bundle, ROLE.mcpUiToolsCall)
+    const readEv = findEvidence(bundle, ROLE.mcpUiResourceRead)
+    const extEv = findEvidence(bundle, ROLE.mcpUiExternalUrl)
+    const ui = buildMcpUiContext(toolsEv, callEv, readEv, extEv)
+
+    const uiEvidence = [ROLE.mcpRemoteToolsList, ROLE.mcpUiToolsCall, ROLE.mcpUiResourceRead, ROLE.mcpUiExternalUrl]
+
+    // (1) resource linkage + MIME
+    checks.push(check('mcp-ui-resource-linkage',
+      'MCP-UI tool result links a ui:// resource served with an MCP-Apps MIME', undefined,
+      uiEvidence, judgeMcpUiLinkage(ui)))
+
+    // (2) srcDoc self-containment + closed CSP
+    checks.push(check('mcp-ui-self-contained',
+      'ui:// srcDoc is self-contained (no remote code) and CSP-safe', undefined,
+      uiEvidence, judgeMcpUiSelfContained(ui)))
+
+    // (3) envelope hygiene — no secret in a model-visible channel (HIGH)
+    checks.push(check('mcp-ui-envelope-hygiene',
+      'no secret leaks into a model-visible channel (content/structuredContent)', undefined,
+      uiEvidence, judgeMcpUiEnvelopeHygiene(ui)))
+
+    // (4) three-register parity
+    checks.push(check('mcp-ui-register-parity',
+      'widget structuredContent is consistent with the agent/API register (no divergence)', undefined,
+      uiEvidence, judgeMcpUiRegisterParity(ui)))
+
+    // (5) host-render readiness
+    checks.push(check('mcp-ui-host-render',
+      'first-render-without-input tolerance + tool annotations / widgetDescription present', undefined,
+      uiEvidence, judgeMcpUiHostRender(ui)))
   }
 
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
@@ -1193,6 +1247,517 @@ function registryDocMentions(doc: unknown, name: string): boolean {
     if (scan(d.data)) return true
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// MCP-UI / streaming-component readiness judges (pure) — ax-odg, ADR-0022
+// ---------------------------------------------------------------------------
+
+/**
+ * The distilled MCP-UI evidence the five readiness judges share, parsed ONCE
+ * from the recorded tools/list, tools/call, resources/read, and (optional)
+ * externalUrl evidence. `claims` is the activation gate: false ⇒ the whole
+ * dimension informationally SKIPs (no tool advertised a `ui://` template), so a
+ * non-MCP-UI target is never over-blocked.
+ */
+interface McpUiContext {
+  /** A tool DEFINITION advertised a `ui://` template ⇒ the target CLAIMS MCP-UI. */
+  claims: boolean
+  /** The UI-bearing tool definition (for host-render readiness), if any. */
+  uiTool?: Record<string, unknown>
+  /** The `ui://` template the tool declared. */
+  templateUri?: string
+  /** The tool RESULT object (structuredContent / content / _meta). */
+  result?: Record<string, unknown>
+  /** The `ui://` resourceUri the RESULT linked (may differ from templateUri). */
+  linkedUri?: string
+  /** The resolved UIResource content (mimeType + srcDoc text). */
+  resource?: { mimeType?: string; text?: string; uri?: string }
+  /** An externalUrl UIResource target, if the resource is a uri-list. */
+  externalUrl?: string
+  /** The externalUrl fetch evidence (present only when it passed the SSRF gate). */
+  extEv?: Evidence
+  /** True when a resources/read was recorded at all (vs. never reached). */
+  readAttempted: boolean
+}
+
+function buildMcpUiContext(
+  toolsEv: Evidence | undefined,
+  callEv: Evidence | undefined,
+  readEv: Evidence | undefined,
+  extEv: Evidence | undefined,
+): McpUiContext {
+  const tools = toolObjectsFrom(parseJsonRpcMessage(toolsEv))
+  const uiTool = tools.find((t) => uiTemplateOfTool(t) !== undefined)
+  if (!uiTool) return { claims: false, readAttempted: false }
+
+  const templateUri = uiTemplateOfTool(uiTool)
+  const result = (parseJsonRpcMessage(callEv)?.result ?? undefined) as Record<string, unknown> | undefined
+  const linkedUri = resourceUriOfResult(result)
+  const wantUri = linkedUri ?? templateUri ?? ''
+  const readMsg = parseJsonRpcMessage(readEv)
+  const resource = wantUri ? resourceContentOf(readMsg, wantUri) : undefined
+  const externalUrl = externalUrlOf(resource)
+  return {
+    claims: true,
+    uiTool,
+    templateUri,
+    result,
+    linkedUri,
+    resource,
+    externalUrl,
+    extEv,
+    readAttempted: readEv !== undefined,
+  }
+}
+
+const NOT_READY = 'no MCP-UI declared (no tool advertises a ui:// template) — informational not-ready, not a failure'
+
+/**
+ * (1) Resource linkage + MIME. The tool result must carry `_meta.ui.resourceUri`
+ * → a `ui://` resource, and that resource must resolve with an MCP-Apps /
+ * MCP-UI MIME (`text/html;profile=mcp-app`, rawHtml, externalUrl, remote-dom).
+ * No claim ⇒ SKIP (not-ready). Claims but the link is missing / the resource is
+ * unresolved / served with the wrong MIME ⇒ FAIL (declares MCP-UI but broken).
+ */
+function judgeMcpUiLinkage(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.linkedUri) {
+    return { verdict: 'fail', detail: `a tool advertises a ui:// template (${ui.templateUri ?? '?'}) but its result carries no _meta.ui.resourceUri linking a rendered resource — the widget cannot be located by the host` }
+  }
+  if (!ui.resource) {
+    return { verdict: 'fail', detail: `tool result links ${ui.linkedUri} but resources/read returned no matching UIResource content — the claimed widget resource does not resolve` }
+  }
+  if (ui.externalUrl && !isPublicHttpsOffOriginAllowed(ui.externalUrl)) {
+    return { verdict: 'fail', detail: `UIResource externalUrl ${ui.externalUrl} is not a public https target (no cleartext, no private/metadata host) — refused without fetching (SSRF guard); a widget the host cannot safely load is not render-ready` }
+  }
+  if (!isMcpUiMime(ui.resource.mimeType)) {
+    return { verdict: 'fail', detail: `UIResource ${ui.linkedUri} is served as ${ui.resource.mimeType ?? '(no mimeType)'} — not an MCP-Apps/MCP-UI content type (text/html;profile=mcp-app, rawHtml, text/uri-list, or remote-dom); the host will not render it as a UI resource` }
+  }
+  return pass(`tool result links ${ui.linkedUri}, resolved with MCP-UI MIME ${ui.resource.mimeType}`)
+}
+
+/**
+ * A remote-loading reference: an absolute http(s) URL, a protocol-relative
+ * `//host`, or a ws(s) URL. Relative paths, `#fragments`, `data:`/`blob:`,
+ * `mailto:`, and `javascript:` are NOT remote loads.
+ */
+function isRemoteRef(raw: string): boolean {
+  const s = raw.trim()
+  return /^(?:https?:)?\/\//i.test(s) || /^wss?:\/\//i.test(s)
+}
+
+/** Attributes that trigger an AUTOMATIC network load on ANY element. */
+const LOADING_ATTRS = ['src', 'srcset', 'data', 'poster', 'formaction', 'action', 'background', 'ping', 'xlink:href']
+/** `href` is a network load only on these elements (a plain <a href> is navigation). */
+const HREF_LOAD_ELEMENTS = new Set(['link', 'base', 'use', 'image', 'track'])
+/** Elements whose text content is CDATA/raw — `<` inside does not open a tag. */
+const RAW_TEXT_ELEMENTS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'noscript', 'noframes'])
+
+/** Parse `key="v"` / `key='v'` / `key=v` / `key` pairs out of a start-tag body. */
+function parseAttrs(tagBody: string): Record<string, string> {
+  const attrs: Record<string, string> = {}
+  const re = /([^\s/=]+)(?:\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(tagBody))) {
+    const name = (m[1] ?? '').toLowerCase()
+    if (!name) continue
+    const value = m[3] ?? m[4] ?? m[5] ?? ''
+    attrs[name] = value
+  }
+  return attrs
+}
+
+/** Remote refs in a `<style>`/`@import`/`url(...)` CSS body. */
+function cssRemoteRefs(css: string): string[] {
+  const out: string[] = []
+  const re = /(?:@import\s+(?:url\()?|url\(\s*)["']?((?:https?:)?\/\/[^"')\s]+)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(css))) if (m[1] && isRemoteRef(m[1])) out.push(m[1])
+  return out
+}
+
+/** Remote-URL string literals in an executable `<script>` body (the exfil surface). */
+function scriptRemoteRefs(js: string): string[] {
+  const out: string[] = []
+  // Single-, double-, and backtick-quoted string literals.
+  const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|`((?:\\.|[^`\\])*)`/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(js))) {
+    const lit = m[1] ?? m[2] ?? m[3] ?? ''
+    if (isRemoteRef(lit)) out.push(lit)
+  }
+  return out
+}
+
+/**
+ * Executable external references a srcDoc actually PULLS — the supply-chain +
+ * exfil surface. Unlike a raw-string regex, this walks the HTML: it flags only
+ * (a) network-loading ATTRIBUTES on real elements (src/href/srcset/data/…,
+ * including protocol-relative `//host`), and (b) remote-URL string literals in
+ * executable `<script>` / `<style>` bodies (covering `fetch`, backtick
+ * `fetch(\`…\`)`, `sendBeacon`, `XMLHttpRequest.open`, `new Image().src`,
+ * `new WebSocket/EventSource`, dynamic `import()`). It IGNORES text nodes,
+ * `<pre>`/`<code>` sample text, and escaped markup — a widget that merely
+ * DISPLAYS a URL is self-contained. This is a best-effort secondary signal, not
+ * a proof of inertness; the closed-CSP requirement is the real boundary.
+ */
+function externalRefsInSrcDoc(html: string): string[] {
+  const refs = new Set<string>()
+  let i = 0
+  const n = html.length
+  while (i < n) {
+    const lt = html.indexOf('<', i)
+    if (lt < 0) break
+    // Comments / doctype / CDATA — skip without treating `<` as a tag.
+    if (html.startsWith('<!--', lt)) {
+      const end = html.indexOf('-->', lt + 4)
+      i = end < 0 ? n : end + 3
+      continue
+    }
+    if (html[lt + 1] === '!' || html[lt + 1] === '?') {
+      const end = html.indexOf('>', lt + 1)
+      i = end < 0 ? n : end + 1
+      continue
+    }
+    const gt = html.indexOf('>', lt + 1)
+    if (gt < 0) break
+    const rawTag = html.slice(lt + 1, gt)
+    i = gt + 1
+    if (rawTag.startsWith('/')) continue // end tag
+    const nameMatch = /^([a-zA-Z][a-zA-Z0-9:-]*)/.exec(rawTag)
+    if (!nameMatch || !nameMatch[1]) continue
+    const name = nameMatch[1].toLowerCase()
+    const attrBody = rawTag.slice(nameMatch[1].length)
+    const attrs = parseAttrs(attrBody)
+
+    // (a) network-loading attributes on this element.
+    for (const a of LOADING_ATTRS) {
+      const v = attrs[a]
+      if (v === undefined) continue
+      if (a === 'srcset') {
+        for (const part of v.split(',')) {
+          const url = part.trim().split(/\s+/)[0]
+          if (url && isRemoteRef(url)) refs.add(url)
+        }
+      } else if (isRemoteRef(v)) refs.add(v)
+    }
+    if (attrs.href !== undefined && HREF_LOAD_ELEMENTS.has(name) && isRemoteRef(attrs.href)) {
+      refs.add(attrs.href)
+    }
+    // <meta http-equiv="refresh" content="0;url=https://evil"> — a redirect load.
+    if (name === 'meta' && (attrs['http-equiv'] ?? '').toLowerCase() === 'refresh' && attrs.content) {
+      const um = /url\s*=\s*([^;,\s]+)/i.exec(attrs.content)
+      if (um && um[1] && isRemoteRef(um[1])) refs.add(um[1])
+    }
+
+    // (b) raw-text elements: consume the body up to the matching close tag and,
+    // for script/style, scan it for remote refs. Text is NEVER treated as tags.
+    if (RAW_TEXT_ELEMENTS.has(name) && !rawTag.endsWith('/')) {
+      const closeRe = new RegExp(`</${name}\\b`, 'i')
+      const rest = html.slice(i)
+      const cm = closeRe.exec(rest)
+      const body = cm ? rest.slice(0, cm.index) : rest
+      i = cm ? i + cm.index : n
+      if (name === 'script') for (const r of scriptRemoteRefs(body)) refs.add(r)
+      else if (name === 'style') for (const r of cssRemoteRefs(body)) refs.add(r)
+      // textarea/title/xmp/noscript bodies are inert display text — not scanned.
+    }
+  }
+  return [...refs]
+}
+
+/** A CSP directive value that admits remote code / connections (a bare `*` or a remote origin). */
+function cspAdmitsRemote(csp: Record<string, unknown>): string[] {
+  const offenders: string[] = []
+  const risky = ['script-src', 'connect-src', 'default-src', 'style-src', 'img-src', 'frame-src']
+  for (const dir of risky) {
+    const raw = csp[dir]
+    const value = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
+    if (!value) continue
+    if (/(^|\s)\*(\s|$)/.test(value) || /https?:\/\//i.test(value) || /(^|\s)(https?:|\*):/.test(value)) {
+      offenders.push(`${dir} ${value.trim()}`)
+    }
+  }
+  return offenders
+}
+
+/**
+ * A CSP is CLOSED when it (a) admits no wildcard / remote origin (see
+ * `cspAdmitsRemote`), AND (b) actually CONSTRAINS both the script-execution and
+ * the network-connection surface — either via a non-empty `default-src`
+ * fallback, or via explicit non-empty `script-src` and `connect-src`. An absent
+ * or empty CSP (`undefined` / `{}`) is NOT closed: it declares no boundary for
+ * the host sandbox to enforce, so the widget cannot be proven inert.
+ */
+function cspIsClosed(csp: Record<string, unknown> | undefined): boolean {
+  if (!csp) return false
+  if (cspAdmitsRemote(csp).length > 0) return false
+  const nonEmpty = (dir: string): boolean => {
+    for (const [k, raw] of Object.entries(csp)) {
+      if (k.toLowerCase() !== dir) continue
+      const v = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
+      if (v.trim().length > 0) return true
+    }
+    return false
+  }
+  const hasDefault = nonEmpty('default-src')
+  const scriptCovered = hasDefault || nonEmpty('script-src')
+  const connectCovered = hasDefault || nonEmpty('connect-src')
+  return scriptCovered && connectCovered
+}
+
+/**
+ * (2) srcDoc self-containment. A widget is provably safe ONLY behind a CLOSED
+ * `_meta.ui.csp` that the host sandbox can enforce. A deny-list of exfil sinks
+ * is unwinnable (protocol-relative `//host`, `sendBeacon`, `XMLHttpRequest`,
+ * `new Image().src`, dynamic `import()`, backtick `fetch`), so the PRIMARY
+ * signal is ENFORCEMENT-based:
+ *   - the widget MUST declare a closed CSP (default-src / no remote origin in
+ *     script-src / connect-src / img-src). An un-CSP'd widget is NOT provably
+ *     inert ⇒ FAIL — there is nothing for the host to enforce.
+ * As a SECONDARY signal, the srcDoc is PARSED (not regexed) and any actual
+ * EXECUTABLE external reference is flagged — network-loading element attributes
+ * plus remote-URL literals in `<script>`/`<style>` bodies, covering
+ * protocol-relative, backtick, sendBeacon/XHR/Image/WebSocket/EventSource/
+ * dynamic-import. A URL merely DISPLAYED in text / `<pre>`/`<code>` / escaped
+ * markup is NOT a reference and does not fail. This is best-effort, not a proof
+ * of inertness; the closed CSP is the real boundary.
+ * No claim ⇒ SKIP. An externalUrl widget is graded on the fetched page (or, when
+ * not fetched, on the linkage check, not here).
+ */
+function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  // The HTML under scrutiny: the inline srcDoc, or (only when SAME-ORIGIN and
+  // thus fetched) an externalUrl page. An off-origin externalUrl is never
+  // fetched — self-containment is judged via linkage, not here.
+  const html = ui.externalUrl ? ui.extEv?.body : ui.resource?.text
+  if (typeof html !== 'string' || html.length === 0) {
+    if (ui.externalUrl) return { verdict: 'skip', detail: `externalUrl UIResource ${ui.externalUrl} not fetched (off-origin, not proxied) — self-containment judged on the declared shape (see resource-linkage)` }
+    return { verdict: 'fail', detail: `UIResource ${ui.linkedUri ?? '?'} carries no srcDoc HTML to render — an empty widget is not render-ready` }
+  }
+  const meta = ui.result?._meta
+  const uiMeta = meta && typeof meta === 'object' ? ((meta as Record<string, unknown>).ui as Record<string, unknown> | undefined) : undefined
+  const csp = uiMeta && typeof uiMeta.csp === 'object' && uiMeta.csp !== null ? (uiMeta.csp as Record<string, unknown>) : undefined
+  // PRIMARY: a closed CSP is REQUIRED. An open (remote-admitting) CSP is the
+  // worst case; a missing/empty CSP still fails — an un-CSP'd widget cannot be
+  // proven inert.
+  const cspOffenders = csp ? cspAdmitsRemote(csp) : []
+  if (cspOffenders.length > 0) {
+    return { verdict: 'fail', detail: `_meta.ui.csp is not closed: ${cspOffenders.slice(0, 3).join('; ')} — a widget CSP that admits a wildcard or remote origin defeats the host sandbox` }
+  }
+  if (!cspIsClosed(csp)) {
+    return { verdict: 'fail', detail: `the widget declares no closed _meta.ui.csp (need e.g. default-src 'none' with script-src/connect-src restricted to 'self') — an un-CSP'd widget cannot be proven self-contained; the host sandbox has no policy to enforce` }
+  }
+  // SECONDARY: parse the srcDoc for actual executable external references.
+  const refs = externalRefsInSrcDoc(html)
+  if (refs.length > 0) {
+    return { verdict: 'fail', detail: `ui:// srcDoc has executable external references: ${refs.slice(0, 4).join(', ')} — an element that loads or a script that beacons to a remote origin is a host-sandbox + supply-chain + exfil risk; the srcDoc must be self-contained (inline/precompiled, no remote refs)` }
+  }
+  return pass('srcDoc is self-contained (no executable external refs) behind a closed CSP')
+}
+
+/** Minimum length of a credential-named field's string value before it counts as a leak. */
+const MIN_CRED_LEN = 8
+
+/**
+ * A field NAME that denotes a credential. A brand deny-list (sk-/ghp_/…) misses
+ * generically-named secrets (refresh_token, session_token, auth, credential), so
+ * this is a NAME-shaped ALLOW-list: any field whose (camelCase-normalized) name
+ * ends in a credential word — token / secret / key / password / credential /
+ * authorization / auth / session / cookie / private-key (and the *_token /
+ * *_secret / *_key variants). Anchored at the END so `count`, `keyboard`,
+ * `monkey`, `session_id` do NOT match.
+ */
+function nameLooksCredential(key: string): boolean {
+  const norm = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+  return /(^|[_-])(tokens?|secrets?|keys?|password|passwd|pwd|credentials?|authorization|auth|session|cookie|private[_-]?key)$/.test(norm)
+}
+
+/** VALUE-shape heuristics — a string that LOOKS like a credential regardless of its field name. */
+const VALUE_SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/AIza[0-9A-Za-z_-]{20,}/, 'Google API key (AIza…)'],
+  [/\bsk-[A-Za-z0-9]{16,}/, 'OpenAI-style secret key (sk-…)'],
+  [/\bAKIA[0-9A-Z]{16}\b/, 'AWS access key id (AKIA…)'],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/, 'GitHub token (gh?_…)'],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}/, 'Slack token (xox…)'],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'PEM private key'],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, 'JWT (three-segment)'],
+  [/\bBearer\s+[A-Za-z0-9._-]{16,}/, 'inline Bearer token'],
+]
+
+/** A UUID — a benign identifier shape that must NOT be mistaken for a credential. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * A single WHITESPACE-delimited token that looks like an opaque credential: a
+ * long base64/hex/opaque string, mixed character classes, with a long
+ * CONTIGUOUS run (so dotted/hyphenated identifiers and UUIDs — benign IDs — do
+ * NOT trip it).
+ */
+function looksHighEntropy(raw: string): boolean {
+  const s = raw.trim()
+  if (s.length < 32) return false
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(s)) return false
+  if (UUID_RE.test(s)) return false
+  const longestRun = Math.max(...s.split(/[_\-+/=]+/).map((r) => r.length))
+  if (longestRun < 24) return false // a UUID's longest hex run is 12 → excluded
+  const classes = (/[a-z]/.test(s) ? 1 : 0) + (/[A-Z]/.test(s) ? 1 : 0) + (/[0-9]/.test(s) ? 1 : 0)
+  return classes >= 2
+}
+
+/**
+ * A credential label if `s` — or any whitespace-delimited token WITHIN it —
+ * matches a value-shape heuristic, else undefined. Tokenizing catches a
+ * credential embedded in narration text (e.g. `content[].text`), not only a
+ * value that IS the credential.
+ */
+function valueSecretLabel(s: string): string | undefined {
+  for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(s)) return label
+  for (const tok of s.split(/[\s"'`<>(){}\[\],;]+/)) {
+    if (looksHighEntropy(tok)) return 'high-entropy credential-like string'
+  }
+  return undefined
+}
+
+/** A credential-named field is a leak once it actually carries a non-trivial string value. */
+function credentialValuePresent(v: unknown): boolean {
+  if (typeof v === 'string') return v.trim().length >= MIN_CRED_LEN
+  return false
+}
+
+function walkForSecrets(value: unknown, path: string, hits: string[]): void {
+  if (typeof value === 'string') {
+    const label = valueSecretLabel(value)
+    if (label) hits.push(`${label}${path ? ` at ${path}` : ''}`)
+    return
+  }
+  if (Array.isArray(value)) {
+    value.forEach((el, idx) => walkForSecrets(el, `${path}[${idx}]`, hits))
+    return
+  }
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const child = path ? `${path}.${k}` : k
+      if (nameLooksCredential(k) && credentialValuePresent(v)) hits.push(`credential-named field \`${k}\``)
+      walkForSecrets(v, child, hits)
+    }
+  }
+}
+
+/**
+ * Model-visible values that carry a leaked credential. Credential-SHAPED: it
+ * flags (a) any field whose NAME denotes a credential and carries a real value,
+ * and (b) any VALUE that matches a credential shape (AIza…/sk-/AKIA/gh?_/xox/
+ * PEM/JWT/Bearer/high-entropy). Recurses through objects AND arrays, so a
+ * `structuredContent` object is scanned as JSON and each `content[].text` string
+ * is scanned as text.
+ */
+function secretsIn(value: unknown): string[] {
+  const hits: string[] = []
+  walkForSecrets(value, '', hits)
+  return hits
+}
+
+/**
+ * (3) Envelope hygiene (HIGH). The three-way split — structuredContent (model +
+ * widget), content (model narration), _meta (widget-only) — must not leak a
+ * secret into a MODEL-VISIBLE channel. A token/key in `content` or
+ * `structuredContent` ⇒ FAIL (it is exfiltrated to the model/agent transcript).
+ * `_meta` is widget-only and not scanned here. No claim ⇒ SKIP.
+ */
+function judgeMcpUiEnvelopeHygiene(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.result) return { verdict: 'skip', detail: 'MCP-UI claimed but no tool result recorded — nothing to inspect for envelope hygiene' }
+  const modelVisible: Array<[string, unknown]> = [
+    ['structuredContent', ui.result.structuredContent],
+    ['content', ui.result.content],
+  ]
+  for (const [channel, value] of modelVisible) {
+    if (value === undefined) continue
+    const hits = secretsIn(value)
+    if (hits.length > 0) {
+      return { verdict: 'fail', detail: `a secret (${hits[0]}) leaks into the model-visible \`${channel}\` channel — model-visible channels must never carry credentials; secrets belong only in the widget-only _meta` }
+    }
+  }
+  return pass('no secret detected in the model-visible content/structuredContent channels')
+}
+
+/** Deep key/value conflicts between two objects (same key present in both, different value). */
+function conflictingKeys(a: unknown, b: unknown, prefix = ''): string[] {
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return []
+  const out: string[] = []
+  const ao = a as Record<string, unknown>
+  const bo = b as Record<string, unknown>
+  for (const key of Object.keys(ao)) {
+    if (!(key in bo)) continue
+    const av = ao[key]
+    const bv = bo[key]
+    const path = prefix ? `${prefix}.${key}` : key
+    if (av && bv && typeof av === 'object' && typeof bv === 'object') {
+      out.push(...conflictingKeys(av, bv, path))
+    } else if (JSON.stringify(av) !== JSON.stringify(bv)) {
+      out.push(`${path} (${JSON.stringify(av)} ≠ ${JSON.stringify(bv)})`)
+    }
+  }
+  return out
+}
+
+/**
+ * (4) Three-register parity. The widget's data must be CONSISTENT with the
+ * agent/API register — the widget must not show different data than the twin.
+ * `structuredContent` is the model+widget register; any widget-only data payload
+ * (`_meta.ui.data` / `_meta.ui.props`) must not CONTRADICT it. A conflicting key
+ * ⇒ FAIL (the widget renders divergent data from what the agent/API sees). When
+ * MCP-UI is claimed but there is NO structuredContent for the widget/model to
+ * share, there is nothing byte-consistent to render ⇒ FAIL. No claim ⇒ SKIP.
+ */
+function judgeMcpUiRegisterParity(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.result) return { verdict: 'skip', detail: 'MCP-UI claimed but no tool result recorded — nothing to check parity against' }
+  const structured = ui.result.structuredContent
+  const meta = ui.result._meta
+  const uiMeta = meta && typeof meta === 'object' ? ((meta as Record<string, unknown>).ui as Record<string, unknown> | undefined) : undefined
+  const widgetData = uiMeta ? (uiMeta.data ?? uiMeta.props) : undefined
+  if (widgetData !== undefined && (structured === undefined || structured === null)) {
+    return { verdict: 'fail', detail: 'the widget renders from a _meta.ui data payload but the tool result carries NO structuredContent — the widget register has no agent/API twin to be consistent with (register divergence)' }
+  }
+  if (widgetData !== undefined && structured !== undefined) {
+    const conflicts = conflictingKeys(widgetData, structured)
+    if (conflicts.length > 0) {
+      return { verdict: 'fail', detail: `widget data diverges from the agent/API register (structuredContent): ${conflicts.slice(0, 4).join('; ')} — the widget must show the same data as the json/markdown twin` }
+    }
+  }
+  if (structured === undefined || structured === null) {
+    return { verdict: 'fail', detail: 'MCP-UI is claimed but the tool result carries no structuredContent — the widget has no byte-consistent state shared with the model/API register' }
+  }
+  return pass('widget structuredContent is present and consistent with the agent/API register (no divergence)')
+}
+
+/**
+ * (5) Host-render readiness. The widget should render on first turn WITHOUT user
+ * input (no required tool inputs), and the tool should carry the host-facing
+ * affordances a host needs: a description / `widgetDescription` and annotations.
+ * No claim ⇒ SKIP. Claims but requires input to first-render, or lacks a
+ * description/annotations ⇒ FAIL (a widget the host cannot present unprompted).
+ */
+function judgeMcpUiHostRender(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  const tool = ui.uiTool ?? {}
+  const inputSchema = tool.inputSchema && typeof tool.inputSchema === 'object' ? (tool.inputSchema as Record<string, unknown>) : undefined
+  const required = Array.isArray(inputSchema?.required) ? (inputSchema!.required as unknown[]) : []
+  if (required.length > 0) {
+    return { verdict: 'fail', detail: `the UI tool requires input(s) [${required.join(', ')}] before it can be called — the widget cannot first-render without user input, so the host cannot present it unprompted` }
+  }
+  const meta = tool._meta && typeof tool._meta === 'object' ? (tool._meta as Record<string, unknown>) : undefined
+  const uiMeta = meta && typeof meta.ui === 'object' && meta.ui !== null ? (meta.ui as Record<string, unknown>) : undefined
+  const widgetDescription = typeof uiMeta?.widgetDescription === 'string' && uiMeta.widgetDescription.length > 0
+  const hasDescription = typeof tool.description === 'string' && tool.description.length > 0
+  const hasAnnotations = tool.annotations && typeof tool.annotations === 'object' && Object.keys(tool.annotations as Record<string, unknown>).length > 0
+  if (!widgetDescription && !hasDescription && !hasAnnotations) {
+    return { verdict: 'fail', detail: 'the UI tool declares no description, widgetDescription, or annotations — the host has no affordance text to present the widget trustworthily' }
+  }
+  return pass(`first-render tolerant (no required inputs) with ${widgetDescription ? 'widgetDescription' : hasDescription ? 'a description' : 'annotations'} for the host`)
 }
 
 function looksLikeHtml(body: string): boolean {
