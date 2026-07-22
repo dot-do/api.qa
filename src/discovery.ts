@@ -55,6 +55,19 @@ export const ROLE = {
    * only to confirm it RESOLVES. Advertisement/shape-grade — no ID-JAG mint.
    */
   agentIdentity: 'surface:agent-identity',
+  // ── MCP-registry publishability (ax-e6b.38) ──────────────────────────────
+  /** The MCP registry manifest (server.json) at the well-known / declared path. */
+  mcpServerJson: 'surface:mcp:server-json',
+  /** LIVE MCP remote handshake: initialize (POST) to server.json remotes[0].url. */
+  mcpRemoteInit: 'probe:mcp:remote-initialize',
+  /** LIVE MCP remote handshake: tools/list (POST), echoing the mcp-session-id. */
+  mcpRemoteToolsList: 'probe:mcp:remote-tools-list',
+  /** Domain-ownership well-known: /.well-known/mcp-registry-auth (v=MCPv1). */
+  mcpRegistryAuthWellKnown: 'surface:mcp:registry-auth-well-known',
+  /** DNS-over-HTTPS TXT lookup of the reverse-DNS namespace domain (ownership). */
+  mcpRegistryDnsTxt: 'probe:mcp:registry-dns-txt',
+  /** OPTIONAL/informational: presence in the official MCP registry, by name. */
+  mcpRegistryPresence: 'probe:mcp:registry-presence',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -89,6 +102,13 @@ export interface AgentsClaims {
   probes?: Record<string, Array<{ method: string; url: string; param?: string }>>
   attestation?: unknown
   openapiUrl?: string
+  /**
+   * Declared location of the MCP registry manifest (server.json), if the card
+   * advertises one (top-level `serverJson`/`server_json`, or
+   * interfaces.mcp.serverJson). Absolutized; SSRF-gated same-origin at fetch.
+   * Absent => api.qa probes the default well-known `/.well-known/mcp/server.json`.
+   */
+  serverJsonUrl?: string
 }
 
 export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
@@ -126,6 +146,13 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
       url: mcpRawUrl !== undefined ? absolutize(mcpRawUrl, origin) : undefined,
       tools: Array.isArray(mcp.tools) ? mcp.tools.filter((t): t is string => typeof t === 'string') : undefined,
     }
+    const mcpServerJson = str(mcp.serverJson) ?? str(mcp.server_json)
+    if (mcpServerJson !== undefined) out.serverJsonUrl = absolutize(mcpServerJson, origin)
+  }
+  // Top-level server.json pointer (card-derived; absolutized, SSRF-gated at fetch).
+  const declaredServerJson = str(d.serverJson) ?? str(d.server_json)
+  if (out.serverJsonUrl === undefined && declaredServerJson !== undefined) {
+    out.serverJsonUrl = absolutize(declaredServerJson, origin)
   }
 
   const monetization = d.monetization as Record<string, unknown> | undefined
@@ -228,6 +255,104 @@ export function parseAgentAuth(asMeta: unknown): AgentAuthClaims | undefined {
     events_endpoint: str(b.events_endpoint),
     raw: b,
   }
+}
+
+// ---------------------------------------------------------------------------
+// MCP registry manifest (server.json) claims (pure) — ax-e6b.38
+// ---------------------------------------------------------------------------
+
+export interface ServerJsonRemote {
+  /** 'streamable-http' | 'sse' (registry transport vocabulary). */
+  type?: string
+  url?: string
+}
+
+export interface ServerJsonClaims {
+  name?: string
+  version?: string
+  title?: string
+  description?: string
+  websiteUrl?: string
+  repository?: { url?: string; source?: string }
+  remotes: ServerJsonRemote[]
+  /** The raw parsed doc, so a judge can validateSchema over it. */
+  raw: Record<string, unknown>
+}
+
+/**
+ * Parse a fetched server.json (the MCP registry manifest) into the fields the
+ * publishability judge reads. Pure. A non-object doc yields undefined (=> the
+ * dimension SKIPs — the target is not claiming registry publishability).
+ */
+export function parseServerJson(doc: unknown): ServerJsonClaims | undefined {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return undefined
+  const d = doc as Record<string, unknown>
+  const repoRaw = d.repository && typeof d.repository === 'object' && !Array.isArray(d.repository)
+    ? (d.repository as Record<string, unknown>)
+    : undefined
+  const remotes: ServerJsonRemote[] = Array.isArray(d.remotes)
+    ? (d.remotes as unknown[])
+        .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object' && !Array.isArray(r))
+        .map((r) => ({ type: str(r.type), url: str(r.url) }))
+    : []
+  return {
+    name: str(d.name),
+    version: str(d.version),
+    title: str(d.title),
+    description: str(d.description),
+    websiteUrl: str(d.websiteUrl),
+    repository: repoRaw ? { url: str(repoRaw.url), source: str(repoRaw.source) } : undefined,
+    remotes,
+    raw: d,
+  }
+}
+
+/**
+ * The reverse-DNS namespace shape of a server.json `name`: two-or-more
+ * reverse-DNS labels, a single `/`, then the server segment — e.g.
+ * `io.github.owner/server` or `com.example/server`. Returns the split parts, or
+ * undefined when the name is not a valid reverse-DNS namespace.
+ */
+export function parseReverseDnsName(name: string | undefined):
+  | { namespace: string; server: string; labels: string[] }
+  | undefined {
+  if (typeof name !== 'string') return undefined
+  const slash = name.indexOf('/')
+  if (slash <= 0 || slash === name.length - 1) return undefined
+  const namespace = name.slice(0, slash)
+  const server = name.slice(slash + 1)
+  const labels = namespace.split('.')
+  if (labels.length < 2) return undefined
+  const labelRe = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i
+  if (!labels.every((l) => labelRe.test(l))) return undefined
+  if (!/^[A-Za-z0-9._-]+$/.test(server)) return undefined
+  return { namespace, server, labels }
+}
+
+/**
+ * The DNS domain a reverse-DNS namespace must prove ownership of, by reversing
+ * the namespace labels: `com.example` => `example.com`, `com.example.api` =>
+ * `api.example.com`. Undefined for a malformed name. The special GitHub
+ * namespace (`io.github.<owner>`) has no DNS-provable domain the target owns —
+ * ownership there is GitHub-account-backed — so callers must special-case it.
+ */
+export function namespaceDomain(name: string | undefined): string | undefined {
+  const parsed = parseReverseDnsName(name)
+  if (!parsed) return undefined
+  return [...parsed.labels].reverse().join('.').toLowerCase()
+}
+
+/** True when the namespace is the GitHub-account-backed `io.github.<owner>` form. */
+export function isGithubNamespace(name: string | undefined): boolean {
+  const p = parseReverseDnsName(name)
+  return !!p && p.labels.length >= 3 && p.labels[0]!.toLowerCase() === 'io' && p.labels[1]!.toLowerCase() === 'github'
+}
+
+/** The `<owner>` segment of an `io.github.<owner>` namespace, lowercased. */
+export function githubNamespaceOwner(name: string | undefined): string | undefined {
+  const p = parseReverseDnsName(name)
+  if (!p || !isGithubNamespace(name)) return undefined
+  return p.labels[2]?.toLowerCase()
 }
 
 export interface OpenapiSummary {
@@ -434,6 +559,148 @@ export const MAX_KEYLESS_PROBES = 3
  */
 export const MAX_CONTRACT_PROBES = 8
 
+// ---------------------------------------------------------------------------
+// MCP-registry publishability observe (ax-e6b.38)
+// ---------------------------------------------------------------------------
+
+/** Default well-known location api.qa probes for the MCP registry manifest. */
+export const DEFAULT_SERVER_JSON_PATH = '/.well-known/mcp/server.json'
+/** The domain-ownership HTTPS proof the registry checks (v=MCPv1; k=…; p=…). */
+export const REGISTRY_AUTH_WELL_KNOWN_PATH = '/.well-known/mcp-registry-auth'
+/** A fixed, trusted public DNS-over-HTTPS resolver (not target-controlled). */
+export const DOH_RESOLVER = 'https://dns.google/resolve'
+/** The official MCP registry base (informational presence lookup). */
+export const MCP_REGISTRY_BASE = 'https://registry.modelcontextprotocol.io'
+
+/** The MCP `initialize` JSON-RPC request the live-remote handshake sends. */
+function mcpInitializeRequest(): unknown {
+  return {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'api.qa', version: '0.1.0' },
+    },
+  }
+}
+
+/** The MCP `tools/list` JSON-RPC request (echoing the initialize session id). */
+function mcpToolsListRequest(): unknown {
+  return { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }
+}
+
+/**
+ * Observe the MCP-registry publishability surfaces (ax-e6b.38). Runs BEFORE the
+ * unbounded contract-diff pass so its fixed, high-value probes reserve their
+ * share of the shared politeness budget (same ordering rationale as the
+ * 402-offer + MCP-OAuth probes).
+ *
+ * SSRF: every fetch is gated. server.json is same-origin (default well-known
+ * path, or a card-declared server.json url re-gated same-origin). The
+ * domain-ownership well-known and the DNS-TXT proof are DELIBERATELY fetched/
+ * resolved at the reversed NAMESPACE DOMAIN, not the scanned origin (see the
+ * comment at call site 3, below) — that domain is frequently off-origin from
+ * the target, so both use the same NARROW public-https off-origin allowance
+ * (https, public host, no private/metadata IP) as the RFC 9728 authorization
+ * server. The MCP remote url (from server.json remotes[0]) may also
+ * legitimately be hosted off-origin, using the same allowance — and
+ * observeMcp never follows a redirect. The DoH resolver + registry base are
+ * FIXED trusted public hosts, still gated public-https. Nothing here
+ * introduces an un-gated fetch.
+ */
+async function observeMcpRegistry(origin: string, observer: Observer): Promise<void> {
+  // Re-parse the card from the already-recorded agents.json evidence (no refetch).
+  const agentsEv = findEvidence({ target: origin, fetchedAt: '', seed: 0, items: observer.items }, ROLE.agentsJson)
+  const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
+
+  // 1. server.json — the registry manifest. Declared url (re-gated same-origin)
+  //    or the default same-origin well-known. A card-declared off-origin/private
+  //    server.json url is DROPPED (never fetched); the default well-known is then
+  //    NOT used as a fallback, so a hostile declaration fails closed (mirrors the
+  //    openapi url posture) rather than silently succeeding at the default path.
+  let serverJsonUrl: string | undefined
+  if (agents.serverJsonUrl !== undefined) {
+    serverJsonUrl = isPubliclyRoutableSameOrigin(agents.serverJsonUrl, origin) ? agents.serverJsonUrl : undefined
+    if (serverJsonUrl === undefined) return // hostile declared url — fail closed, do not probe further
+  } else {
+    serverJsonUrl = `${origin}${DEFAULT_SERVER_JSON_PATH}`
+  }
+  if (!isPubliclyRoutableSameOrigin(serverJsonUrl, origin)) return
+  const sjEv = await observer.observe(ROLE.mcpServerJson, serverJsonUrl, { accept: 'application/json' })
+  const server = parseServerJson(parseJsonBody(sjEv))
+  // No parseable server.json => the target is not claiming registry
+  // publishability => the whole dimension SKIPs (no further probes).
+  if (!server) return
+
+  // 2. LIVE MCP remote resolution — connect to remotes[0] over http and perform
+  //    the initialize -> tools/list handshake. Remote url uses the narrow
+  //    public-https off-origin allowance; observeMcp adds the private-host
+  //    backstop and never follows a redirect.
+  const remote = server.remotes.find((r) => typeof r.url === 'string' && r.url.length > 0)
+  if (remote?.url && isPublicHttpsOffOriginAllowed(remote.url)) {
+    const initEv = await observer.observeMcp(ROLE.mcpRemoteInit, remote.url, mcpInitializeRequest())
+    // Only follow up with tools/list when initialize genuinely resolved (2xx).
+    // A 401/403 is 'reachable + protected' — the judge treats it as PASS and we
+    // do not (cannot) list tools. A dead/redirect/5xx remote => no tools/list.
+    if (initEv.status !== null && initEv.status >= 200 && initEv.status < 300) {
+      const sid = initEv.headers['mcp-session-id']
+      const extra: Record<string, string> = sid ? { 'mcp-session-id': sid } : {}
+      await observer.observeMcp(ROLE.mcpRemoteToolsList, remote.url, mcpToolsListRequest(), extra)
+    }
+  }
+
+  // 3. Domain-ownership provability — for a CUSTOM-DOMAIN namespace
+  //    (com.example/server ⇒ domain example.com), both proofs MUST be bound to
+  //    the reversed NAMESPACE DOMAIN, never to the scanned target's own origin.
+  //    Fetching (or resolving) at the target's own origin would let ANY target
+  //    forge ownership of ANY namespace it can merely spell in server.json —
+  //    the origin is exactly what's under adversarial control. So:
+  //      - DNS-TXT is resolved for the namespace domain (already correct: DoH
+  //        `name=` is the domain, not the origin's host);
+  //      - the HTTPS well-known is now fetched at
+  //        `https://<namespaceDomain>/.well-known/mcp-registry-auth` — via the
+  //        narrow public-https OFF-ORIGIN allowance (the same one the RFC 9728
+  //        authorization server and the DoH/registry lookups use) — NOT at
+  //        `${origin}/.well-known/...`. When the namespace domain happens to
+  //        equal the scanned origin's own host (the common self-hosting case),
+  //        this resolves to the identical URL the origin fetch used to hit, so
+  //        the honest case is unaffected; a target whose origin is NOT the
+  //        namespace domain can no longer self-serve a proof for a domain it
+  //        does not control (the judge additionally re-checks the fetched URL's
+  //        hostname against the namespace domain — belt and suspenders).
+  //
+  //    The GitHub-account-backed `io.github.<owner>` namespace has no DNS-
+  //    provable domain — a third party cannot mint a domain proof for it, and
+  //    manifest-internal consistency (name vs. repository.url) is NOT an
+  //    ownership proof (both are target-authored). Its ownership is graded
+  //    ONLY from out-of-band registry presence (step 4, below) — nothing is
+  //    fetched here for it.
+  if (!isGithubNamespace(server.name)) {
+    const domain = namespaceDomain(server.name)
+    if (domain && /^[a-z0-9.-]+\.[a-z0-9-]+$/i.test(domain)) {
+      const dohUrl = `${DOH_RESOLVER}?name=${encodeURIComponent(domain)}&type=TXT`
+      if (isPublicHttpsOffOriginAllowed(dohUrl)) {
+        await observer.observe(ROLE.mcpRegistryDnsTxt, dohUrl, { accept: 'application/dns-json' })
+      }
+      const authWellKnownUrl = `https://${domain}${REGISTRY_AUTH_WELL_KNOWN_PATH}`
+      if (isPublicHttpsOffOriginAllowed(authWellKnownUrl)) {
+        await observer.observe(ROLE.mcpRegistryAuthWellKnown, authWellKnownUrl, { accept: 'text/plain' })
+      }
+    }
+  }
+
+  // 4. OPTIONAL/informational — is the server actually present in the official
+  //    registry, by name? Never gates the grade (a pass or a skip, never a fail).
+  if (typeof server.name === 'string' && server.name.length > 0 && parseReverseDnsName(server.name)) {
+    const presenceUrl = `${MCP_REGISTRY_BASE}/v0/servers?search=${encodeURIComponent(server.name)}`
+    if (isPublicHttpsOffOriginAllowed(presenceUrl)) {
+      await observer.observe(ROLE.mcpRegistryPresence, presenceUrl, { accept: 'application/json' })
+    }
+  }
+}
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -582,6 +849,16 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
       }
     }
   }
+
+  // 4b. MCP-registry publishability (ax-e6b.38): fetch the server.json manifest,
+  //     LIVE-resolve its remote (initialize -> tools/list), and derive domain-
+  //     ownership provability (well-known + DNS-TXT). ORDERED BEFORE contract-
+  //     diff so these fixed, high-value probes reserve their budget share and are
+  //     never starved by an endpoint-rich target's unbounded contract enumeration.
+  //     Every fetch is SSRF-gated (see observeMcpRegistry). A target that serves
+  //     no server.json performs only the one well-known probe (404 => the whole
+  //     dimension SKIPs).
+  await observeMcpRegistry(origin, observer)
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
