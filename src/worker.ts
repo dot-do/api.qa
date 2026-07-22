@@ -194,7 +194,7 @@ export function createApp(
             // cached pass. Only consult the cache when the pin is consistent.
             const pinOk = !body.expectedDigest || body.expectedDigest === specDigest
             if (!bypass && cache && pinOk) {
-              const hit = await cache.getPinned(body.target, specDigest, now())
+              const hit = await cache.getPinned(body.target, specDigest, body.seed, now())
               if (hit?.fresh)
                 return respondPinned(hit.report, accept, { cache: 'HIT', ageMs: hit.ageMs })
             }
@@ -206,7 +206,7 @@ export function createApp(
               delayMs: bypass ? 0 : externalDelayMs,
               allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
             })
-            if (!bypass && cache) await cache.putPinned(body.target, specDigest, report, now())
+            if (!bypass && cache) await cache.putPinned(body.target, specDigest, body.seed, report, now())
             return respondPinned(report, accept, { cache: bypass ? undefined : 'MISS' })
           }
 
@@ -288,7 +288,7 @@ export function createApp(
           // Anti-Goodhart gate must fire on a bad pin BEFORE any cache hit.
           const pinOk = !body.expectedDigest || body.expectedDigest === suiteDigest
           if (targetForKey !== undefined && !bypass && cache && pinOk) {
-            const hit = await cache.getSuite(targetForKey, suiteDigest, body.environment, now())
+            const hit = await cache.getSuite(targetForKey, suiteDigest, body.environment, body.seed, now())
             if (hit?.fresh) return respondSuite(hit.report, accept, { cache: 'HIT', ageMs: hit.ageMs })
           }
 
@@ -301,7 +301,8 @@ export function createApp(
             delayMs: bypass ? 0 : externalDelayMs,
             allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
           })
-          if (!bypass && cache) await cache.putSuite(report.target, suiteDigest, body.environment, report, now())
+          if (!bypass && cache)
+            await cache.putSuite(report.target, suiteDigest, body.environment, body.seed, report, now())
           return respondSuite(report, accept, { cache: bypass ? undefined : 'MISS' })
         }
 

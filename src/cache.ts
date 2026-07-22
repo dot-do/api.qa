@@ -45,6 +45,23 @@ export function hostKey(domain: string): string {
     .toLowerCase()
 }
 
+/**
+ * Bucket the (optional) verifier RNG seed into a cache-key segment. A run's
+ * `seed` field is part of the report and is NOT invariant across seeds (a
+ * pinned spec can bind sampled/randomized behavior into it), so a verdict
+ * cache keyed WITHOUT the seed would serve a request for a specific seed the
+ * FIRST run's report — including its now-stale `seed` field — misreporting
+ * which seed the returned verdict actually ran under. Keying on the
+ * (unresolved) requested seed, rather than the resolved one baked into the
+ * eventual report, keeps the key decidable BEFORE any run: an explicit seed
+ * always gets its own bucket (re-runs on a different seed), while omitting
+ * `seed` on every call keeps sharing one bucket (a caller that never asked
+ * for a specific seed is truthfully served whichever seed answered).
+ */
+function seedKey(seed: number | undefined): string {
+  return seed === undefined ? 'auto' : String(seed)
+}
+
 interface HeadPointer {
   digest: string
   probedAtMs: number
@@ -73,8 +90,8 @@ export class ReportCache {
   private reportK(domain: string, digest: string): string {
     return `report:${hostKey(domain)}:${digest}`
   }
-  private pinnedK(domain: string, specDigest: string): string {
-    return `pinned:${hostKey(domain)}:${specDigest}`
+  private pinnedK(domain: string, specDigest: string, seed: number | undefined): string {
+    return `pinned:${hostKey(domain)}:${specDigest}:${seedKey(seed)}`
   }
 
   /** Latest domain-mode verdict, if any. `fresh` = within the TTL window. */
@@ -109,17 +126,28 @@ export class ReportCache {
     return raw ? (JSON.parse(raw) as CachedReport<VerificationReport>).report : null
   }
 
-  async getPinned(domain: string, specDigest: string, nowMs: number = Date.now()): Promise<CacheHit<PinnedReport> | null> {
-    const raw = await this.kv.get(this.pinnedK(domain, specDigest))
+  async getPinned(
+    domain: string,
+    specDigest: string,
+    seed: number | undefined,
+    nowMs: number = Date.now(),
+  ): Promise<CacheHit<PinnedReport> | null> {
+    const raw = await this.kv.get(this.pinnedK(domain, specDigest, seed))
     if (!raw) return null
     const cached = JSON.parse(raw) as CachedReport<PinnedReport>
     const ageMs = Math.max(0, nowMs - cached.storedAtMs)
     return { report: cached.report, ageMs, fresh: ageMs < this.ttlSeconds * 1000 }
   }
 
-  async putPinned(domain: string, specDigest: string, report: PinnedReport, nowMs: number = Date.now()): Promise<void> {
+  async putPinned(
+    domain: string,
+    specDigest: string,
+    seed: number | undefined,
+    report: PinnedReport,
+    nowMs: number = Date.now(),
+  ): Promise<void> {
     await this.kv.put(
-      this.pinnedK(domain, specDigest),
+      this.pinnedK(domain, specDigest, seed),
       JSON.stringify({ report, storedAtMs: nowMs } satisfies CachedReport<PinnedReport>),
       { expirationTtl: this.ttlSeconds },
     )
@@ -130,8 +158,8 @@ export class ReportCache {
   private suiteTextK(digest: string): string {
     return `suitetext:${digest}`
   }
-  private suiteK(target: string, suiteDigest: string, envName: string): string {
-    return `suite:${hostKey(target)}:${suiteDigest}:${envName}`
+  private suiteK(target: string, suiteDigest: string, envName: string, seed: number | undefined): string {
+    return `suite:${hostKey(target)}:${suiteDigest}:${envName}:${seedKey(seed)}`
   }
 
   /**
@@ -147,14 +175,15 @@ export class ReportCache {
     return this.kv.get(this.suiteTextK(digest))
   }
 
-  /** A prior suite verdict, keyed by (target, suite digest, environment). */
+  /** A prior suite verdict, keyed by (target, suite digest, environment, seed). */
   async getSuite(
     target: string,
     suiteDigest: string,
     envName: string,
+    seed: number | undefined,
     nowMs: number = Date.now(),
   ): Promise<CacheHit<SuiteReport> | null> {
-    const raw = await this.kv.get(this.suiteK(target, suiteDigest, envName))
+    const raw = await this.kv.get(this.suiteK(target, suiteDigest, envName, seed))
     if (!raw) return null
     const cached = JSON.parse(raw) as CachedReport<SuiteReport>
     const ageMs = Math.max(0, nowMs - cached.storedAtMs)
@@ -165,11 +194,12 @@ export class ReportCache {
     target: string,
     suiteDigest: string,
     envName: string,
+    seed: number | undefined,
     report: SuiteReport,
     nowMs: number = Date.now(),
   ): Promise<void> {
     await this.kv.put(
-      this.suiteK(target, suiteDigest, envName),
+      this.suiteK(target, suiteDigest, envName, seed),
       JSON.stringify({ report, storedAtMs: nowMs } satisfies CachedReport<SuiteReport>),
       { expirationTtl: this.ttlSeconds },
     )

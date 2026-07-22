@@ -462,7 +462,28 @@ export async function verifyPinnedSpec(
           id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
           detail: plan.unresolved, evidence: [ROLE.agentsJson],
         })
+        continue
+      }
+      // Interpolate this probe's `expect` through the SAME judge-scope binding
+      // path an `endpoint` requirement uses (env-seeded vars AND captures
+      // chained from an earlier requirement), so a {{var}} inside e.g.
+      // expect.paths[].equals resolves instead of being compared as the
+      // LITERAL string '{{var}}' (a silent, misleading FAIL with no hint the
+      // token was never resolved). An undefined reference fails CLOSED with
+      // the same clear detail resolveEndpoint gives the endpoint path — never
+      // a spurious literal-string mismatch. This is judge-side only (the
+      // already-fetched probe evidence is just re-compared) — no new fetch, so
+      // no new SSRF surface; the probe URL itself was already gated in phase
+      // 1/2 above, unaffected by this.
+      const expectResolved = interpolateDeep(req.expect, judgeBindings)
+      if ('error' in expectResolved) {
+        results.push({
+          id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
+          detail: `requirement ${req.id} references ${expectResolved.error}`,
+          evidence: [ROLE.agentsJson],
+        })
       } else {
+        const expect = expectResolved.value as EndpointExpect
         const problems: string[] = []
         const evidence: string[] = []
         plan.declared.forEach((entry, i) => {
@@ -474,7 +495,7 @@ export async function verifyPinnedSpec(
           const role = `pinned:${req.id}:${i}`
           evidence.push(role)
           const ev = fullBundle.items.find((e) => e.role === role)
-          const ps = judgeExpect(ev, req.expect)
+          const ps = judgeExpect(ev, expect)
           // Anti-decoy rule: the probed pathname must also have answered a
           // 200 `OK` envelope somewhere in this same run — a path that can
           // only ever say EMPTY/BLOCKED is a dedicated decoy, not a branch.

@@ -340,6 +340,32 @@ describe('worker runs a STORED suite by digest', () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/no stored suite/)
   })
 
+  it('a different seed on POST /suite re-runs instead of serving the first seed\'s cached (now-stale) report', async () => {
+    const { app } = suiteApp()
+    const suiteObj = JSON.parse(suiteText) as unknown
+
+    const post = (seed: number) =>
+      app.fetch(req('/suite', { environment: 'staging', suite: suiteObj, seed }))
+
+    const first = await post(1)
+    expect(first.status).toBe(200)
+    const firstReport = (await first.json()) as { seed: number; evidence: { bindings?: { runId?: string } } }
+    expect(firstReport.seed).toBe(1)
+
+    // Same (target, suite digest, environment), a DIFFERENT requested seed:
+    // must re-run rather than serve seed=1's cached report under a false
+    // seed=2 label.
+    const second = await post(2)
+    expect(second.status).toBe(200)
+    const secondReport = (await second.json()) as { seed: number; evidence: { bindings?: { runId?: string } } }
+    expect(secondReport.seed).toBe(2) // truthfully reports the seed it ran under
+
+    // The ORIGINAL seed is still served correctly (content-addressed by seed).
+    const replay = await post(1)
+    expect(replay.status).toBe(200)
+    expect(((await replay.json()) as { seed: number }).seed).toBe(1)
+  })
+
   it('enforces the suite digest pin (wrong expectedDigest → 400, never a cached pass)', async () => {
     const { app } = suiteApp()
     const suiteObj = JSON.parse(suiteText) as unknown
