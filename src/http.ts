@@ -42,7 +42,7 @@ export interface ObserverOpts {
   allowPrivate?: boolean
 }
 
-const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin']
+const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin', 'x-vercel-ai-ui-message-stream']
 
 /** Max redirect hops the observer will manually follow (each re-validated). */
 const MAX_REDIRECT_HOPS = 3

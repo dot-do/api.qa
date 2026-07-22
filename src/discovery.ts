@@ -84,6 +84,20 @@ export const ROLE = {
   mcpUiResourceRead: 'probe:mcp:ui-resource-read',
   /** GET of an externalUrl UIResource target (SSRF-gated; only when public-https). */
   mcpUiExternalUrl: 'probe:mcp:ui-external-url',
+  // ── AI SDK 5 UI-message-stream readiness (ax-rx1) ─────────────────────────
+  /**
+   * GET of the target-DECLARED AI SDK 5 UI-message-stream face
+   * (interfaces.uiMessageStream.url). Same-origin SSRF-gated; read capped as
+   * SSE text. Recorded ONLY when a target declares the face — a target with no
+   * uiMessageStream interface records nothing, so the ui-stream-* checks SKIP.
+   */
+  uiMessageStream: 'probe:ui-message-stream',
+  /**
+   * GET of the declared JSON/MCP twin (interfaces.uiMessageStream.twin) — the
+   * canonical projection the stream's tool-output MUST be consistent with.
+   * Same-origin SSRF-gated. Absent ⇒ the parity check SKIPs (no twin to diff).
+   */
+  uiStreamTwin: 'probe:ui-message-stream-twin',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -125,6 +139,14 @@ export interface AgentsClaims {
    * Absent => api.qa probes the default well-known `/.well-known/mcp/server.json`.
    */
   serverJsonUrl?: string
+  /**
+   * The target-declared AI SDK 5 UI-message-stream face
+   * (interfaces.uiMessageStream). `url` is the SSE endpoint api.qa observes;
+   * `twin` is an optional JSON projection the stream's tool-output is diffed
+   * against. Both absolutized and SSRF-gated same-origin at fetch. Absent ⇒
+   * the target exposes no UI-message-stream face and the ui-stream-* checks SKIP.
+   */
+  uiStream?: { url?: string; twin?: string }
 }
 
 export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
@@ -165,6 +187,23 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
     const mcpServerJson = str(mcp.serverJson) ?? str(mcp.server_json)
     if (mcpServerJson !== undefined) out.serverJsonUrl = absolutize(mcpServerJson, origin)
   }
+  // UI-message-stream face (ax-rx1): interfaces.uiMessageStream.{url,twin}.
+  // Card-derived — absolutize both (a relative "/api/chat" resolves same-origin;
+  // an absolute attacker url is preserved so the same-origin gate downstream can
+  // DROP it, exactly like interfaces.mcp.url). Present ⇒ the target DECLARES an
+  // AI SDK 5 UI-message-stream face and the ui-stream-* checks are ARMED.
+  const uiStream = interfaces.uiMessageStream as Record<string, unknown> | undefined
+  if (uiStream && typeof uiStream === 'object' && !Array.isArray(uiStream)) {
+    const url = str(uiStream.url)
+    const twin = str(uiStream.twin)
+    if (url !== undefined || twin !== undefined) {
+      out.uiStream = {
+        url: url !== undefined ? absolutize(url, origin) : undefined,
+        twin: twin !== undefined ? absolutize(twin, origin) : undefined,
+      }
+    }
+  }
+
   // Top-level server.json pointer (card-derived; absolutized, SSRF-gated at fetch).
   const declaredServerJson = str(d.serverJson) ?? str(d.server_json)
   if (out.serverJsonUrl === undefined && declaredServerJson !== undefined) {
@@ -956,6 +995,35 @@ async function observeMcpUi(origin: string, observer: Observer): Promise<void> {
   }
 }
 
+/**
+ * Observe the AI SDK 5 UI-message-stream face (ax-rx1). Target-declared: only
+ * when agents.json carries `interfaces.uiMessageStream.url` do we fetch — a
+ * target with no such interface records NOTHING, so every ui-stream-* check
+ * SKIPs (a non-streaming API is never over-blocked). The declared url is
+ * CARD-DERIVED adversarial input, so it is gated through the SAME shared
+ * same-origin helper as the openapi / offer / mcp.url probes: only a
+ * same-origin, publicly-routable url is fetched (an off-origin / private /
+ * metadata url is DROPPED, never fetched — the SSE face then simply isn't
+ * observed, exactly the fail-closed posture the other card-derived probes
+ * take). The body is read capped as SSE text via the read-only Observer.observe
+ * (the structural private-host backstop applies underneath regardless). An
+ * optional same-origin `twin` JSON projection is fetched for the parity check;
+ * absent ⇒ parity SKIPs (no twin to diff against — never fabricated).
+ */
+async function observeUiStream(origin: string, observer: Observer): Promise<void> {
+  const items = observer.items
+  const bundleView: EvidenceBundle = { target: origin, fetchedAt: '', seed: 0, items }
+  const agentsEv = findEvidence(bundleView, ROLE.agentsJson)
+  const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
+  const face = agents.uiStream
+  if (!face?.url) return // no UI-message-stream face declared — informational SKIP
+  if (!isPubliclyRoutableSameOrigin(face.url, origin)) return // hostile/off-origin declared url — never fetched
+  await observer.observe(ROLE.uiMessageStream, face.url, { accept: 'text/event-stream' })
+  if (face.twin && isPubliclyRoutableSameOrigin(face.twin, origin)) {
+    await observer.observe(ROLE.uiStreamTwin, face.twin, { accept: 'application/json' })
+  }
+}
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -1128,6 +1196,14 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //     Every fetch is SSRF-gated (see observeMcpUi); reuses the registry pass's
   //     initialize session, so it adds no handshake for the common case.
   await observeMcpUi(origin, observer)
+
+  // 4d. AI SDK 5 UI-message-stream readiness (ax-rx1): when the card declares an
+  //     `interfaces.uiMessageStream` face, GET its SSE endpoint (and any JSON
+  //     twin) so the ui-stream-* judges can grade header/framing/part-shape/
+  //     secret-hygiene/projection-parity. Zero-overhead for non-streaming
+  //     targets (no interface ⇒ no probe). Same SSRF posture as every other
+  //     card-derived probe (see observeUiStream).
+  await observeUiStream(origin, observer)
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
