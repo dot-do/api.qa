@@ -77,8 +77,13 @@ export interface DataDrivenReport {
 export type DatasetFormat = 'csv' | 'json'
 
 export interface ParseDatasetOpts {
-  /** Force a format. When omitted, JSON is detected by a leading `[`/`{` (after
-   * whitespace); anything else is parsed as CSV. */
+  /** Force a format. When omitted, auto-detect: JSON.parse is TRIED first; if
+   * the text isn't valid JSON syntax, it falls back to CSV. (A CSV whose
+   * header happens to start with `[`/`{`, e.g. `[region],seed`, is therefore
+   * not misclassified as JSON — it simply fails JSON.parse and falls through
+   * to the CSV parser instead of being rejected with a confusing JSON syntax
+   * error.) If BOTH attempts fail, the error mentions both and suggests
+   * passing --format explicitly. */
   format?: DatasetFormat
 }
 
@@ -94,8 +99,37 @@ export interface ParseDatasetOpts {
  *   done; author a JSON dataset when a field must bind as a number/boolean.
  */
 export function parseDataset(text: string, opts: ParseDatasetOpts = {}): DatasetRow[] {
-  const format = opts.format ?? (/^\s*[[{]/.test(text) ? 'json' : 'csv')
-  return format === 'json' ? parseJsonDataset(text) : parseCsvDataset(text)
+  if (opts.format === 'json') return parseJsonDataset(text)
+  if (opts.format === 'csv') return parseCsvDataset(text)
+
+  // Auto-detect (no explicit --format): TRY JSON.parse first — cheap and
+  // exact, unlike sniffing the first non-whitespace char — and only FALL BACK
+  // to CSV when the text isn't valid JSON syntax at all. This matters because
+  // a CSV whose first header cell happens to start with `[`/`{` (e.g.
+  // `[region],seed`) is not valid JSON syntax either, so it now falls through
+  // to the CSV parser instead of being misclassified and rejected with a
+  // confusing JSON syntax error. If the text IS valid JSON syntax but the
+  // wrong SHAPE (not an array of row objects), that's surfaced directly as a
+  // real authoring error — it does not silently fall back to CSV.
+  let jsonDoc: unknown
+  let jsonSyntaxError: unknown
+  try {
+    jsonDoc = JSON.parse(text)
+  } catch (err) {
+    jsonSyntaxError = err
+  }
+  if (jsonSyntaxError === undefined) return jsonDocToRows(jsonDoc)
+
+  try {
+    return parseCsvDataset(text)
+  } catch (csvErr) {
+    const jsonMsg = jsonSyntaxError instanceof Error ? jsonSyntaxError.message : String(jsonSyntaxError)
+    const csvMsg = csvErr instanceof Error ? csvErr.message : String(csvErr)
+    throw new Error(
+      `could not auto-detect dataset format — tried JSON (${jsonMsg}) and CSV (${csvMsg}). ` +
+        'Pass --format json or --format csv to force one.',
+    )
+  }
 }
 
 function parseJsonDataset(text: string): DatasetRow[] {
@@ -105,6 +139,10 @@ function parseJsonDataset(text: string): DatasetRow[] {
   } catch (err) {
     throw new Error(`dataset is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
   }
+  return jsonDocToRows(doc)
+}
+
+function jsonDocToRows(doc: unknown): DatasetRow[] {
   if (!Array.isArray(doc)) {
     throw new Error('JSON dataset must be an ARRAY of row objects (Newman --iteration-data shape)')
   }
@@ -119,8 +157,11 @@ function parseJsonDataset(text: string): DatasetRow[] {
 /**
  * RFC 4180-minimal CSV parser: a small correct state machine (not a regex).
  * Handles quoted fields containing commas, LF/CRLF newlines, and doubled
- * quotes (`""` → a literal `"`). A trailing blank line is ignored. Every data
- * record must have the same field count as the header.
+ * quotes (`""` → a literal `"`). A `"` mid-field (the field already has
+ * chars) is a literal character, not a quote-open — only a `"` at the START
+ * of a field opens RFC-4180 quoting. A wholly blank line (no comma at all)
+ * anywhere between the header and EOF is skipped, not rejected as ragged.
+ * Every other data record must have the same field count as the header.
  */
 function parseCsvDataset(text: string): DatasetRow[] {
   const records = parseCsvRecords(text)
@@ -135,6 +176,12 @@ function parseCsvDataset(text: string): DatasetRow[] {
   const rows: DatasetRow[] = []
   for (let r = 1; r < records.length; r++) {
     const rec = records[r]!
+    // A wholly blank line — a single zero-length, UNQUOTED field, i.e. no
+    // comma on the line at all — is common trailing/interstitial noise from
+    // CSV producers (Newman tolerates it too). Skip it rather than rejecting
+    // the whole run as "ragged". A genuinely empty CELL in a real row still
+    // has >1 field (e.g. `,,` for a 3-column header) and is NOT skipped.
+    if (rec.length === 1 && rec[0] === '') continue
     if (rec.length !== header.length) {
       throw new Error(
         `CSV data row ${r} has ${rec.length} field(s), expected ${header.length} to match the header`,
@@ -184,7 +231,21 @@ function parseCsvRecords(text: string): string[][] {
       continue
     }
     if (ch === '"') {
-      inQuotes = true
+      // A `"` only opens RFC-4180 quoting at the START of a field (the field
+      // is still empty). A `"` that shows up MID-FIELD (the field already has
+      // chars, e.g. `6"x8"panel`) is not a delimiter's business — treat it as
+      // a literal character, preserved verbatim. This is deliberately lenient
+      // (Newman/real-world-CSV compatible): the alternative is either
+      // silently stripping the quote from the value (corrupting the data the
+      // author is testing with, with zero signal) or throwing a misleading
+      // "unterminated quoted field" error when the bare-quote count is odd.
+      if (field.length === 0) {
+        inQuotes = true
+        sawAny = true
+        i++
+        continue
+      }
+      field += ch
       sawAny = true
       i++
       continue

@@ -92,6 +92,34 @@ describe('parseDataset — CSV (RFC 4180 minimal)', () => {
   it('rejects an unterminated quoted field', () => {
     expect(() => parseDataset('a\n"oops\n', { format: 'csv' })).toThrow(/unterminated/)
   })
+
+  it('preserves a BARE (mid-field) quote verbatim instead of silently stripping it', () => {
+    // `"` only opens RFC-4180 quoting at the START of a field. Mid-field it's
+    // a literal char — an unquoted cell like `6"x8"panel` must NOT be
+    // silently corrupted into `6x8panel` (zero signal to the author).
+    expect(parseDataset('a\na"b"c\n', { format: 'csv' })).toEqual([{ a: 'a"b"c' }])
+    expect(parseDataset('a\n6"x8"panel\n', { format: 'csv' })).toEqual([{ a: '6"x8"panel' }])
+  })
+
+  it('still parses a properly-escaped quoted field and an embedded-comma quoted field correctly', () => {
+    // Proper RFC-4180 quoting (a field that STARTS with `"`) keeps working:
+    // `""` is an escaped quote, and the closing `"` ends the field.
+    expect(parseDataset('a\n"p""wd"\n', { format: 'csv' })).toEqual([{ a: 'p"wd' }])
+    expect(parseDataset('a\n"a,b"\n', { format: 'csv' })).toEqual([{ a: 'a,b' }])
+  })
+
+  it('skips a wholly blank line between the header and EOF, but not genuine empty fields', () => {
+    expect(parseDataset('a,b\n1,2\n\n3,4', { format: 'csv' })).toEqual([
+      { a: '1', b: '2' },
+      { a: '3', b: '4' },
+    ])
+    // A genuinely empty CELL (a real `,` on the line) is NOT a blank line and
+    // is NOT skipped.
+    expect(parseDataset('a,b\n,\n1,2\n', { format: 'csv' })).toEqual([
+      { a: '', b: '' },
+      { a: '1', b: '2' },
+    ])
+  })
 })
 
 describe('parseDataset — JSON + auto-detect', () => {
@@ -109,6 +137,19 @@ describe('parseDataset — JSON + auto-detect', () => {
   it('rejects a non-array JSON dataset and non-object rows', () => {
     expect(() => parseDataset('{"x":1}', { format: 'json' })).toThrow(/ARRAY/)
     expect(() => parseDataset('[1,2]', { format: 'json' })).toThrow(/must be an object/)
+  })
+
+  it('auto-detects a CSV whose header starts with `[` or `{` as CSV (not misclassified as JSON)', () => {
+    // `[region]` etc is not valid JSON syntax, so auto-detect's JSON.parse
+    // attempt fails and it falls back to CSV instead of surfacing a confusing
+    // JSON syntax error.
+    expect(parseDataset('[region],seed\nwest,1\n')).toEqual([{ '[region]': 'west', seed: '1' }])
+  })
+
+  it('surfaces a combined JSON+CSV error when auto-detect cannot parse either way', () => {
+    // Genuinely invalid as both: unbalanced quote breaks CSV, and it is not
+    // valid JSON syntax either.
+    expect(() => parseDataset('a\n"oops\n')).toThrow(/JSON.*CSV|CSV.*JSON/s)
   })
 })
 
