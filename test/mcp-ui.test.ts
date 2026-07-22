@@ -428,6 +428,20 @@ const SRCDOC_STYLE_ATTR_PROTO_REL = `<!doctype html><html><body><div style="back
 const SRCDOC_STYLE_ATTR_IMPORT = `<!doctype html><html><body><div style="@import url('https://evil.example/x.css')">x</div></body></html>`
 // A benign inline style — color/padding/local only, NO remote url — stays self-contained.
 const SRCDOC_STYLE_ATTR_BENIGN = `<!doctype html><html><body><div style="color:#333;padding:4px;background:url(#localgrad)">ok</div></body></html>`
+// OBFUSCATED remote url() (ax-oo9): the raw bytes are NOT `https://`, but the
+// browser HTML-entity-decodes (`&#x68;` → h) / CSS-unescapes (`\68` → h) the
+// target before it fetches, so each resolves to url(https://evil…) and pulls
+// off-origin. A raw-string remote test misses them; the decode-then-test does
+// not. Covered in BOTH a <style> tag body AND a style="" attribute.
+const SRCDOC_STYLE_TAG_ENTITY_URL = `<!doctype html><html><head><style>div{background:url(&#x68;ttps://evil.example/bg.png?c=1)}</style></head><body><div>x</div></body></html>`
+const SRCDOC_STYLE_TAG_CSSESC_URL = `<!doctype html><html><head><style>div{background:url(\\68ttps://evil.example/bg.png?c=1)}</style></head><body><div>x</div></body></html>`
+const SRCDOC_STYLE_ATTR_ENTITY_URL = `<!doctype html><html><body><div style="background:url(&#x68;ttps://evil.example/bg.png?c=1)">x</div></body></html>`
+const SRCDOC_STYLE_ATTR_CSSESC_URL = `<!doctype html><html><body><div style="background:url(\\68ttps://evil.example/bg.png?c=1)">x</div></body></html>`
+// A url() whose remote-looking target is prefixed by a CSS /*comment*/ — this
+// survives as bytes but is INERT: an unquoted url-token treats `/*..*/`
+// LITERALLY, so the browser reads it as a same-origin relative path and never
+// fetches evil.example. It must NOT be flagged (that would be a false-positive).
+const SRCDOC_STYLE_ATTR_COMMENT_REL = `<!doctype html><html><body><div style="background:url(/*x*/https://evil.example/bg.png)">ok</div></body></html>`
 // A <meta http-equiv="refresh"> to a remote origin — a redirect load (already caught).
 const SRCDOC_META_REFRESH = `<!doctype html><html><head><meta http-equiv="refresh" content="0;url=https://evil.example/go"></head><body>x</body></html>`
 
@@ -463,6 +477,10 @@ describe('self-containment REQUIRES a closed CSP and catches the exfil surface',
     ['remote url() in a style="" attribute', SRCDOC_STYLE_ATTR_URL],
     ['protocol-relative url() in a style="" attribute', SRCDOC_STYLE_ATTR_PROTO_REL],
     ['@import in a style="" attribute', SRCDOC_STYLE_ATTR_IMPORT],
+    ['entity-obfuscated url() in a <style> tag', SRCDOC_STYLE_TAG_ENTITY_URL],
+    ['CSS-escape-obfuscated url() in a <style> tag', SRCDOC_STYLE_TAG_CSSESC_URL],
+    ['entity-obfuscated url() in a style="" attribute', SRCDOC_STYLE_ATTR_ENTITY_URL],
+    ['CSS-escape-obfuscated url() in a style="" attribute', SRCDOC_STYLE_ATTR_CSSESC_URL],
     ['<meta http-equiv=refresh url=https://…>', SRCDOC_META_REFRESH],
   ]
   for (const [label, srcdoc] of exfilCases) {
@@ -481,6 +499,11 @@ describe('self-containment REQUIRES a closed CSP and catches the exfil surface',
 
   it('a benign inline style="" (color/padding/local, NO remote url) stays self-contained → PASSES (no over-block)', async () => {
     const { checks } = await judge({ resourceRead: defaultResourceRead({ text: SRCDOC_STYLE_ATTR_BENIGN }) })
+    expect(verdictOf(checks, 'mcp-ui-self-contained'), detailOf(checks, 'mcp-ui-self-contained')).toBe('pass')
+  })
+
+  it('a url(/*comment*/https://…) — inert same-origin path, not a real remote load — is NOT flagged → PASSES (no false-positive)', async () => {
+    const { checks } = await judge({ resourceRead: defaultResourceRead({ text: SRCDOC_STYLE_ATTR_COMMENT_REL }) })
     expect(verdictOf(checks, 'mcp-ui-self-contained'), detailOf(checks, 'mcp-ui-self-contained')).toBe('pass')
   })
 })

@@ -1384,6 +1384,47 @@ function isRemoteRef(raw: string): boolean {
   return /^(?:https?:)?\/\//i.test(s) || /^wss?:\/\//i.test(s)
 }
 
+/** A small named-entity set covering the chars needed to smuggle a URL scheme
+ * (`https://`) past a raw-string remote test. Enough for `&colon;`/`&sol;`
+ * style obfuscation; unknown names are left intact. */
+const NAMED_ENTITIES: Record<string, string> = {
+  colon: ':', sol: '/', period: '.', quest: '?', num: '#', commat: '@',
+  lpar: '(', rpar: ')', percnt: '%', amp: '&', equals: '=', lowbar: '_',
+  hyphen: '-', Tab: '\t', NewLine: '\n', nbsp: '\u00a0',
+}
+/** codePoint → char, dropping out-of-range / NUL code points to '' (a NUL in a
+ * CSS escape is spec'd to U+FFFD, but for a remote-ref TEST dropping it is
+ * safe — it never manufactures a `//` that was not there). */
+function safeFromCodePoint(code: number): string {
+  return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : ''
+}
+
+/**
+ * Decode a CSS url()/@import target the way a BROWSER would before it fetches:
+ * HTML-entity-decode (numeric `&#xNN;` / `&#NN;` + a small named set) THEN
+ * CSS-unescape (`\NN` hex, one trailing whitespace swallowed; `\c` literal).
+ * `url(&#x68;ttps://evil)` and `url(\68ttps://evil)` both decode to
+ * `url(https://evil)`, so a remote target hidden behind either encoding trips
+ * the same {@link isRemoteRef} test that sees a plain URL. A CSS-comment
+ * prefix has no escape/entity, so it survives unchanged and stays non-remote
+ * (an unquoted url-token treats a slash-star comment literally — a same-origin
+ * relative path — so flagging it would be a false-positive). Kept BYTE-IDENTICAL with
+ * page.ax's `decodeForRemoteRef` so the emitter that defangs and the grader
+ * that certifies never drift. */
+function decodeForRemoteRef(raw: string): string {
+  let s = raw
+  // (1) HTML entities: &#xHH; hex, &#DD; decimal, and a small named set.
+  s = s
+    .replace(/&#x([0-9a-fA-F]+);?/g, (_m, h) => safeFromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);?/g, (_m, d) => safeFromCodePoint(parseInt(d, 10)))
+    .replace(/&([a-zA-Z][a-zA-Z0-9]*);?/g, (m, name) => NAMED_ENTITIES[name] ?? m)
+  // (2) CSS escapes: \HH..(1-6 hex, one trailing whitespace swallowed) or \c.
+  s = s.replace(/\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|([^\n\r\f0-9a-fA-F]))/g, (_m, hex, ch) =>
+    hex !== undefined ? safeFromCodePoint(parseInt(hex, 16)) : ch,
+  )
+  return s
+}
+
 /** Attributes that trigger an AUTOMATIC network load on ANY element. */
 const LOADING_ATTRS = ['src', 'srcset', 'data', 'poster', 'formaction', 'action', 'background', 'ping', 'xlink:href']
 /** `href` is a network load only on these elements (a plain <a href> is navigation). */
@@ -1405,12 +1446,19 @@ function parseAttrs(tagBody: string): Record<string, string> {
   return attrs
 }
 
-/** Remote refs in a `<style>`/`@import`/`url(...)` CSS body. */
+/**
+ * Remote refs in a `<style>`/`@import`/`url(...)` CSS body. The target is
+ * captured RAW (not required to already start with `//`), then decoded the way
+ * the browser would ({@link decodeForRemoteRef}) BEFORE the remote test — so an
+ * HTML-entity (`url(&#x68;ttps://…)`) or CSS-escape (`url(\68ttps://…)`) hidden
+ * scheme is caught, while a CSS-comment-prefixed url (inert same-origin path)
+ * and benign local urls decode to nothing remote and are left alone.
+ */
 function cssRemoteRefs(css: string): string[] {
   const out: string[] = []
-  const re = /(?:@import\s+(?:url\()?|url\(\s*)["']?((?:https?:)?\/\/[^"')\s]+)/gi
+  const re = /(?:@import\s+(?:url\()?|url\(\s*)["']?([^"')\s]+)/gi
   let m: RegExpExecArray | null
-  while ((m = re.exec(css))) if (m[1] && isRemoteRef(m[1])) out.push(m[1])
+  while ((m = re.exec(css))) if (m[1] && isRemoteRef(decodeForRemoteRef(m[1]))) out.push(m[1])
   return out
 }
 
