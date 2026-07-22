@@ -96,6 +96,21 @@ export function parsePinnedSpec(text: string): PinnedSpec {
  */
 export function validateRequirements(requirements: PinnedRequirement[]): void {
   const doc = { requirements }
+  // VACUOUS-PASS GUARD. `passed: results.every(r => r.verdict === 'pass')` is
+  // `true` for an EMPTY array — an all() over nothing is vacuously true. A
+  // PinnedSpec (or Suite) with zero requirements would therefore ALWAYS report
+  // `passed: true` regardless of what the target does, including a totally
+  // broken worker: `expect(anyWorker).toConform({spec: emptySpec})` would pass
+  // every time. That is the exact class of silent-faked-success this verifier
+  // exists to catch, so refuse it categorically, LOUDLY, at parse — before any
+  // probe fires — rather than let an empty spec verify nothing while looking
+  // like a green report.
+  if (doc.requirements.length === 0) {
+    throw new Error(
+      'a PinnedSpec with no requirements verifies nothing; refusing to vacuously pass. ' +
+        'Add at least one requirement (or delete this spec/suite rather than pin an empty one).',
+    )
+  }
   // Every requirement id MUST be a UNIQUE, NON-EMPTY STRING. The role key
   // (`pinned:<id>`) is what observe records evidence under and what the judge
   // looks up by `find(role === 'pinned:<id>')` (FIRST match). A PinnedSpec is

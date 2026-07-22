@@ -924,6 +924,21 @@ describe('endpoint capture + chaining', () => {
     expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
   })
 
+  // Vacuous-pass guard: `results.every(...)` over an EMPTY array is `true`, so
+  // a PinnedSpec with zero requirements must be rejected at parse — otherwise
+  // it would ALWAYS report passed:true, even against a totally broken target,
+  // which is exactly the silent-faked-success class this verifier exists to
+  // prevent.
+  it('rejects a PinnedSpec with an EMPTY requirements array (refuses to vacuously pass)', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([])
+    await expect(
+      verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' }),
+    ).rejects.toThrow(/no requirements verifies nothing.*refusing to vacuously pass/is)
+    // Rejected BEFORE any probe fires — never a silent green.
+    expect(fetched.length).toBe(0)
+  })
+
   it('a spec with DUPLICATE requirement ids is rejected up front with a naming error', async () => {
     const { fetcher, fetched } = crudFetcher()
     const spec = probeSpec([

@@ -5,6 +5,9 @@
  *   npx autonomous-qa <domain|url>                       grade a target (advisory, unsigned)
  *   npx autonomous-qa verify <target> --spec <file>      pinned-spec mode (the hill-climb gate)
  *       [--expect-digest <sha256>] [--seed <n>] [--json]
+ *   npx autonomous-qa dev <entry.js|localhost-url>       grade a surface PRE-DEPLOY, in-process
+ *       [--spec <file>] [--expect-digest <sha256>] [--json]   (Worker entry mounted in memory,
+ *                                                              or a running local dev server by URL)
  *   npx autonomous-qa suite <file> --env <name>          reusable suite/collection mode
  *       [--iteration-data <dataset>] [--target <t>] [--expect-digest <sha256>]
  *   npx autonomous-qa spec-digest <file>                 print the sha256 pin for a spec
@@ -27,8 +30,11 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { verifyTarget, rejudge } from '../src/verify.js'
+import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/local.js'
+import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from '../src/render.js'
@@ -198,6 +204,49 @@ async function main(): Promise<number> {
     return emit(report, suiteMarkdown(report), flags)
   }
 
+  if (cmd === 'dev') {
+    const entry = rest[0]
+    if (!entry) return die('dev needs an entry module path or a localhost URL')
+    const specFile = flags.get('spec')
+    // Mount the surface in-process (a Worker entry module) OR grade a running
+    // dev server by URL. A localhost/private URL is the ONE place `dev` opts
+    // into the private-host allowance — local only, never inferred from a
+    // remote target (the SSRF invariant lives in src/local.ts).
+    //
+    // SSRF: the opt-in MUST be anchored to the PARSED HOSTNAME, never a
+    // substring test over the whole URL string — `isLocalTarget` (cli/
+    // target.ts) is a loose, unanchored `/localhost|127\.0\.0\.1|\[::1\]/`
+    // match used ONLY as a cosmetic delay-throttle heuristic elsewhere in this
+    // file. Reusing it here would let a PUBLIC url that merely embeds that
+    // substring in its path, query, or subdomain (e.g.
+    // `http://127.0.0.1.attacker.com/`, or `http://public.example/?x=localhost`)
+    // flip `allowPrivate` on for a run against a real public origin, disabling
+    // the private-host backstop it was never meant to disable. `isPrivateUrlHost`
+    // instead parses the URL and checks `isPrivateHost` against the HOSTNAME
+    // ONLY (the same function the core SSRF gate in src/http.ts enforces with),
+    // so a public host can never trigger the allowance no matter what its
+    // path/query/subdomain contains.
+    let target: GradeTarget
+    let allowPrivate = false
+    if (isUrl(entry)) {
+      target = entry
+      allowPrivate = isPrivateUrlHost(entry)
+    } else {
+      target = await loadHandler(entry)
+    }
+    const gradeOpts = { seed, delayMs: 0, allowPrivate }
+    if (specFile) {
+      const specText = readFileSync(specFile, 'utf8')
+      const report = await gradePinned(target, specText, {
+        ...gradeOpts,
+        expectedDigest: flags.get('expect-digest'),
+      })
+      return emit(report, pinnedMarkdown(report), flags)
+    }
+    const report = await grade(target, gradeOpts)
+    return emit(report, reportMarkdown(report), flags)
+  }
+
   // Default: grade a target (advisory). exitCodeFor() only fails on grade F,
   // so a bare `autonomous-qa <target>` is silent-green for grades A-D even
   // with failing checks — a footgun if a CI pipeline gates on it. Warn every
@@ -213,8 +262,34 @@ async function main(): Promise<number> {
   return emit(report, reportMarkdown(report), flags)
 }
 
-function isLocalTarget(target: string): boolean {
-  return /localhost|127\.0\.0\.1|\[::1\]/.test(target)
+/**
+ * Import an entry MODULE and resolve its Worker-style handler — a default
+ * export that is a `{ fetch }` object or a bare `(request) => Response`, or a
+ * named `fetch` export (the module namespace itself). Throws a clear,
+ * actionable error when the module exports no usable handler (fall back to
+ * `api.qa dev <localhost-url>` against a running dev server). Kept
+ * dependency-light: a single dynamic `import()`, no bundler, no loader.
+ */
+async function loadHandler(entry: string): Promise<FetchHandler> {
+  const href = pathToFileURL(resolve(process.cwd(), entry)).href
+  let mod: Record<string, unknown>
+  try {
+    mod = (await import(href)) as Record<string, unknown>
+  } catch (err) {
+    throw new Error(
+      `dev: could not import entry "${entry}": ${err instanceof Error ? err.message : String(err)}\n` +
+        '(if the entry cannot be imported in-process, run `api.qa dev <localhost-url>` against a running dev server instead)',
+    )
+  }
+  const candidate = (mod.default ?? mod) as unknown
+  if (typeof candidate === 'function') return candidate as FetchHandler
+  if (candidate && typeof (candidate as { fetch?: unknown }).fetch === 'function') {
+    return candidate as FetchHandler
+  }
+  throw new Error(
+    `dev: entry "${entry}" exports no fetch handler — expected a default export that is a ` +
+      'Worker `{ fetch(request, env, ctx) }` or a bare `(request) => Response`, or a named `fetch` export.',
+  )
 }
 
 function die(message: string): number {
@@ -228,6 +303,9 @@ function usage(): string {
   npx autonomous-qa <domain|url>                      grade a target (advisory, unsigned)
   npx autonomous-qa verify <target> --spec <file>     pinned-spec mode
       [--expect-digest <sha256>] [--seed <n>]
+  npx autonomous-qa dev <entry.js|localhost-url>      grade a surface PRE-DEPLOY, in-process
+      [--spec <file>] [--expect-digest <sha256>]      mount a Worker entry module in memory
+      [--seed <n>] [--json]                           (or grade a running local dev server by URL)
   npx autonomous-qa suite <file> --env <name>         reusable suite/collection mode
       [--iteration-data <dataset.csv|.json>]          run once per dataset row (data-driven)
       [--target <target>] [--expect-digest <sha256>] [--seed <n>]
