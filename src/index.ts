@@ -32,7 +32,18 @@ export {
   exportPrivateKey,
   reportBody,
 } from './attest.js'
-export { reportMarkdown, reportHtml, pinnedMarkdown, suiteMarkdown } from './render.js'
+export { reportMarkdown, reportHtml, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from './render.js'
+export {
+  parseDataset,
+  verifySuiteDataDriven,
+  type DatasetRow,
+  type DatasetFormat,
+  type ParseDatasetOpts,
+  type MatrixCell,
+  type IterationResult,
+  type DataDrivenReport,
+  type VerifySuiteDataDrivenOpts,
+} from './dataset.js'
 export { Observer, normalizeTarget, type Fetcher, type ObserverOpts } from './http.js'
 export { canonicalJson, sha256Hex, seededRandom, sampleSeeded } from './digest.js'
 export { validateSchema, readPath } from './schema.js'

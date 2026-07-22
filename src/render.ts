@@ -6,6 +6,7 @@
 
 import type { VerificationReport } from './types.js'
 import type { PinnedReport, SuiteReport } from './pinned.js'
+import type { DataDrivenReport } from './dataset.js'
 
 const MARK: Record<string, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip' }
 
@@ -82,6 +83,33 @@ export function suiteMarkdown(r: SuiteReport): string {
     '',
   ]
   return lines.join('\n')
+}
+
+const CELL: Record<string, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip', error: 'ERR!' }
+
+/**
+ * Data-driven run: a per-iteration × per-probe pass/fail MATRIX plus an OVERALL
+ * verdict. One row per dataset iteration, one column per suite probe.
+ */
+export function dataDrivenMarkdown(r: DataDrivenReport): string {
+  const header = ['iter', ...r.probeIds.map((id) => `\`${id}\``), 'row verdict']
+  const sep = header.map(() => '---')
+  const rows = r.iterations.map((it) => {
+    const cells = r.probeIds.map((id) => CELL[it.verdicts[id] ?? 'error'] ?? '?')
+    const verdict = it.error ? `FAIL (refused: ${it.error.replace(/\|/g, '\\|')})` : it.passed ? 'PASS' : 'FAIL'
+    return `| ${it.index} | ${cells.join(' | ')} | ${verdict} |`
+  })
+  return [
+    `# api.qa data-driven suite report — ${r.suite.name}@${r.suite.version}`,
+    '',
+    `> **${r.passed ? 'PASSED' : 'FAILED'}** · ${r.passedCount}/${r.total} iterations passed · environment \`${r.suite.environment}\``,
+    `> suite digest \`${r.suite.digest}\` · ${r.mode} mode · NOT attested (advisory)`,
+    '',
+    `| ${header.join(' | ')} |`,
+    `| ${sep.join(' | ')} |`,
+    ...rows,
+    '',
+  ].join('\n')
 }
 
 export function reportHtml(r: VerificationReport): string {
