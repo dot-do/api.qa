@@ -64,6 +64,27 @@ npx autonomous-qa verify http://localhost:8787 \
 If the spec text doesn't hash to the pin, nothing runs. Acceptance =
 `passed: true` from the *deployed* verifier; local runs never sign.
 
+## CI gate (Newman parity)
+
+A pinned reusable suite gates a pipeline the way Newman does: **non-zero exit on
+any failure** plus machine-readable **JUnit XML + JSON** reports. A gate that
+exits `0` on a failure is a silent green — so `verify` / `suite` /
+`suite --iteration-data` all exit non-zero when any requirement, probe, or
+iteration fails (or the digest pin mismatches, or the target is
+unreachable/refused), and exit `0` only when everything passed.
+
+```sh
+npx autonomous-qa suite examples/golden-scenario.suite.json --env prod \
+  --target https://your.api --expect-digest <pin> \
+  --reporter cli \
+  --reporter junit --reporter-junit-out reports/api-qa.junit.xml \
+  --reporter json  --reporter-json-out  reports/api-qa.json
+```
+
+A working GitHub Action is at
+[`.github/workflows/api-qa-example.yml`](./.github/workflows/api-qa-example.yml);
+full recipe (GitHub + GitLab) in [docs/ci.md](./docs/ci.md).
+
 ## Development
 
 ```sh

@@ -1,0 +1,67 @@
+name: api.qa gate (example)
+
+# Gate a pipeline on a PINNED reusable suite, the way you would gate on Newman.
+#
+# WHAT MAKES THIS A GATE (not a rubber stamp):
+#   - `npx autonomous-qa suite ... --expect-digest <pin>` refuses to run unless
+#     the suite text hashes to the ratified pin, then exits NON-ZERO if ANY probe
+#     (or, with --iteration-data, ANY iteration) fails or the target is
+#     unreachable/refused. The job step inherits that exit code, so a regression
+#     turns the check RED. Exit 0 only when everything passed.
+#   - The JUnit + JSON reports are uploaded as artifacts on every run (pass or
+#     fail) so the failure detail survives even when the gate goes red.
+#
+# Copy this into your OWN repo, then set:
+#   - API_QA_TARGET   the deployed URL to verify (repo/environment variable)
+#   - the suite file + its pinned digest (mint once: `npx autonomous-qa spec-digest <suite>`)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify agent-first contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run the pinned api.qa suite (fails the check on regression)
+        run: |
+          npx --yes autonomous-qa suite examples/golden-scenario.suite.json \
+            --env prod \
+            --target "${API_QA_TARGET}" \
+            --expect-digest "${API_QA_SUITE_DIGEST}" \
+            --reporter cli \
+            --reporter junit --reporter-junit-out reports/api-qa.junit.xml \
+            --reporter json --reporter-json-out reports/api-qa.json
+        env:
+          API_QA_TARGET: ${{ vars.API_QA_TARGET }}
+          API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST }}
+
+      - name: Upload api.qa reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-qa-reports
+          path: reports/
+          if-no-files-found: warn
+
+      - name: Publish JUnit test report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: api.qa results
+          path: reports/api-qa.junit.xml
+          reporter: java-junit
