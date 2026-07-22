@@ -27,7 +27,15 @@
 
   // KV report cache (per-target cooldown + content-addressed replay store).
   // Verdicts are keyed report:{host}:{evidenceDigest} with a head:{host}
-  // pointer; pinned runs are keyed pinned:{host}:{specDigest}. Provision with
+  // pointer; pinned runs are keyed pinned:{host}:{specDigest}. The ax-e6b.29.1
+  // monitor registry (monitor:{id}, runs:{id}, monitors:index) and the
+  // ax-e6b.29.2 TIME-SERIES store (ts:raw:{monitorId}, ts:roll:{monitorId} —
+  // the queryable per-target/per-endpoint uptime/latency/error-rate/grade
+  // history read by GET /monitors/:id/series and GET /series) live in this SAME
+  // namespace under their own key prefixes (no new binding/migration; the
+  // series is derived from the already-SSRF-gated scheduled verify runs — no new
+  // fetch). Optional Env.TS_RAW_CAP / Env.TS_ROLLUP_CAP tune the raw ring +
+  // hourly-rollup retention. Provision with
   //   wrangler kv namespace create REPORTS
   // and paste the id below (the placeholder must be replaced before deploy).
   "kv_namespaces": [

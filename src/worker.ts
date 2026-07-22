@@ -52,6 +52,13 @@ import {
   type MonitorRecord,
   type MonitorRunRecord,
 } from './monitors.js'
+import {
+  TimeseriesStore,
+  ScheduledRunSeriesSource,
+  seriesPointsFromReport,
+  type SeriesSource,
+  type SeriesQueryOpts,
+} from './timeseries.js'
 import { normalizeTarget } from './http.js'
 import type { VerificationReport } from './types.js'
 import {
@@ -99,6 +106,10 @@ export interface Env {
   /** Idle-eviction TTL, in days: a monitor not run/refreshed this long is
    * treated as abandoned (excluded from listing/ticking, evictable). */
   MONITOR_TTL_DAYS?: string
+  /** Time-series raw-point ring cap per series before rollup (bd ax-e6b.29.2). */
+  TS_RAW_CAP?: string
+  /** Time-series hourly rollup-bucket cap before oldest are evicted. */
+  TS_ROLLUP_CAP?: string
 }
 
 /** Summary of one scheduled tick — returned for tests/observability. */
@@ -166,6 +177,12 @@ export function createApp(
     scheduler?: DONamespaceLike
     /** Injected for tests; falls back to env.REPORTS when present. */
     monitors?: MonitorStore
+    /**
+     * Injected for tests; falls back to a TimeseriesStore over env.REPORTS.
+     * The queryable per-target/per-endpoint metric series (bd ax-e6b.29.2)
+     * written on each scheduled run + read by the /series query endpoints.
+     */
+    timeseries?: TimeseriesStore
     /** Override the per-tick monitor cap (else env / default). */
     maxPerTick?: number
     /** Injectable clock so cache TTL / age is deterministic in tests. */
@@ -187,6 +204,26 @@ export function createApp(
     opts.cooldown ?? (env.COOLDOWN ? new DurableObjectCooldown(env.COOLDOWN, minIntervalMs) : undefined)
   const scheduler = opts.scheduler ?? env.MONITOR_SCHEDULER
   const monitors = opts.monitors ?? (env.REPORTS ? new MonitorStore(env.REPORTS) : undefined)
+  // Time-series store (bd ax-e6b.29.2): retains a queryable per-target AND
+  // per-endpoint metric series (uptime/latency/error-rate/grade over time)
+  // written from each scheduled run — the substrate dashboards/trends/alerts
+  // (bd ax-e6b.29.4) read. Bound to the same REPORTS namespace (distinct `ts:`
+  // prefix), MemoryKV in tests.
+  const timeseries =
+    opts.timeseries ??
+    (env.REPORTS
+      ? new TimeseriesStore(env.REPORTS, {
+          ...(env.TS_RAW_CAP ? { rawCap: Number(env.TS_RAW_CAP) } : {}),
+          ...(env.TS_ROLLUP_CAP ? { rollupCap: Number(env.TS_ROLLUP_CAP) } : {}),
+        })
+      : undefined)
+  // The pluggable READ seam (deferred apis.ax-ledger integration — see
+  // timeseries.ts SeriesSource). Today the ONLY source is api.qa's own series
+  // written from scheduled runs; the query endpoints depend on this interface,
+  // never on how the points were produced.
+  const seriesSource: SeriesSource | undefined = timeseries
+    ? new ScheduledRunSeriesSource(timeseries)
+    : undefined
   const maxPerTick =
     opts.maxPerTick ?? (env.MONITOR_MAX_PER_TICK ? Number(env.MONITOR_MAX_PER_TICK) : DEFAULT_MAX_PER_TICK)
   // LOW abuse-surface bound (bd ax-e6b.29.1): POST /monitors has no auth yet
@@ -310,6 +347,16 @@ export function createApp(
           digest: report.discovery.evidenceDigest,
         }
         await monitors.appendRun(run)
+
+        // Time-series (bd ax-e6b.29.2): write a metric sample per target AND
+        // per endpoint from THIS run's already-observed evidence — uptime,
+        // latency, error-rate, grade, freshness — keyed by the monitor id. Pure
+        // derivation over the report the SSRF-gated verify path just produced;
+        // no new fetch. Keyed by monitor id so GET /monitors/:id/series reads it.
+        if (timeseries) {
+          await timeseries.record(claimed.id, seriesPointsFromReport(report, nowMs))
+        }
+
         summary.runs.push(run)
         summary.ran += 1
 
@@ -624,6 +671,51 @@ export function createApp(
           await monitors.register(record)
           return json({ monitor: record }, 201)
         }
+        // Time-series query (bd ax-e6b.29.2): a PURE read over stored scheduled-
+        // run samples — NO re-probe at query time. Returns uptime %, latency
+        // p50/p95/p99, error-rate, and grade history over a window. This is what
+        // the dashboards (bd ax-e6b.29.4) consume.
+        //   GET /monitors/:id/series?endpoint=&window=&from=&to=&breakdown=
+        {
+          const sm = /^\/monitors\/([A-Za-z0-9_.-]+)\/series$/.exec(path)
+          if (sm && request.method === 'GET') {
+            if (!seriesSource) return json({ error: 'no time-series store configured' }, 501)
+            return json({ series: await seriesSource.query(sm[1]!, seriesOptsFromUrl(url, now())) })
+          }
+        }
+        // GET /series?target=&endpoint=&window=&from=&to=&breakdown= — the same
+        // series addressed by TARGET (resolved to its monitor id) rather than id.
+        if (path === '/series' && request.method === 'GET') {
+          if (!seriesSource) return json({ error: 'no time-series store configured' }, 501)
+          const target = url.searchParams.get('target')
+          if (!target) return json({ error: 'query must include "target" (or use /monitors/:id/series)' }, 400)
+          // Same SSRF-consistent normalization the registry uses — a target that
+          // could never be a monitor cannot address a series either.
+          const normalized = normalizeTarget(target, env.ALLOW_PRIVATE_TARGETS === 'true')
+          if ('error' in normalized) return json({ error: normalized.error }, 400)
+          const suiteDigest = url.searchParams.get('suiteDigest') ?? undefined
+          const environmentParam = url.searchParams.get('environment') ?? undefined
+          // The id must match what REGISTRATION stored under, not just the
+          // literal params: registration defaults `environment` to the
+          // suite's first environment when none was given (worker.ts ~628),
+          // so recomputing monitorId with an undefined environment here would
+          // resolve a DIFFERENT id than the write path used, and read back an
+          // empty series though data exists. Resolve by looking up the actual
+          // monitor RECORD (by origin + suiteDigest [+ environment, when
+          // given]) and using its STORED id — the read id always equals the
+          // write id, independent of how registration resolved the default.
+          let id = monitorId(normalized.origin, suiteDigest, environmentParam)
+          if (monitors) {
+            const match = (await monitors.list()).find(
+              (m) =>
+                m.target === normalized.origin &&
+                m.suiteDigest === suiteDigest &&
+                (environmentParam === undefined || m.environment === environmentParam),
+            )
+            if (match) id = match.id
+          }
+          return json({ series: await seriesSource.query(id, seriesOptsFromUrl(url, now())) })
+        }
         {
           const m = /^\/monitors\/([A-Za-z0-9_.-]+)$/.exec(path)
           if (m && request.method === 'DELETE') {
@@ -734,6 +826,54 @@ export class MonitorSchedulerDO {
     const nowMs = nowMsParam !== null && nowMsParam !== '' ? Number(nowMsParam) : undefined
     const summary = await this.getApp().scheduledTick(nowMs)
     return new Response(JSON.stringify(summary), { headers: { 'content-type': 'application/json' } })
+  }
+}
+
+/**
+ * Parse a time-series query's window/filter params off the URL into
+ * SeriesQueryOpts (bd ax-e6b.29.2). `window` is a relative span ending at `now`
+ * (e.g. "1h", "24h", "7d", or a bare ms number); explicit `from`/`to` (ms epoch)
+ * override it. `endpoint` filters to one endpoint; `breakdown=1` adds the
+ * per-endpoint breakdown.
+ */
+function seriesOptsFromUrl(url: URL, nowMs: number): SeriesQueryOpts {
+  const q = url.searchParams
+  const opts: SeriesQueryOpts = { nowMs }
+  const endpoint = q.get('endpoint')
+  if (endpoint) opts.endpoint = endpoint
+  const from = q.get('from')
+  const to = q.get('to')
+  if (to !== null && to !== '' && Number.isFinite(Number(to))) opts.toMs = Number(to)
+  if (from !== null && from !== '' && Number.isFinite(Number(from))) opts.fromMs = Number(from)
+  const windowMs = parseWindowMs(q.get('window'))
+  // A relative window sets fromMs = (toMs|now) - span when no explicit from given.
+  if (opts.fromMs === undefined && windowMs !== undefined) opts.fromMs = (opts.toMs ?? nowMs) - windowMs
+  const breakdown = q.get('breakdown')
+  if (breakdown === '1' || breakdown === 'true') opts.breakdown = true
+  return opts
+}
+
+/** "1h"/"24h"/"7d"/"30m"/"45s" or a bare ms number → ms; undefined if unset/bad. */
+function parseWindowMs(raw: string | null): number | undefined {
+  if (raw === null || raw.trim() === '') return undefined
+  const s = raw.trim()
+  const m = /^(\d+)(ms|s|m|h|d)?$/.exec(s)
+  if (!m) return undefined
+  const n = Number(m[1])
+  switch (m[2]) {
+    case undefined:
+    case 'ms':
+      return n
+    case 's':
+      return n * 1000
+    case 'm':
+      return n * 60_000
+    case 'h':
+      return n * 3_600_000
+    case 'd':
+      return n * 86_400_000
+    default:
+      return undefined
   }
 }
 
