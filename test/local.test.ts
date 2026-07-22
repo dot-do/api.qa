@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { grade, gradePinned } from '../src/local.js'
 import { verifyTarget } from '../src/verify.js'
-import '../src/vitest.js' // registers toConform / toGradeAtLeast
+import { assertConforms, assertGradeAtLeast } from '../src/vitest.js' // also registers toConform / toGradeAtLeast
 import {
   goodTargetRoutes,
   makeFetcher,
@@ -126,6 +126,17 @@ describe('gradePinned() an in-process handler', () => {
     const report = await gradePinned(worker, goldenSpec, { seed: 1 })
     expect(report.passed).toBe(false)
   })
+
+  it('an EMPTY-requirements spec is REJECTED, never a vacuous passed:true for a broken worker', async () => {
+    // `results.every(...)` over [] is vacuously true — an empty PinnedSpec would
+    // otherwise ALWAYS report passed:true, even against a totally broken worker.
+    // gradePinned must refuse it up front instead of silently faking success.
+    const brokenWorker = { fetch: () => new Response('not found', { status: 404 }) }
+    const emptySpec = JSON.stringify({ $type: 'PinnedSpec', name: 'empty', version: '1', requirements: [] })
+    await expect(gradePinned(brokenWorker, emptySpec, { seed: 1 })).rejects.toThrow(
+      /no requirements verifies nothing.*refusing to vacuously pass/is,
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -160,6 +171,19 @@ describe('vitest matcher: toConform / toGradeAtLeast', () => {
     expect(threw).toBe(true)
   })
 
+  it('toConform({spec: emptySpec}) throws instead of vacuously passing a broken worker', async () => {
+    const brokenWorker = { fetch: () => new Response('not found', { status: 404 }) }
+    const emptySpec = JSON.stringify({ $type: 'PinnedSpec', name: 'empty', version: '1', requirements: [] })
+    let error: unknown
+    try {
+      await expect(brokenWorker).toConform({ spec: emptySpec })
+    } catch (e) {
+      error = e
+    }
+    expect(error, 'an empty-requirements spec must throw, never vacuously pass').toBeDefined()
+    expect(String(error)).toMatch(/no requirements verifies nothing.*refusing to vacuously pass/is)
+  })
+
   it('toGradeAtLeast honors the threshold', async () => {
     await expect(makeWorker(goodTargetRoutes(BASE), BASE)).toGradeAtLeast('B')
     let threw = false
@@ -169,6 +193,37 @@ describe('vitest matcher: toConform / toGradeAtLeast', () => {
       threw = true
     }
     expect(threw).toBe(true)
+  })
+})
+
+describe('assertConforms / assertGradeAtLeast — await-only helpers (documented alternative to a forgotten `await`)', () => {
+  it('assertConforms resolves (void) for a conforming worker, throws for a broken one', async () => {
+    await expect(assertConforms(makeWorker(goldenRoutes(BASE), BASE), goldenSpec)).resolves.toBeUndefined()
+    await expect(
+      assertConforms(makeWorker(goodTargetRoutes(BASE), BASE), goldenSpec), // no /golden/run
+    ).rejects.toThrow(/failed/i)
+  })
+
+  it('assertConforms with no spec passes a clean surface and throws on a broken one', async () => {
+    await expect(assertConforms(makeWorker(goodTargetRoutes(BASE), BASE))).resolves.toBeUndefined()
+    await expect(
+      assertConforms({ fetch: () => new Response('nope', { status: 404 }) }),
+    ).rejects.toThrow()
+  })
+
+  it('assertGradeAtLeast honors the threshold', async () => {
+    await expect(assertGradeAtLeast(makeWorker(goodTargetRoutes(BASE), BASE), 'B')).resolves.toBeUndefined()
+    await expect(
+      assertGradeAtLeast({ fetch: () => new Response('nope', { status: 404 }) }, 'B'),
+    ).rejects.toThrow()
+  })
+
+  it('an empty-requirements spec throws through assertConforms too (never a vacuous resolve)', async () => {
+    const brokenWorker = { fetch: () => new Response('not found', { status: 404 }) }
+    const emptySpec = JSON.stringify({ $type: 'PinnedSpec', name: 'empty', version: '1', requirements: [] })
+    await expect(assertConforms(brokenWorker, { spec: emptySpec })).rejects.toThrow(
+      /no requirements verifies nothing.*refusing to vacuously pass/is,
+    )
   })
 })
 

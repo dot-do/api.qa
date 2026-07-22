@@ -34,6 +34,7 @@ import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { verifyTarget, rejudge } from '../src/verify.js'
 import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/local.js'
+import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from '../src/render.js'
@@ -211,11 +212,25 @@ async function main(): Promise<number> {
     // dev server by URL. A localhost/private URL is the ONE place `dev` opts
     // into the private-host allowance — local only, never inferred from a
     // remote target (the SSRF invariant lives in src/local.ts).
+    //
+    // SSRF: the opt-in MUST be anchored to the PARSED HOSTNAME, never a
+    // substring test over the whole URL string — `isLocalTarget` (cli/
+    // target.ts) is a loose, unanchored `/localhost|127\.0\.0\.1|\[::1\]/`
+    // match used ONLY as a cosmetic delay-throttle heuristic elsewhere in this
+    // file. Reusing it here would let a PUBLIC url that merely embeds that
+    // substring in its path, query, or subdomain (e.g.
+    // `http://127.0.0.1.attacker.com/`, or `http://public.example/?x=localhost`)
+    // flip `allowPrivate` on for a run against a real public origin, disabling
+    // the private-host backstop it was never meant to disable. `isPrivateUrlHost`
+    // instead parses the URL and checks `isPrivateHost` against the HOSTNAME
+    // ONLY (the same function the core SSRF gate in src/http.ts enforces with),
+    // so a public host can never trigger the allowance no matter what its
+    // path/query/subdomain contains.
     let target: GradeTarget
     let allowPrivate = false
     if (isUrl(entry)) {
       target = entry
-      allowPrivate = isLocalTarget(entry)
+      allowPrivate = isPrivateUrlHost(entry)
     } else {
       target = await loadHandler(entry)
     }
@@ -245,14 +260,6 @@ async function main(): Promise<number> {
   )
   const report = await verifyTarget(target, { mode: 'local', seed, delayMs: isLocalTarget(target) ? 0 : 150 })
   return emit(report, reportMarkdown(report), flags)
-}
-
-function isLocalTarget(target: string): boolean {
-  return /localhost|127\.0\.0\.1|\[::1\]/.test(target)
-}
-
-function isUrl(s: string): boolean {
-  return /^https?:\/\//i.test(s)
 }
 
 /**

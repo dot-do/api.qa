@@ -13,9 +13,31 @@
  *     await expect(worker).toGradeAtLeast('B')
  *   })
  *
- * Both matchers are ASYNC — `await` the assertion. They dispatch every probe to
- * the handler IN MEMORY (no socket), so the gate the deployed api.qa runs
- * against your PUBLIC origin also runs against your worker pre-deploy.
+ * ⚠️  BOTH MATCHERS ARE ASYNC — YOU MUST `await` THE ASSERTION. ⚠️
+ *
+ *   await expect(worker).toConform(spec)        // correct
+ *   await expect(worker).toGradeAtLeast('B')    // correct
+ *   expect(worker).toConform(spec)              // WRONG — silently ignored!
+ *
+ * `expect(...).toConform(...)` / `.toGradeAtLeast(...)` each return a Promise.
+ * If the test function does not `await` (or `return`) that promise, vitest
+ * moves on immediately: the test is recorded as PASSED before the grading
+ * even finishes, and a LATER rejection (the assertion actually failing) can
+ * surface only as an unhandled-rejection warning — attributed to nothing, or
+ * to the wrong test, and easy to miss in CI output. A forgotten `await` is
+ * therefore a SILENT FALSE-GREEN: a real conformance failure reports as a
+ * passing test. There is no way for the matcher itself to detect a missing
+ * `await` (a synchronous matcher can throw immediately; an async one cannot
+ * force the caller to wait on it) — the safe pattern is on YOU: always
+ * `await` (or `return`) the `expect(...)` call, and prefer the `assertConforms`
+ * / `assertGradeAtLeast` helpers below when you want a shape that makes a
+ * missing `await` obvious (they return `Promise<void>` and are useless
+ * un-awaited, rather than a fluent `expect(...)` chain that reads fine either
+ * way).
+ *
+ * They dispatch every probe to the handler IN MEMORY (no socket), so the gate
+ * the deployed api.qa runs against your PUBLIC origin also runs against your
+ * worker pre-deploy.
  *
  * SSRF: these matchers grade a handler in-memory (`allowPrivate` stays false) or
  * a URL you explicitly pass with `{ allowPrivate: true }` for a local dev
@@ -99,6 +121,44 @@ async function toGradeAtLeast(
         ? `expected target NOT to grade at least ${minimum}, but it graded ${report.grade} (${report.axScore.points}/${report.axScore.max})`
         : `expected target to grade at least ${minimum}, but it graded ${report.grade} (${report.axScore.points}/${report.axScore.max})`,
   }
+}
+
+/**
+ * `await assertConforms(target, spec?, opts?)` — an AWAIT-ONLY alternative to
+ * `expect(target).toConform(spec)` for callers who want the missing-`await`
+ * footgun documented above to be as hard as possible to trip over: this is a
+ * plain async function that resolves to `void` and THROWS on a failing
+ * conformance check (same failure detail as the matcher's message). It has no
+ * other use un-awaited — there is no fluent chain to read past, no `pass`
+ * value to accidentally ignore — so a reviewer (or the "floating promise"
+ * lint many projects already run) has an obvious, single thing to check:
+ * is this call awaited.
+ *
+ *   await assertConforms(worker, spec)   // throws with a detailed message on failure
+ *
+ * Runs the exact same gate as `toConform` (in fact, delegates to it).
+ */
+export async function assertConforms(
+  received: GradeTarget,
+  spec?: ConformSpec,
+  opts: GradePinnedOpts = {},
+): Promise<void> {
+  const result = await toConform(received, spec, opts)
+  if (!result.pass) throw new Error(result.message())
+}
+
+/**
+ * `await assertGradeAtLeast(target, minimum, opts?)` — the `assertConforms`
+ * counterpart for the grade-threshold check. See `assertConforms` for why this
+ * shape exists alongside `expect(target).toGradeAtLeast(minimum)`.
+ */
+export async function assertGradeAtLeast(
+  received: GradeTarget,
+  minimum: Grade,
+  opts: GradeOpts = {},
+): Promise<void> {
+  const result = await toGradeAtLeast(received, minimum, opts)
+  if (!result.pass) throw new Error(result.message())
 }
 
 expect.extend({ toConform, toGradeAtLeast })
