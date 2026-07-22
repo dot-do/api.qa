@@ -46,6 +46,8 @@ import {
   parseIntervalSec,
   monitorId,
   DEFAULT_MAX_PER_TICK,
+  DEFAULT_MAX_MONITORS,
+  DEFAULT_MONITOR_TTL_DAYS,
   type MonitorRecord,
   type MonitorRunRecord,
 } from './monitors.js'
@@ -78,6 +80,13 @@ export interface Env {
   COOLDOWN_MIN_INTERVAL_MS?: string
   /** Max monitors re-run per scheduled tick before carrying the rest over. */
   MONITOR_MAX_PER_TICK?: string
+  /** Cap on ACTIVE (non-expired) registered monitors — bounds the open,
+   * unauthenticated POST /monitors abuse surface (real per-principal auth
+   * awaits bd ax-e6b.30, still 402-blocked). */
+  MAX_MONITORS?: string
+  /** Idle-eviction TTL, in days: a monitor not run/refreshed this long is
+   * treated as abandoned (excluded from listing/ticking, evictable). */
+  MONITOR_TTL_DAYS?: string
 }
 
 /** Summary of one scheduled tick — returned for tests/observability. */
@@ -143,6 +152,13 @@ export function createApp(
   const monitors = opts.monitors ?? (env.REPORTS ? new MonitorStore(env.REPORTS) : undefined)
   const maxPerTick =
     opts.maxPerTick ?? (env.MONITOR_MAX_PER_TICK ? Number(env.MONITOR_MAX_PER_TICK) : DEFAULT_MAX_PER_TICK)
+  // LOW abuse-surface bound (bd ax-e6b.29.1): POST /monitors has no auth yet
+  // (real per-principal quota + registration auth await bd ax-e6b.30, still
+  // 402-blocked). Until then, cap total active registrations and evict idle
+  // ones so an open registry cannot grow without bound.
+  const maxMonitors = env.MAX_MONITORS ? Number(env.MAX_MONITORS) : DEFAULT_MAX_MONITORS
+  const monitorTtlMs =
+    (env.MONITOR_TTL_DAYS ? Number(env.MONITOR_TTL_DAYS) : DEFAULT_MONITOR_TTL_DAYS) * 24 * 60 * 60 * 1000
 
   // Loopback: any verification of api.qa itself dispatches back into this
   // handler — the verifier discovers itself over its own protocols. Hoisted to
@@ -353,7 +369,7 @@ export function createApp(
         // DELETE /monitors/:id                                         → remove
         if (path === '/monitors' && request.method === 'GET') {
           if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
-          return json({ monitors: await monitors.list() })
+          return json({ monitors: await monitors.listActive(now()) })
         }
         if (path === '/monitors' && request.method === 'POST') {
           if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
@@ -400,6 +416,26 @@ export function createApp(
           }
 
           const id = monitorId(normalized.origin, body.suiteDigest, environment)
+
+          // LOW abuse-surface bound: an open (unauthenticated) registry must
+          // not grow without limit. Re-registering an EXISTING (id already
+          // present) monitor is an idempotent refresh, not new growth, so it
+          // never counts against the cap — only a genuinely new id does.
+          const existing = await monitors.get(id)
+          if (!existing) {
+            const active = await monitors.listActive(now())
+            if (active.length >= maxMonitors) {
+              return json(
+                {
+                  error: `monitor registry full (${active.length}/${maxMonitors}) — refusing new registration`,
+                  detail:
+                    'per-principal quota + registration auth await ax-e6b.30 (402-blocked); MAX_MONITORS is a coarse interim cap, env-overridable',
+                },
+                429,
+              )
+            }
+          }
+
           const record: MonitorRecord = {
             id,
             target: normalized.origin,
@@ -410,6 +446,8 @@ export function createApp(
             lastRunAt: null,
             // Due on the first tick after registration (nextDueAt <= now).
             nextDueAt: now(),
+            // Idle-eviction TTL, refreshed on every (re-)registration.
+            expiresAt: now() + monitorTtlMs,
           }
           await monitors.register(record)
           return json({ monitor: record }, 201)
@@ -458,6 +496,13 @@ export function createApp(
       }
       if (!monitors) return summary
 
+      // Idle-eviction housekeeping (LOW abuse-surface bound): reclaim any
+      // monitor that hasn't run/refreshed within its TTL before it can
+      // occupy a MAX_MONITORS slot or be considered for this tick. Real
+      // per-principal quota + registration auth await bd ax-e6b.30
+      // (currently 402-blocked) — this is a coarse interim bound.
+      await monitors.evictExpired(nowMs)
+
       // Due = nextDueAt has passed. Run the MOST-overdue first so a cap does
       // not perpetually starve one monitor (fair carry-over).
       const all = await monitors.list()
@@ -483,8 +528,26 @@ export function createApp(
           }
         }
 
+        // --- Claim this monitor's due slot BEFORE the verify await --------
+        // Cloudflare does NOT guarantee non-overlapping scheduled()
+        // invocations: two overlapping ticks can both have listed this same
+        // pre-advance snapshot above. claimDue() is a best-effort OPTIMISTIC
+        // claim (KV has no native CAS): it skips if another concurrent tick
+        // already advanced this monitor's nextDueAt past the snapshot (i.e.
+        // already claimed/ran it this pass). Advancing nextDueAt HERE, as
+        // part of the claim and before the verify await, means a crash (or
+        // a failed verify) mid-run skips at most one slot rather than
+        // double-running it — a genuinely due monitor still advances even
+        // when verify fails.
+        const claimed = await monitors.claimDue(mon.id, mon.nextDueAt, nowMs + mon.intervalSec * 1000)
+        if (!claimed) {
+          // Lost the race to a concurrent tick (or deleted mid-tick) — not
+          // due for US anymore. Not a skip worth counting; just move on.
+          continue
+        }
+
         // Re-verify through the SAME attested verify path a fetch run uses.
-        const report = await verifyTarget(mon.target, {
+        const report = await verifyTarget(claimed.target, {
           mode: 'remote',
           fetcher: routed,
           delayMs: isSelf ? 0 : externalDelayMs,
@@ -493,13 +556,13 @@ export function createApp(
         })
 
         let suiteVerdict: boolean | undefined
-        if (mon.suiteDigest && cache) {
-          const suiteText = await cache.getSuiteText(mon.suiteDigest)
-          if (suiteText !== null && mon.environment) {
-            const suiteReport = await verifySuite(suiteText, mon.environment, {
+        if (claimed.suiteDigest && cache) {
+          const suiteText = await cache.getSuiteText(claimed.suiteDigest)
+          if (suiteText !== null && claimed.environment) {
+            const suiteReport = await verifySuite(suiteText, claimed.environment, {
               mode: 'remote',
               fetcher: routed,
-              target: mon.target,
+              target: claimed.target,
               delayMs: isSelf ? 0 : externalDelayMs,
               allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
             })
@@ -508,7 +571,7 @@ export function createApp(
         }
 
         const run: MonitorRunRecord = {
-          monitorId: mon.id,
+          monitorId: claimed.id,
           at: nowMs,
           grade: report.grade,
           ...(suiteVerdict !== undefined ? { suiteVerdict } : {}),
@@ -518,10 +581,11 @@ export function createApp(
         summary.runs.push(run)
         summary.ran += 1
 
-        // Advance the schedule only for a monitor that actually ran.
-        mon.lastRunAt = nowMs
-        mon.nextDueAt = nowMs + mon.intervalSec * 1000
-        await monitors.update(mon)
+        // A completed run refreshes lastRunAt + the idle-eviction TTL.
+        // nextDueAt was already advanced at claim time above.
+        claimed.lastRunAt = nowMs
+        claimed.expiresAt = nowMs + monitorTtlMs
+        await monitors.update(claimed)
       }
 
       return summary

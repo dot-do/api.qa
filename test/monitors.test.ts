@@ -85,6 +85,20 @@ describe('parseIntervalSec', () => {
     expect(() => parseIntervalSec('every minute')).toThrow()
     expect(() => parseIntervalSec('0 0 * * *')).toThrow() // not the every-N-min shape
   })
+  it('rejects sub-integer/sub-floor intervals — the MED fix (would otherwise floor to 0 and run every tick)', () => {
+    expect(() => parseIntervalSec(0.5)).toThrow()
+    expect(() => parseIntervalSec(0)).toThrow()
+    expect(() => parseIntervalSec(-1)).toThrow()
+    expect(() => parseIntervalSec(30.7)).toThrow() // non-integer
+    expect(() => parseIntervalSec(30)).toThrow() // integer but below the 60s floor
+    expect(() => parseIntervalSec(NaN)).toThrow()
+    expect(() => parseIntervalSec(Infinity)).toThrow()
+    expect(() => parseIntervalSec('0.5')).toThrow() // string path: not /^\d+$/
+  })
+  it('accepts a valid integer interval at/above the 60s floor', () => {
+    expect(parseIntervalSec(60)).toBe(60)
+    expect(parseIntervalSec(300)).toBe(300)
+  })
 })
 
 describe('monitor registry CRUD', () => {
@@ -147,6 +161,119 @@ describe('registration SSRF gate (the belt)', () => {
     const res = await app.fetch(jsonReq('/monitors', { target: 'apis.directory', suiteDigest: 'deadbeef', interval: 300 }))
     expect(res.status).toBe(404)
     expect(((await res.json()) as { error: string }).error).toMatch(/no stored suite/)
+  })
+})
+
+describe('registration interval floor — sub-1s/fractional/below-floor intervals refused (MED fix)', () => {
+  it.each([0.5, 0, -1, 30.7, 59])('refuses interval %s with 400, registers nothing', async (interval) => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    const res = await app.fetch(jsonReq('/monitors', { target: 'good.example', interval }))
+    expect(res.status).toBe(400)
+    const listed = await app.fetch(req('/monitors'))
+    expect(((await listed.json()) as { monitors: unknown[] }).monitors).toHaveLength(0)
+  })
+
+  it('accepts a valid integer interval at/above the 60s floor with 201', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    const res = await app.fetch(jsonReq('/monitors', { target: 'good.example', interval: 60 }))
+    expect(res.status).toBe(201)
+    const { monitor } = (await res.json()) as { monitor: { intervalSec: number } }
+    expect(monitor.intervalSec).toBe(60)
+  })
+})
+
+describe('MAX_MONITORS cap — bounds the open (unauthenticated) registry (LOW fix)', () => {
+  it('refuses a new registration beyond the cap with 429, but still allows re-registering an existing monitor', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      { MAX_MONITORS: '2' },
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    const a = await app.fetch(jsonReq('/monitors', { target: 'a.example', interval: 300 }))
+    const b = await app.fetch(jsonReq('/monitors', { target: 'b.example', interval: 300 }))
+    expect(a.status).toBe(201)
+    expect(b.status).toBe(201)
+
+    const c = await app.fetch(jsonReq('/monitors', { target: 'c.example', interval: 300 }))
+    expect(c.status).toBe(429)
+    expect(((await c.json()) as { error: string }).error).toMatch(/registry full/)
+
+    // Re-registering an EXISTING (id-stable) monitor is idempotent — it does
+    // not grow the count, so it's allowed even while the cap is at capacity.
+    const again = await app.fetch(jsonReq('/monitors', { target: 'a.example', interval: 600 }))
+    expect(again.status).toBe(201)
+
+    const listed = await app.fetch(req('/monitors'))
+    expect(((await listed.json()) as { monitors: unknown[] }).monitors).toHaveLength(2)
+  })
+})
+
+describe('idle-eviction TTL — an expired monitor is not run/listed (LOW fix)', () => {
+  it('excludes an expired monitor from GET /monitors, skips it on the tick, and evicts it from the store', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    const reg = await app.fetch(jsonReq('/monitors', { target: 'good.example', interval: 300 }))
+    const { monitor } = (await reg.json()) as { monitor: { id: string; expiresAt: number } }
+    expect(monitor.expiresAt).toBeGreaterThan(0) // TTL set at registration
+
+    // Simulate the TTL having elapsed (no run, no re-registration since).
+    const rec = await monitors.get(monitor.id)
+    await monitors.update({ ...rec!, expiresAt: -1 })
+
+    const listed = await app.fetch(req('/monitors'))
+    expect(((await listed.json()) as { monitors: unknown[] }).monitors).toHaveLength(0)
+
+    const summary = await app.scheduledTick(1000)
+    expect(summary.due).toBe(0)
+    expect(summary.ran).toBe(0)
+    expect(await monitors.listRuns(monitor.id)).toHaveLength(0)
+
+    // Evicted from the underlying store entirely by the tick's housekeeping.
+    expect(await monitors.get(monitor.id)).toBeNull()
+  })
+})
+
+describe('scheduled tick concurrency — no double-run under overlapping ticks (MED fix)', () => {
+  it('two overlapping scheduledTick() calls for one due monitor produce exactly ONE run', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    const reg = await app.fetch(jsonReq('/monitors', { target: 'good.example', interval: 300 }))
+    const { monitor } = (await reg.json()) as { monitor: { id: string } }
+
+    // Cloudflare does NOT guarantee non-overlapping scheduled() invocations —
+    // simulate two overlapping ticks racing the same due monitor.
+    const [a, b] = await Promise.all([app.scheduledTick(1000), app.scheduledTick(1000)])
+    expect(a.ran + b.ran).toBe(1) // exactly one of the two actually ran it
+    expect(await monitors.listRuns(monitor.id)).toHaveLength(1)
+
+    const rec = await monitors.get(monitor.id)
+    expect(rec?.nextDueAt).toBe(1000 + 300_000) // advanced exactly once, not twice
+  })
+
+  it('a normal single tick still runs a genuinely-due monitor (no over-correction)', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+    await app.fetch(jsonReq('/monitors', { target: 'good.example', interval: 300 }))
+    const summary = await app.scheduledTick(1000)
+    expect(summary.ran).toBe(1)
+    expect(summary.runs).toHaveLength(1)
   })
 })
 
