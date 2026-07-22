@@ -1221,11 +1221,32 @@ describe('probe-manifest check', () => {
     expect(c.detail).toMatch(/no non-empty "param"/)
   })
 
-  it('fails a card that declares a probe manifest but no monetization.probe (the 402 boundary would go unverified)', async () => {
+  it('fails a METERED card (declares monetization.offers) with no monetization.probe (the 402 boundary would go unverified)', async () => {
     const routes = withProbes(goodTargetRoutes(), {
       keyless: { url: '/api/status' },
       pricing: { url: '/api/status' },
       overCeiling: { url: '/api/widgets', param: 'spend' },
+      knownEmpty: [{ url: '/api/widgets?a=1' }, { url: '/api/widgets?a=2' }],
+      knownForbidden: [{ url: '/api/widgets?b=1' }, { url: '/api/widgets?b=2' }],
+    })
+    const card = JSON.parse(
+      routes['GET /.well-known/agents.json']!({ method: 'GET', accept: 'application/json' }).body!,
+    ) as Record<string, unknown>
+    // Keep the offers (this is a metered card) but drop the probe boundary.
+    card.monetization = { offers: [{ id: 'pro', title: 'Pro tier' }] }
+    const c = await probeManifestCheck(withOverrides(routes, {
+      'GET /.well-known/agents.json': () => ({
+        status: 200, contentType: 'application/json', body: JSON.stringify(card),
+      }),
+    }))
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toMatch(/monetization\.probe/)
+  })
+
+  it('PASSES a free-shaped card (no monetization, no overCeiling) — those are metered-only surfaces (ax-5v1)', async () => {
+    const routes = withProbes(goodTargetRoutes(), {
+      keyless: { url: '/api/status' },
+      pricing: { url: '/api/status' },
       knownEmpty: [{ url: '/api/widgets?a=1' }, { url: '/api/widgets?a=2' }],
       knownForbidden: [{ url: '/api/widgets?b=1' }, { url: '/api/widgets?b=2' }],
     })
@@ -1238,8 +1259,7 @@ describe('probe-manifest check', () => {
         status: 200, contentType: 'application/json', body: JSON.stringify(card),
       }),
     }))
-    expect(c.verdict).toBe('fail')
-    expect(c.detail).toMatch(/monetization\.probe/)
+    expect(c.verdict, c.detail).toBe('pass')
   })
 
   it('fragment-only duplicates do not inflate channel cardinality, and fragment overlap is still overlap', async () => {
@@ -1263,7 +1283,8 @@ describe('probe-manifest check', () => {
     expect(c.verdict).toBe('fail')
     expect(c.detail).toMatch(/probes\.knownEmpty declares 1 distinct/)
     expect(c.detail).toMatch(/probes\.pricing declares 0 distinct/)
-    expect(c.detail).toMatch(/probes\.overCeiling declares 0 distinct/)
     expect(c.detail).toMatch(/probes\.knownForbidden declares 0 distinct/)
+    // overCeiling is metered-only — its absence is NOT a manifest-structure failure.
+    expect(c.detail).not.toMatch(/probes\.overCeiling declares 0 distinct/)
   })
 })

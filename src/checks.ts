@@ -373,11 +373,14 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       result = fail(agentsEv, 'no monetization.offers declared — payment boundaries are dead ends, not offers')
     } else if (agents.offerProbe) {
       const body = parseJsonBody(offerEv) as Record<string, unknown> | undefined
+      // Every 402 body is a typed OFFER outcome (AXP Appendix A.1): a bare 402
+      // is deterministically dispatchable by an agent on `type` alone.
+      const typed = body?.type === 'OFFER'
       const shaped = body && (typeof body.id === 'string' || typeof body.title === 'string') &&
         (Array.isArray(body.alternatives) || body.price !== undefined || typeof body.checkoutUrl === 'string')
-      result = offerEv?.status === 402 && shaped
-        ? pass('declared boundary answered HTTP 402 with a structured offer (id/title + price|checkoutUrl|alternatives)')
-        : { verdict: 'fail', detail: `declared offer probe did not behave: status ${offerEv?.status ?? 'ERR'}, structured offer body ${shaped ? 'present' : 'missing'}` }
+      result = offerEv?.status === 402 && typed && shaped
+        ? pass('declared boundary answered HTTP 402 with a typed OFFER (type:"OFFER" + id/title + price|checkoutUrl|alternatives)')
+        : { verdict: 'fail', detail: `declared offer probe did not behave: status ${offerEv?.status ?? 'ERR'}, type ${JSON.stringify(body?.type)} (want "OFFER"), structured offer body ${shaped ? 'present' : 'missing'}` }
     } else {
       result = pass(`${agents.offers!.length} offer(s) declared in agents.json (declared-only — no monetization.probe URL to verify behaviorally)`)
     }
@@ -528,8 +531,14 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       }
       const dedupe = (a: Array<{ method: string; url: string; param?: string }>) =>
         [...new Map(a.map((p) => [urlKey(p.url), p])).values()]
+      // overCeiling and monetization.probe are metered-only surfaces: a free
+      // API (Clause 5) declares neither. Presence-when-metered is enforced
+      // behaviorally by the pinned metering probes (which fail closed on a
+      // missing overCeiling channel when pricing.model=="metered"); here the
+      // manifest is only validated for STRUCTURE, so whatever IS declared must
+      // be well-formed, but overCeiling is not required to be present.
       const required: Array<[string, number]> = [
-        ['keyless', 1], ['pricing', 1], ['overCeiling', 1], ['knownEmpty', 2], ['knownForbidden', 2],
+        ['keyless', 1], ['pricing', 1], ['knownEmpty', 2], ['knownForbidden', 2],
       ]
       const deduped: Record<string, Array<{ method: string; url: string; param?: string }>> = {}
       for (const [ch, entries] of Object.entries(manifest)) deduped[ch] = dedupe(entries)
@@ -560,11 +569,14 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
           problems.push(`probes.overCeiling ${e.url} carries no non-empty "param" (the spend query-parameter name)`)
         }
       }
-      // A card that invites pinned probing must also declare its 402-offer
-      // boundary (monetization.probe), so the structured-offer obligation is
-      // behaviorally verified — never satisfiable by declaration alone.
-      if (!agents.offerProbe) {
-        problems.push('card declares a probe manifest but no monetization.probe URL — the 402 offer boundary cannot be behaviorally verified')
+      // A METERED card that invites pinned probing must also declare its
+      // 402-offer boundary (monetization.probe), so the structured-offer
+      // obligation is behaviorally verified — never satisfiable by declaration
+      // alone. A free card (monetization absent) need not: it has no boundary.
+      // (The pinned offers-402 requirement is itself metered-gated, so this
+      // only fails a card that declares monetization.offers but no probe.)
+      if ((agents.offers?.length ?? 0) > 0 && !agents.offerProbe) {
+        problems.push('card declares monetization.offers but no monetization.probe URL — the 402 offer boundary cannot be behaviorally verified')
       }
       checks.push(check('probe-manifest', 'card-declared probe manifest is valid', undefined, [ROLE.agentsJson, ROLE.openapi],
         problems.length === 0
