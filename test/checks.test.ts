@@ -33,6 +33,45 @@ describe('checks against the good target', () => {
   })
 })
 
+describe('a keyless remote (HTTP) MCP is not penalized/capped (No-ask Zone, ax-q6o)', () => {
+  const MCP_OAUTH_IDS = [
+    'mcp-oauth-protected-resource',
+    'mcp-oauth-as-metadata',
+    'mcp-pkce',
+    'mcp-oauth-dcr',
+    'mcp-oauth-resource-indicators',
+    'mcp-www-authenticate',
+  ]
+
+  it('keyless HTTP MCP (200 unauth, no OAuth well-knowns) → OAuth checks SKIP, grade stays A+ (no cap)', async () => {
+    // Re-declare the good target's MCP as a REMOTE keyless HTTP endpoint and
+    // answer the unauthenticated probe with a 200 (the server operates without
+    // auth; it publishes NO OAuth well-knowns) — exactly .ax's own keyless-first
+    // HTTP MCP face for the MCP-UI emitter / ChatGPT.
+    const agentsBody = JSON.parse(
+      goodTargetRoutes()['GET /.well-known/agents.json']!({ method: 'GET', accept: '*/*' }).body!,
+    )
+    agentsBody.interfaces.mcp = { transport: 'streamable-http', url: `${GOOD}/mcp`, tools: ['list_widgets'] }
+    const routes = withOverrides(goodTargetRoutes(), {
+      'GET /.well-known/agents.json': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(agentsBody) }),
+      'GET /mcp': () => ({ status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' }),
+    })
+    const { checks, score, grade, notes } = await judge(routes)
+
+    // Every MCP-OAuth sibling SKIPS — none fail.
+    for (const id of MCP_OAUTH_IDS) {
+      expect(verdictOf(checks, id), `${id}: ${checks.find((c) => c.id === id)?.detail}`).toBe('skip')
+    }
+    // AX-6 presence still passes for a remote transport + tools.
+    expect(verdictOf(checks, 'mcp-declared')).toBe('pass')
+    // No honesty check failed → NO cap. The surface reaches A+ on the rest.
+    for (const c of checks) expect(c.verdict, `${c.id}: ${c.detail}`).not.toBe('fail')
+    expect(score.points).toBe(10)
+    expect(grade).toBe('A+')
+    expect(notes.join(' ')).not.toMatch(/capped/)
+  })
+})
+
 describe('each broken surface fails its own check', () => {
   it('missing llms.txt → llms-txt + linkset fail', async () => {
     const { checks } = await judge(withoutRoutes(goodTargetRoutes(), 'GET /llms.txt'))

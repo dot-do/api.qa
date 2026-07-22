@@ -271,13 +271,6 @@ describe('non-conformant MCP targets fail the specific check', () => {
     expect(verdictOf(checks, 'mcp-pkce')).toBe('pass')
   })
 
-  it('unauthenticated MCP without WWW-Authenticate → mcp-www-authenticate fails', async () => {
-    const { checks } = await judge({
-      unauth: { status: 200, contentType: 'application/json', body: '{"ok":true}' },
-    })
-    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
-  })
-
   it('401 without a WWW-Authenticate header → mcp-www-authenticate fails', async () => {
     const { checks } = await judge({
       unauth: { status: 401, contentType: 'application/json', body: '{"error":"unauthorized"}' },
@@ -297,6 +290,60 @@ describe('non-conformant MCP targets fail the specific check', () => {
     })
     expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
     expect(detailOf(checks, 'mcp-www-authenticate')).toMatch(/resource_metadata/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// KEYLESS remote MCP (AXP Clause 7, the No-ask Zone) — every MCP-OAuth check
+// SKIPS exactly like stdio. A keyless-first-value HTTP MCP is a VALID choice
+// (a public read-only tool needs no auth; .ax's own surfaces are keyless-first)
+// and must NOT be penalized/capped for lacking OAuth. The critical invariant:
+// keyless (2xx unauth, no challenge) = skip; protected-but-broken = still fail.
+// ---------------------------------------------------------------------------
+
+describe('keyless remote MCP (No-ask Zone) skips the OAuth checks (not fail, no cap)', () => {
+  const KEYLESS: McpFixtureOpts = {
+    // An unauthenticated initialize/request SUCCEEDS with no auth challenge.
+    unauth: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' },
+    // A genuine keyless server publishes NO OAuth well-knowns.
+    protectedResource: null,
+    asMetadata: null,
+  }
+
+  it('(a) keyless remote MCP (200 unauth, no OAuth well-knowns) → all six checks SKIP, none fail', async () => {
+    const { checks } = await judge(KEYLESS)
+    for (const id of MCP_CHECK_IDS) {
+      expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+    }
+    // The skip is informational and names the No-ask Zone — not a silent skip.
+    expect(detailOf(checks, 'mcp-oauth-protected-resource')).toMatch(/keyless|No-ask Zone/i)
+    // AX-6 presence still passes — a keyless remote MCP is a real, declared MCP.
+    expect(verdictOf(checks, 'mcp-declared')).toBe('pass')
+  })
+
+  it('mcp-www-authenticate SKIPS for a keyless server (it legitimately returns 200, no 401)', async () => {
+    const { checks } = await judge(KEYLESS)
+    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('skip')
+    expect(detailOf(checks, 'mcp-www-authenticate')).toMatch(/keyless|No-ask Zone/i)
+  })
+
+  it('keyless is PROBE-decided: a 200 unauth is keyless even if OAuth well-knowns happen to be served', async () => {
+    // Even with the default well-knowns present, an unauthenticated 200 means the
+    // server operates without auth — keyless is decided by PROBING the endpoint.
+    const { checks } = await judge({ unauth: { status: 200, contentType: 'application/json', body: '{"ok":true}' } })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+  })
+
+  it('INVARIANT: a 401 WITHOUT a WWW-Authenticate is PROTECTED-but-broken, NOT keyless → still FAILS', async () => {
+    // The positive-2xx requirement keeps the invariant: a challenge status (401/
+    // 403) is never read as keyless, so a protected-but-broken server cannot
+    // escape into a skip — it still fails the OAuth conformance it needs.
+    const { checks } = await judge({
+      unauth: { status: 401, contentType: 'application/json', body: '{"error":"unauthorized"}' },
+    })
+    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
+    // The keyless skip did not swallow the failure — protected still applies.
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).not.toBe('skip')
   })
 })
 

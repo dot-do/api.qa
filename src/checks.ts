@@ -203,6 +203,38 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       | Record<string, unknown>
       | undefined
 
+    // ── KEYLESS vs PROTECTED remote MCP (AXP Clause 7, the No-ask Zone) ──────
+    //    keyless-first-value is a VALID, intentional choice: a public read-only
+    //    MCP tool legitimately needs no auth, and .ax's OWN surfaces are
+    //    keyless-first. The unauthenticated MCP probe (ROLE.mcpUnauth — fetched
+    //    ONCE, SSRF-gated, in observeTarget) tells the two apart:
+    //      PROTECTED = the endpoint GATES access — it answers the unauthenticated
+    //                  request with 401/403, OR advertises an auth scheme via a
+    //                  WWW-Authenticate challenge. Every OAuth sibling then
+    //                  APPLIES unchanged; a PROTECTED-but-broken OAuth still
+    //                  FAILS (the key invariant — no false-pass).
+    //      KEYLESS   = the unauthenticated request SUCCEEDS (2xx) with NO auth
+    //                  challenge — the server operates without auth. The OAuth
+    //                  siblings SKIP with an informational verdict, exactly like
+    //                  the stdio case; no fail, no cap.
+    //    Keyless requires a POSITIVE 2xx signal (not merely "not a 401"): a 401
+    //    with no WWW-Authenticate, or an unresolved probe, is NEVER read as
+    //    keyless — it stays PROTECTED(-but-broken) and FAILS the OAuth checks.
+    const unauthStatus = unauthEv?.status ?? null
+    const unauthWww = unauthEv?.headers['www-authenticate']
+    const mcpChallengesAuth =
+      unauthStatus === 401 ||
+      unauthStatus === 403 ||
+      (typeof unauthWww === 'string' && unauthWww.length > 0)
+    const isKeylessMcp =
+      isRemote &&
+      !remoteNoUrl &&
+      !mcpViolation &&
+      !mcpChallengesAuth &&
+      unauthStatus !== null &&
+      unauthStatus >= 200 &&
+      unauthStatus < 300
+
     // Consistent skip/violation gate for every MCP-OAuth sibling check.
     const mcpCheck = (
       id: string,
@@ -225,6 +257,11 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         }
       } else if (mcpViolation) {
         result = { verdict: 'fail', detail: mcpViolation }
+      } else if (isKeylessMcp) {
+        result = {
+          verdict: 'skip',
+          detail: `keyless MCP (No-ask Zone, AXP Clause 7) — the unauthenticated MCP request returned ${unauthStatus} with no auth challenge; OAuth 2.1 is not required for a keyless-first-value surface`,
+        }
       } else {
         result = judge()
       }
