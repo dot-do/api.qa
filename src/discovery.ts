@@ -26,6 +26,15 @@ import type {
 export const ROLE = {
   rootAgent: 'probe:root-as-agent',
   rootBrowser: 'probe:root-as-browser',
+  /**
+   * Root probed with `Accept: application/json` (ax-c7m). Closes a grader
+   * BLIND-SPOT: a surface can silently ignore `Accept: application/json` and
+   * hand an agent a wall of HTML. The content-negotiation check grades DOWN a
+   * root that answers JSON-requesting agents with text/html; a root that has no
+   * JSON representation but still returns agent-actionable non-HTML text
+   * (markdown) is handled as partial credit, not a false-fail.
+   */
+  rootJson: 'probe:root-as-json',
   llmsTxt: 'surface:llms.txt',
   agentsJson: 'surface:agents.json',
   icpJson: 'surface:icp.json',
@@ -707,6 +716,12 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   await observer.observe(ROLE.rootBrowser, `${origin}/`, {
     accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   })
+  // Root probed with a strict `Accept: application/json` (ax-c7m). A fixed,
+  // high-value negotiation probe (like the two root probes above): it lets the
+  // content-negotiation check catch a root that IGNORES application/json and
+  // returns a wall of HTML to an agent that explicitly asked for JSON — a
+  // grader blind-spot surfaced by the ICP trial. Same-origin by construction.
+  await observer.observe(ROLE.rootJson, `${origin}/`, { accept: 'application/json' })
   await observer.observe(ROLE.llmsTxt, `${origin}/llms.txt`, { accept: '*/*' })
   const agentsEv = await observer.observe(ROLE.agentsJson, `${origin}/.well-known/agents.json`, {
     accept: 'application/json',

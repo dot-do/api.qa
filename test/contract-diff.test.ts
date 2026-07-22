@@ -15,6 +15,8 @@ import { Observer } from '../src/http.js'
 import { observeTarget, ROLE } from '../src/discovery.js'
 import { runChecks } from '../src/checks.js'
 import { contractDiff } from '../src/contract.js'
+import { runContractDiff } from '../src/contract-cli.js'
+import { exitCodeFor, jsonReport } from '../src/reporters.js'
 import { axScoreOf, gradeOf } from '../src/grade.js'
 import { verifyPinnedSpec } from '../src/pinned.js'
 import { selfOpenapi, selfAgentsJson, selfIcpJson, selfLlmsTxt, SELF_ORIGIN } from '../src/self.js'
@@ -650,5 +652,66 @@ describe("dogfood — contract-diff against api.qa's own openapi.json shape", ()
     expect(dev?.kind).toBe('const-violation')
     expect(dev?.classification).toBe('breaking')
     expect(diffCheck(checks).verdict).toBe('fail')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ax-gyh — contract-diff as a first-class CLI verb (runContractDiff). The spec
+// is supplied LOCALLY; the live target is fetched through the SSRF-gated
+// Observer. Exit code is NON-ZERO on any breaking op diff, zero on clean; the
+// raw report is a valid ContractDiffReport for the --json reporter.
+// ---------------------------------------------------------------------------
+
+describe('contract-diff CLI verb (ax-gyh)', () => {
+  const spec = JSON.stringify(richOpenapi({
+    type: 'object',
+    required: ['ok', 'widgets'],
+    properties: { ok: { type: 'boolean' }, widgets: { type: 'integer' } },
+  }))
+
+  it('exits ZERO and reports clean on a conformant live target', async () => {
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.$type).toBe('ContractDiffReport')
+    expect(report.breaking).toBe(0)
+    expect(report.operationsProbed).toBeGreaterThan(0)
+    expect(exitCodeFor(report)).toBe(0)
+  })
+
+  it('exits NON-ZERO on a breaking diff (live violates the declared schema)', async () => {
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(withOverrides(goodTargetRoutes(), {
+        // declares {ok:boolean, widgets:integer}; serves a string — breaking.
+        'GET /api/status': () => json({ ok: 'yes', widgets: 3 }),
+      })),
+      delayMs: 0,
+    })
+    expect(report.breaking).toBeGreaterThan(0)
+    expect(exitCodeFor(report)).toBe(1)
+  })
+
+  it('--json emits a valid ContractDiffReport JSON (round-trips)', async () => {
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    const round = JSON.parse(JSON.stringify(report))
+    expect(round.$type).toBe('ContractDiffReport')
+    expect(round.target).toBe(GOOD)
+    expect(Array.isArray(round.perOperation)).toBe(true)
+    expect(typeof round.breaking).toBe('number')
+    // The normalized CI reporters also accept it (same exit-code contract).
+    const model = jsonReport(report)
+    expect(model.verdict).toBe(report.breaking > 0 ? 'FAILED' : 'PASSED')
+  })
+
+  it('never fetches off-origin — a declared spec cannot steer the probe away', async () => {
+    // enumerateOperations only probes the declared same-origin GET paths; the
+    // fetcher throws on any off-origin request (helpers.makeFetcher), so a
+    // successful run proves nothing off-origin was fetched.
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.target).toBe(GOOD)
   })
 })

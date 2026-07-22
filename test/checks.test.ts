@@ -100,3 +100,55 @@ describe('honesty checks cap the grade (the anti-Goodhart teeth)', () => {
     expect(['C', 'D', 'F']).toContain(grade)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ax-c7m — content-negotiation grades application/json (grader blind-spot).
+// A root that IGNORES Accept: application/json and hands an agent a wall of
+// HTML is graded DOWN; a root that answers JSON passes; a root that has no
+// JSON representation but negotiates md/html correctly is NOT false-failed.
+// ---------------------------------------------------------------------------
+
+function detailOf(checks: Awaited<ReturnType<typeof judge>>['checks'], id: string) {
+  return checks.find((c) => c.id === id)?.detail ?? ''
+}
+
+describe('content-negotiation grades Accept: application/json (ax-c7m)', () => {
+  const htmlWall = { status: 200, contentType: 'text/html', body: '<!doctype html><html><body>wall of markup</body></html>' }
+
+  it('root that ignores Accept: application/json (returns HTML) is graded DOWN', async () => {
+    const { checks, score } = await judge(withOverrides(goodTargetRoutes(), {
+      // md/html negotiate correctly, but an agent asking for JSON gets HTML.
+      'GET /': (req: { accept: string }) =>
+        req.accept.includes('text/html')
+          ? htmlWall
+          : req.accept.includes('application/json')
+            ? htmlWall
+            : { status: 200, contentType: 'text/markdown', body: '# good.example\n\n> markdown for agents, long enough to be substantive content here.' },
+    }))
+    expect(verdictOf(checks, 'content-negotiation')).toBe('fail')
+    expect(detailOf(checks, 'content-negotiation')).toMatch(/ignores Accept: application\/json/i)
+    expect(score.points).toBeLessThan(10) // the AX-4 point is withheld
+  })
+
+  it('root that correctly returns JSON for Accept: application/json passes', async () => {
+    const { checks } = await judge(withOverrides(goodTargetRoutes(), {
+      'GET /': (req: { accept: string }) =>
+        req.accept.includes('text/html')
+          ? { status: 200, contentType: 'text/html', body: '<!doctype html><html><body><h1>good</h1></body></html>' }
+          : req.accept.includes('application/json')
+            ? { status: 200, contentType: 'application/json', body: JSON.stringify({ service: 'good.example' }) }
+            : { status: 200, contentType: 'text/markdown', body: '# good.example\n\n> markdown for agents, long enough to be substantive content here.' },
+    }))
+    expect(verdictOf(checks, 'content-negotiation')).toBe('pass')
+    expect(detailOf(checks, 'content-negotiation')).toMatch(/parseable JSON body/i)
+  })
+
+  it('root with NO JSON representation but correct md/html is NOT false-failed (partial credit)', async () => {
+    // The default good target returns markdown (non-HTML) for application/json.
+    const { checks, score, grade } = await judge()
+    expect(verdictOf(checks, 'content-negotiation')).toBe('pass')
+    expect(detailOf(checks, 'content-negotiation')).toMatch(/partial credit/i)
+    expect(score.points).toBe(10)
+    expect(grade).toBe('A+')
+  })
+})
