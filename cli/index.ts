@@ -17,8 +17,8 @@
 
 import { readFileSync } from 'node:fs'
 import { verifyTarget, rejudge } from '../src/verify.js'
-import { verifyPinnedSpec } from '../src/pinned.js'
-import { reportMarkdown, pinnedMarkdown } from '../src/render.js'
+import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
+import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from '../src/render.js'
 import { verifyAttestation } from '../src/attest.js'
 import { sha256Hex } from '../src/digest.js'
 import { runMcpServer } from '../src/mcp.js'
@@ -83,6 +83,23 @@ async function main(): Promise<number> {
     return report.passed ? 0 : 1
   }
 
+  if (cmd === 'suite') {
+    const suiteFile = rest[0] ?? flags.get('suite')
+    const envName = flags.get('env')
+    if (!suiteFile || !envName) return die('suite needs a suite file and --env <name>')
+    const suiteText = readFileSync(suiteFile, 'utf8')
+    const targetFlag = flags.get('target')
+    const report = await verifySuite(suiteText, envName, {
+      mode: 'local',
+      seed,
+      expectedDigest: flags.get('expect-digest'),
+      target: targetFlag,
+      delayMs: targetFlag && isLocalTarget(targetFlag) ? 0 : 150,
+    })
+    console.log(asJson ? JSON.stringify(report, null, 2) : suiteMarkdown(report))
+    return report.passed ? 0 : 1
+  }
+
   // Default: grade a target.
   const target = cmd
   const report = await verifyTarget(target, { mode: 'local', seed, delayMs: isLocalTarget(target) ? 0 : 150 })
@@ -105,7 +122,10 @@ function usage(): string {
   npx autonomous-qa <domain|url>                      grade a target (advisory, unsigned)
   npx autonomous-qa verify <target> --spec <file>     pinned-spec mode
       [--expect-digest <sha256>] [--seed <n>]
-  npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec
+  npx autonomous-qa suite <file> --env <name>         reusable suite/collection mode
+      [--target <target>] [--expect-digest <sha256>] [--seed <n>]
+      (target defaults to the selected environment's baseUrl var)
+  npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite
   npx autonomous-qa rejudge                           re-judge a JSON report from stdin
   npx autonomous-qa mcp                               MCP server (stdio)
   flags: --json (raw report)

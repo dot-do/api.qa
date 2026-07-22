@@ -85,6 +85,44 @@ describe('worker: KV report cache', () => {
     expect(((await hit.json()) as { passed: boolean }).passed).toBe(true)
   })
 
+  it('a different seed on POST /verify re-runs instead of serving the first seed\'s cached (now-stale) report', async () => {
+    const probe = counting(makeFetcher(goodTargetRoutes()))
+    const app = createApp(
+      {},
+      { externalFetcher: probe.fetcher, externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), now: () => 0 },
+    )
+    const spec = {
+      $type: 'PinnedSpec', name: 'mini', version: '1',
+      requirements: [{ id: 'status-ok', kind: 'endpoint', method: 'GET', path: '/api/status', expect: { status: 200 } }],
+    }
+    const post = (seed: number) =>
+      app.fetch(req('/verify', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ target: GOOD, spec, seed }),
+      }))
+
+    const first = await post(1)
+    expect(first.headers.get('x-cache')).toBe('MISS')
+    const firstReport = (await first.json()) as { seed: number }
+    expect(firstReport.seed).toBe(1)
+    const afterFirst = probe.count()
+
+    // Same target/spec digest, a DIFFERENT requested seed: must re-run (never
+    // serve the seed=1 report — that would misreport the run's own seed).
+    const second = await post(2)
+    expect(second.headers.get('x-cache')).toBe('MISS')
+    expect(probe.count()).toBeGreaterThan(afterFirst) // actually re-probed
+    const secondReport = (await second.json()) as { seed: number }
+    expect(secondReport.seed).toBe(2) // truthfully reports the seed it ran under
+
+    // The ORIGINAL seed is still served from cache, unaffected.
+    const afterSecond = probe.count()
+    const replay = await post(1)
+    expect(replay.headers.get('x-cache')).toBe('HIT')
+    expect(probe.count()).toBe(afterSecond)
+    expect(((await replay.json()) as { seed: number }).seed).toBe(1)
+  })
+
   it('a wrong expectedDigest still 400s even with a cached pass present', async () => {
     const cache = new ReportCache(new MemoryKV(), 300)
     const app = createApp(

@@ -293,3 +293,42 @@ export interface PinnedSpec {
   version: string
   requirements: PinnedRequirement[]
 }
+
+// ---------------------------------------------------------------------------
+// Reusable test-suite / collection format (Postman collections + environments)
+// ---------------------------------------------------------------------------
+
+/**
+ * A named ENVIRONMENT: a bag of author-supplied variables (base URL, tokens,
+ * resource ids) that seed the capture scope BEFORE the first probe. Selecting a
+ * different environment points the SAME suite at a different target/tokens/ids.
+ * This is Postman's environment/variable concept, minus the mutable-runtime
+ * globals — a suite run is deterministic in (suite text, selected environment).
+ */
+export interface SuiteEnvironment {
+  /** `varName -> value`. A value keeps its JSON type: a number seeds a number
+   * (typed whole-value interpolation preserves it), a string seeds a string. */
+  vars: Record<string, unknown>
+}
+
+/**
+ * A reusable test-suite / collection: an ordered list of probes (the SAME
+ * `PinnedRequirement` shape a PinnedSpec uses — assertions, capture, `{{var}}`
+ * chaining, all reused, not forked) plus a set of NAMED environments. A Suite is
+ * a PinnedSpec parameterized by an environment: the selected environment's vars
+ * pre-seed the binding scope so `{{baseUrl}}`, `{{token}}`, `{{seedId}}`
+ * interpolate into paths/headers/bodies via the one interpolation engine.
+ *
+ * Content-addressed exactly like a PinnedSpec: the suite TEXT hashes to a digest
+ * and `expectedDigest` gates BEFORE any probe runs. The environments live INSIDE
+ * the suite text, so switching environments does not change the pin — the same
+ * ratified suite is what runs against staging AND prod.
+ */
+export interface Suite {
+  $type: 'Suite'
+  name: string
+  version: string
+  /** Named environments; run selects one by name. */
+  environments: Record<string, SuiteEnvironment>
+  requirements: PinnedRequirement[]
+}

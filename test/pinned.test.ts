@@ -311,6 +311,49 @@ describe('kind:probe — card-declared probe requirements', () => {
     expect(report.requirements.find((r) => r.id === 'typed-empty')?.detail).toMatch(/path type/)
   })
 
+  it('a probe requirement interpolates {{var}} in its expect (env-seeded), resolving instead of comparing the literal token', async () => {
+    const routes = withProbes(goodTargetRoutes(), {
+      knownEmpty: [{ url: '/api/widgets?zone=none' }, { url: '/api/widgets?zone=void' }],
+    })
+    const fetcher = urlAware(makeFetcher(routes), (u) =>
+      u.pathname === '/api/widgets' && u.searchParams.has('zone')
+        ? { status: 200, body: { type: 'EMPTY', items: [] } }
+        : undefined)
+    const spec = probeSpec([
+      { id: 'typed-empty-interp', kind: 'probe', probe: 'knownEmpty', minDeclared: 2,
+        expect: { status: 200, paths: [{ path: 'type', equals: '{{envType}}' }] } },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, {
+      fetcher, delayMs: 0, seed: 1, mode: 'local',
+      initialBindings: { envType: 'EMPTY' },
+    })
+    expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
+  })
+
+  it('a probe requirement whose expect references an UNDEFINED {{var}} FAILS CLOSED with the undefined-var detail (never a silent literal-string mismatch)', async () => {
+    const routes = withProbes(goodTargetRoutes(), {
+      knownEmpty: [{ url: '/api/widgets?zone=none' }, { url: '/api/widgets?zone=void' }],
+    })
+    const fetcher = urlAware(makeFetcher(routes), (u) =>
+      u.pathname === '/api/widgets' && u.searchParams.has('zone')
+        ? { status: 200, body: { type: 'EMPTY', items: [] } }
+        : undefined)
+    const spec = probeSpec([
+      { id: 'typed-empty-undef', kind: 'probe', probe: 'knownEmpty', minDeclared: 2,
+        expect: { status: 200, paths: [{ path: 'type', equals: '{{missing}}' }] } },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, {
+      fetcher, delayMs: 0, seed: 1, mode: 'local',
+    })
+    expect(report.passed).toBe(false)
+    const req = report.requirements.find((r) => r.id === 'typed-empty-undef')!
+    expect(req.verdict).toBe('fail')
+    expect(req.detail).toMatch(/undefined capture var \{\{missing\}\}/)
+    // Never a silent literal-string compare against the raw unresolved token —
+    // no per-path "does not equal" mismatch detail should appear here.
+    expect(req.detail).not.toMatch(/path type/)
+  })
+
   it('a third-party probe URL is refused WITHOUT being fetched', async () => {
     const fetched: string[] = []
     const routes = withProbes(goodTargetRoutes(), {

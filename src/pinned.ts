@@ -38,6 +38,8 @@ import type {
   EvidenceBundle,
   PinnedRequirement,
   PinnedSpec,
+  Suite,
+  SuiteEnvironment,
   Verdict,
 } from './types.js'
 
@@ -62,6 +64,18 @@ export interface VerifyPinnedOpts extends ObserverOpts {
   /** The pin. When present, spec text MUST hash to this or nothing runs. */
   expectedDigest?: string
   allowPrivateTargets?: boolean
+  /**
+   * Bindings pre-seeded into the capture scope BEFORE the first requirement
+   * runs. This is how a reusable SUITE injects a selected ENVIRONMENT's vars
+   * (baseUrl, token, seedId, …): an env var is just an author-supplied binding
+   * that `{{var}}` interpolation reads EXACTLY as it reads a target-captured
+   * value — the same interpolation engine, typed-whole-value + embedded-string
+   * rules, and the same fail-closed on an undefined reference. Author-controlled
+   * (lower risk than a target-captured value), but every resolved URL is STILL
+   * re-gated same-origin + publicly-routable + non-private — no bypass. Seeded
+   * into BOTH the observe scope and the judge scope so the two agree.
+   */
+  initialBindings?: Record<string, unknown>
 }
 
 export function parsePinnedSpec(text: string): PinnedSpec {
@@ -69,6 +83,19 @@ export function parsePinnedSpec(text: string): PinnedSpec {
   if (doc.$type !== 'PinnedSpec' || !Array.isArray(doc.requirements)) {
     throw new Error('not a PinnedSpec: expected {"$type":"PinnedSpec","requirements":[...]}')
   }
+  validateRequirements(doc.requirements)
+  return doc
+}
+
+/**
+ * Validate an ordered requirement list — the id-uniqueness, derived-role-key
+ * collision-freeness, and colon-in-id guards. Extracted so BOTH a PinnedSpec
+ * and a reusable Suite (which is a PinnedSpec parameterized by an environment)
+ * run the SAME checks over the SAME requirement shape — the suite format does
+ * not fork the requirement contract, it reuses it.
+ */
+export function validateRequirements(requirements: PinnedRequirement[]): void {
+  const doc = { requirements }
   // Every requirement id MUST be a UNIQUE, NON-EMPTY STRING. The role key
   // (`pinned:<id>`) is what observe records evidence under and what the judge
   // looks up by `find(role === 'pinned:<id>')` (FIRST match). A PinnedSpec is
@@ -159,7 +186,6 @@ export function parsePinnedSpec(text: string): PinnedSpec {
       )
     }
   }
-  return doc
 }
 
 /**
@@ -239,7 +265,11 @@ export async function verifyPinnedSpec(
   // method/path/body/expect. Interpolation happens HERE, at observe time, after
   // the producing requirement has already run — the loop is sequential, so the
   // scope is populated in dependency order.
-  const bindings: Bindings = {}
+  // Pre-seed the observe scope with any environment vars (a Suite's selected
+  // environment). They are ordinary bindings from the first probe's point of
+  // view: {{baseUrl}}, {{token}}, {{seedId}} interpolate through the very same
+  // engine capture-chaining uses.
+  const bindings: Bindings = { ...(opts.initialBindings ?? {}) }
   for (const req of spec.requirements) {
     if (req.kind !== 'endpoint') continue
     const resolved = resolveEndpoint(req, origin, bindings)
@@ -349,8 +379,10 @@ export async function verifyPinnedSpec(
   // makes judging pure over the bundle AND order-respecting: a `{{var}}`
   // referenced before it is produced fails closed with the same undefined-var
   // detail the observe phase saw, and a replay of a stored bundle re-judges
-  // identically without any re-fetch.
-  const judgeBindings: Bindings = {}
+  // identically without any re-fetch. Pre-seeded with the SAME environment vars
+  // as the observe scope so the two scopes are identical by construction (an
+  // env var, like a capture, is data in the run — not a fetch).
+  const judgeBindings: Bindings = { ...(opts.initialBindings ?? {}) }
 
   for (const req of spec.requirements) {
     if (req.kind === 'surface') {
@@ -430,7 +462,28 @@ export async function verifyPinnedSpec(
           id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
           detail: plan.unresolved, evidence: [ROLE.agentsJson],
         })
+        continue
+      }
+      // Interpolate this probe's `expect` through the SAME judge-scope binding
+      // path an `endpoint` requirement uses (env-seeded vars AND captures
+      // chained from an earlier requirement), so a {{var}} inside e.g.
+      // expect.paths[].equals resolves instead of being compared as the
+      // LITERAL string '{{var}}' (a silent, misleading FAIL with no hint the
+      // token was never resolved). An undefined reference fails CLOSED with
+      // the same clear detail resolveEndpoint gives the endpoint path — never
+      // a spurious literal-string mismatch. This is judge-side only (the
+      // already-fetched probe evidence is just re-compared) — no new fetch, so
+      // no new SSRF surface; the probe URL itself was already gated in phase
+      // 1/2 above, unaffected by this.
+      const expectResolved = interpolateDeep(req.expect, judgeBindings)
+      if ('error' in expectResolved) {
+        results.push({
+          id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
+          detail: `requirement ${req.id} references ${expectResolved.error}`,
+          evidence: [ROLE.agentsJson],
+        })
       } else {
+        const expect = expectResolved.value as EndpointExpect
         const problems: string[] = []
         const evidence: string[] = []
         plan.declared.forEach((entry, i) => {
@@ -442,7 +495,7 @@ export async function verifyPinnedSpec(
           const role = `pinned:${req.id}:${i}`
           evidence.push(role)
           const ev = fullBundle.items.find((e) => e.role === role)
-          const ps = judgeExpect(ev, req.expect)
+          const ps = judgeExpect(ev, expect)
           // Anti-decoy rule: the probed pathname must also have answered a
           // 200 `OK` envelope somewhere in this same run — a path that can
           // only ever say EMPTY/BLOCKED is a dedicated decoy, not a branch.
@@ -490,6 +543,151 @@ export async function verifyPinnedSpec(
     passed: results.every((r) => r.verdict === 'pass'),
     requirements: results,
     evidence: fullBundle,
+    attested: false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reusable suite / collection mode (Postman collections + environments)
+// ---------------------------------------------------------------------------
+
+export interface SuiteReport {
+  $type: 'SuiteVerificationReport'
+  verifier: 'api.qa'
+  verifierVersion: string
+  mode: 'remote' | 'local'
+  target: string
+  suite: { name: string; version: string; digest: string; environment: string }
+  verifiedAt: string
+  seed: number
+  passed: boolean
+  requirements: CheckResult[]
+  evidence: EvidenceBundle
+  attested: false
+}
+
+export interface VerifySuiteOpts extends ObserverOpts {
+  mode?: 'remote' | 'local'
+  seed?: number
+  /** The pin. When present, SUITE text MUST hash to this or nothing runs. */
+  expectedDigest?: string
+  allowPrivateTargets?: boolean
+  /**
+   * Explicit target override. When omitted, the selected environment's string
+   * `baseUrl` var IS the target — that is what makes "same suite, different
+   * environment → different target" work by environment selection alone.
+   */
+  target?: string
+}
+
+/**
+ * Parse + validate a reusable Suite. Reuses `validateRequirements` (the SAME
+ * id-uniqueness / derived-role-collision / colon guards a PinnedSpec runs) so
+ * the suite format does not fork the requirement contract. Additionally checks
+ * the `environments` map shape: each entry must be `{ vars: { ... } }`.
+ */
+export function parseSuite(text: string): Suite {
+  const doc = JSON.parse(text) as Suite
+  if (doc.$type !== 'Suite' || !Array.isArray(doc.requirements)) {
+    throw new Error('not a Suite: expected {"$type":"Suite","environments":{...},"requirements":[...]}')
+  }
+  const envs = doc.environments as unknown
+  if (envs === null || typeof envs !== 'object' || Array.isArray(envs)) {
+    throw new Error('Suite.environments must be an object mapping env name -> { vars: { <k>: <v> } }')
+  }
+  for (const [name, env] of Object.entries(envs as Record<string, unknown>)) {
+    const vars = (env as { vars?: unknown } | null)?.vars
+    if (env === null || typeof env !== 'object' || Array.isArray(env) ||
+        vars === null || typeof vars !== 'object' || Array.isArray(vars)) {
+      throw new Error(`Suite environment "${name}" must be an object of the form { "vars": { <k>: <v> } }`)
+    }
+  }
+  validateRequirements(doc.requirements)
+  return doc
+}
+
+/**
+ * Run a reusable Suite against a selected ENVIRONMENT. A Suite is a PinnedSpec
+ * parameterized by the environment's vars, so this DELEGATES to
+ * `verifyPinnedSpec` — the env vars pre-seed the binding scope (`initialBindings`)
+ * and every downstream mechanism (interpolation, capture-chaining, the SSRF
+ * re-gate on resolved URLs, the requirement loop) is reused unchanged.
+ *
+ * The anti-Goodhart digest pin is on the SUITE text and is checked HERE, before
+ * parse and before any probe. The re-expressed inner PinnedSpec has a different
+ * digest, so the delegated call is told NOT to re-gate on it.
+ *
+ * Fail-closed environment selection: an unknown environment name, or an
+ * environment that supplies neither an explicit target nor a string `baseUrl`,
+ * throws before anything runs. A referenced-but-undefined env VAR is caught
+ * downstream by the same undefined-`{{var}}` fail-closed path a capture uses.
+ */
+export async function verifySuite(
+  suiteText: string,
+  envName: string,
+  opts: VerifySuiteOpts = {},
+): Promise<SuiteReport> {
+  const mode = opts.mode ?? 'remote'
+  const digest = await sha256Hex(suiteText)
+
+  // Anti-Goodhart gate: content-address the SUITE and refuse before parsing or
+  // probing if the supplied text is not the ratified suite.
+  if (opts.expectedDigest && opts.expectedDigest !== digest) {
+    throw new Error(
+      `suite digest mismatch: expected ${opts.expectedDigest}, supplied text hashes to ${digest}. ` +
+        'The pinned suite is not the one this text represents — refusing to verify.',
+    )
+  }
+
+  const suite = parseSuite(suiteText)
+  if (!Object.hasOwn(suite.environments, envName)) {
+    const defined = Object.keys(suite.environments)
+    throw new Error(
+      `unknown environment "${envName}" — suite "${suite.name}" defines ` +
+        `${defined.length ? defined.map((n) => `"${n}"`).join(', ') : '(no environments)'}`,
+    )
+  }
+  const env: SuiteEnvironment = suite.environments[envName]!
+  const target =
+    opts.target ?? (typeof env.vars.baseUrl === 'string' ? (env.vars.baseUrl as string) : undefined)
+  if (target === undefined) {
+    throw new Error(
+      `environment "${envName}" supplies no string "baseUrl" var and no explicit target was given — ` +
+        'cannot resolve a target to run the suite against',
+    )
+  }
+
+  // Re-express the suite as a PinnedSpec parameterized by the selected env.
+  const specText = JSON.stringify({
+    $type: 'PinnedSpec',
+    name: suite.name,
+    version: suite.version,
+    requirements: suite.requirements,
+  })
+  const report = await verifyPinnedSpec(target, specText, {
+    ...opts,
+    mode,
+    // The SUITE digest is the pin; it was checked above. Do NOT re-gate on the
+    // inner spec's (different) digest.
+    expectedDigest: undefined,
+    // The selected environment's vars pre-seed the capture scope. The SSRF
+    // gates (normalizeTarget on the baseUrl/target inside verifyPinnedSpec,
+    // resolveEndpoint's same-origin re-gate on interpolated URLs) still apply.
+    initialBindings: env.vars,
+  })
+
+  return {
+    $type: 'SuiteVerificationReport',
+    verifier: 'api.qa',
+    verifierVersion: report.verifierVersion,
+    mode: report.mode,
+    target: report.target,
+    suite: { name: suite.name, version: suite.version, digest, environment: envName },
+    verifiedAt: report.verifiedAt,
+    seed: report.seed,
+    passed: report.passed,
+    requirements: report.requirements,
+    evidence: report.evidence,
     attested: false,
   }
 }

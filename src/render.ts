@@ -5,7 +5,7 @@
  */
 
 import type { VerificationReport } from './types.js'
-import type { PinnedReport } from './pinned.js'
+import type { PinnedReport, SuiteReport } from './pinned.js'
 
 const MARK: Record<string, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip' }
 
@@ -62,6 +62,23 @@ export function pinnedMarkdown(r: PinnedReport): string {
     '| requirement | verdict | detail |',
     '| --- | --- | --- |',
     ...r.requirements.map((c) => `| ${c.title} (\`${c.id}\`) | ${MARK[c.verdict]} | ${c.detail.replace(/\|/g, '\\|')} |`),
+    '',
+  ]
+  return lines.join('\n')
+}
+
+export function suiteMarkdown(r: SuiteReport): string {
+  const lines = [
+    `# api.qa suite report — ${r.target.replace(/^https?:\/\//, '')}`,
+    '',
+    `> **${r.passed ? 'PASSED' : 'FAILED'}** against \`${r.suite.name}@${r.suite.version}\` · environment \`${r.suite.environment}\``,
+    `> suite digest \`${r.suite.digest}\` · ${r.mode} mode · ${r.attested ? 'attested' : 'NOT attested (advisory)'}`,
+    '',
+    '| # | probe | verdict | detail |',
+    '| --- | --- | --- | --- |',
+    ...r.requirements.map(
+      (c, i) => `| ${i + 1} | ${c.title} (\`${c.id}\`) | ${MARK[c.verdict]} | ${c.detail.replace(/\|/g, '\\|')} |`,
+    ),
     '',
   ]
   return lines.join('\n')

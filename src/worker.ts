@@ -12,14 +12,17 @@
  *   GET  /self                  api.qa's live verdict on api.qa (loopback, no network)
  *   GET  /{domain}              the public grade page (markdown | HTML+JSON-LD | JSON)
  *   POST /verify                {target, specText?|spec?, expectedDigest?, seed?}
+ *   POST /suite                 {environment, suite?|suiteText?|suiteDigest, target?, expectedDigest?, seed?}
+ *                               — run a reusable suite (inline or a STORED suite by digest)
+ *                                 against a selected environment
  *
  * `createApp` takes an injectable fetcher so tests and the self-route run the
  * verifier against this very handler without touching the network.
  */
 
 import { verifyTarget, rejudge } from './verify.js'
-import { verifyPinnedSpec, type PinnedReport } from './pinned.js'
-import { reportMarkdown, pinnedMarkdown } from './render.js'
+import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type SuiteReport } from './pinned.js'
+import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
 import { generateSigningKey, importSigningKeyPair } from './attest.js'
 import { sha256Hex } from './digest.js'
@@ -191,7 +194,7 @@ export function createApp(
             // cached pass. Only consult the cache when the pin is consistent.
             const pinOk = !body.expectedDigest || body.expectedDigest === specDigest
             if (!bypass && cache && pinOk) {
-              const hit = await cache.getPinned(body.target, specDigest, now())
+              const hit = await cache.getPinned(body.target, specDigest, body.seed, now())
               if (hit?.fresh)
                 return respondPinned(hit.report, accept, { cache: 'HIT', ageMs: hit.ageMs })
             }
@@ -203,7 +206,7 @@ export function createApp(
               delayMs: bypass ? 0 : externalDelayMs,
               allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
             })
-            if (!bypass && cache) await cache.putPinned(body.target, specDigest, report, now())
+            if (!bypass && cache) await cache.putPinned(body.target, specDigest, body.seed, report, now())
             return respondPinned(report, accept, { cache: bypass ? undefined : 'MISS' })
           }
 
@@ -237,6 +240,72 @@ export function createApp(
           return respondReport(report, accept, { cache: bypass ? undefined : 'MISS' })
         }
 
+        if (request.method === 'POST' && path === '/suite') {
+          const body = (await request.json().catch(() => undefined)) as
+            | {
+                target?: string
+                suite?: unknown
+                suiteText?: string
+                suiteDigest?: string
+                environment?: string
+                expectedDigest?: string
+                seed?: number
+              }
+            | undefined
+          if (!body?.environment) return json({ error: 'body must include "environment"' }, 400)
+
+          // Resolve the suite text: supplied inline, OR a STORED suite fetched
+          // by digest from the registry (the hosted "run a stored suite" path).
+          let suiteText =
+            body.suiteText ?? (body.suite !== undefined ? JSON.stringify(body.suite) : undefined)
+          if (suiteText !== undefined && cache) {
+            // Register the inline suite by its digest so it can later be run by
+            // digest alone (content-addressed registry).
+            await cache.putSuiteText(await sha256Hex(suiteText), suiteText)
+          }
+          if (suiteText === undefined && body.suiteDigest) {
+            if (!cache) return json({ error: 'no suite registry configured for run-by-digest' }, 400)
+            const stored = await cache.getSuiteText(body.suiteDigest)
+            if (stored === null) return json({ error: `no stored suite for digest ${body.suiteDigest}` }, 404)
+            suiteText = stored
+          }
+          if (suiteText === undefined) {
+            return json({ error: 'body must include "suite"/"suiteText" or a stored "suiteDigest"' }, 400)
+          }
+
+          const suiteDigest = await sha256Hex(suiteText)
+          // Resolve the target the SAME way verifySuite will (explicit override,
+          // else the selected environment's baseUrl var) — needed to key the
+          // per-(target, suite, env) verdict cache. parseSuite validates shape.
+          let targetForKey = body.target
+          if (targetForKey === undefined) {
+            const suite = parseSuite(suiteText)
+            const vars = suite.environments[body.environment]?.vars
+            if (vars && typeof vars.baseUrl === 'string') targetForKey = vars.baseUrl
+          }
+          const bypass = targetForKey !== undefined && hostKey(targetForKey) === 'api.qa'
+
+          // Anti-Goodhart gate must fire on a bad pin BEFORE any cache hit.
+          const pinOk = !body.expectedDigest || body.expectedDigest === suiteDigest
+          if (targetForKey !== undefined && !bypass && cache && pinOk) {
+            const hit = await cache.getSuite(targetForKey, suiteDigest, body.environment, body.seed, now())
+            if (hit?.fresh) return respondSuite(hit.report, accept, { cache: 'HIT', ageMs: hit.ageMs })
+          }
+
+          const report = await verifySuite(suiteText, body.environment, {
+            mode: 'remote',
+            fetcher: routed,
+            seed: body.seed,
+            expectedDigest: body.expectedDigest,
+            target: body.target,
+            delayMs: bypass ? 0 : externalDelayMs,
+            allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+          })
+          if (!bypass && cache)
+            await cache.putSuite(report.target, suiteDigest, body.environment, body.seed, report, now())
+          return respondSuite(report, accept, { cache: bypass ? undefined : 'MISS' })
+        }
+
         if (request.method === 'POST' && path === '/rejudge') {
           const report = (await request.json().catch(() => undefined)) as
             | Parameters<typeof rejudge>[0]
@@ -248,7 +317,9 @@ export function createApp(
         return json({ error: 'not found', see: `${SELF_ORIGIN}/llms.txt` }, 404)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        const status = /refusing|not a valid target|digest mismatch|not a PinnedSpec/.test(message) ? 400 : 500
+        const status = /refusing|not a valid target|digest mismatch|not a PinnedSpec|not a Suite|unknown environment|Suite\.environments|Suite environment|supplies no string|cannot resolve a target/.test(message)
+          ? 400
+          : 500
         return json({ error: message }, status)
       }
     },
@@ -302,6 +373,13 @@ function respondPinned(report: PinnedReport, accept: string, meta?: CacheMeta): 
   const headers = cacheHeaders(meta)
   return accept.includes('text/markdown')
     ? text(pinnedMarkdown(report), 200, headers)
+    : json(report, 200, headers)
+}
+
+function respondSuite(report: SuiteReport, accept: string, meta?: CacheMeta): Response {
+  const headers = cacheHeaders(meta)
+  return accept.includes('text/markdown')
+    ? text(suiteMarkdown(report), 200, headers)
     : json(report, 200, headers)
 }
 

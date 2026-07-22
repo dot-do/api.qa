@@ -74,12 +74,27 @@ describe('ReportCache — pinned mode', () => {
     const specDigest = await sha256Hex(specText)
     const report = await verifyPinnedSpec(GOOD, specText, { fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 1 })
 
-    expect(await cache.getPinned(GOOD, specDigest, 0)).toBeNull()
-    await cache.putPinned(GOOD, specDigest, report, 0)
-    const hit = await cache.getPinned(GOOD, specDigest, 0)
+    expect(await cache.getPinned(GOOD, specDigest, 1, 0)).toBeNull()
+    await cache.putPinned(GOOD, specDigest, 1, report, 0)
+    const hit = await cache.getPinned(GOOD, specDigest, 1, 0)
     expect(hit!.fresh).toBe(true)
     expect(hit!.report.passed).toBe(report.passed)
     // a different spec digest is a cache miss (no cross-spec bleed)
-    expect(await cache.getPinned(GOOD, 'deadbeef', 0)).toBeNull()
+    expect(await cache.getPinned(GOOD, 'deadbeef', 1, 0)).toBeNull()
+  })
+
+  it('keys pinned verdicts by seed too — a different seed is a cache miss (never serves a stale seed field)', async () => {
+    const cache = new ReportCache(new MemoryKV(), 300)
+    const specText = JSON.stringify({
+      $type: 'PinnedSpec', name: 'mini', version: '1',
+      requirements: [{ id: 'status-ok', kind: 'endpoint', method: 'GET', path: '/api/status', expect: { status: 200 } }],
+    })
+    const specDigest = await sha256Hex(specText)
+    const report = await verifyPinnedSpec(GOOD, specText, { fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 1 })
+    await cache.putPinned(GOOD, specDigest, 1, report, 0)
+
+    expect(await cache.getPinned(GOOD, specDigest, 1, 0)).not.toBeNull() // same seed → HIT
+    expect(await cache.getPinned(GOOD, specDigest, 2, 0)).toBeNull() // different seed → MISS
+    expect(await cache.getPinned(GOOD, specDigest, undefined, 0)).toBeNull() // unseeded request → MISS
   })
 })
