@@ -1557,44 +1557,70 @@ function externalRefsInSrcDoc(html: string): string[] {
   return [...refs]
 }
 
-/** A CSP directive value that admits remote code / connections (a bare `*` or a remote origin). */
+/**
+ * The FULL CSP fetch/navigation directive set. An explicit remote origin (or a
+ * bare `*`, or a scheme-source like `https:`) in ANY of these admits a remote
+ * load/connection — so the widget is NOT self-contained. Restricting the scan to
+ * a handful of directives (the old 6) let an explicit remote in e.g. `media-src`
+ * / `font-src` / `object-src` / `script-src-elem` slip through.
+ */
+const CSP_FETCH_DIRECTIVES = [
+  'default-src',
+  'script-src', 'script-src-elem', 'script-src-attr',
+  'style-src', 'style-src-elem', 'style-src-attr',
+  'img-src', 'media-src', 'font-src', 'object-src',
+  'connect-src', 'frame-src', 'child-src', 'worker-src',
+  'manifest-src', 'prefetch-src',
+  'base-uri', 'form-action',
+]
+
+/** True if a directive VALUE admits a remote origin: a bare `*` wildcard, an
+ * explicit `http(s)://` origin, a protocol-relative `//host`, a bare
+ * `http(s):` scheme-source, or a `*:`/`*.host` wildcard host. Quoted keyword /
+ * hash / nonce sources (`'self'`, `'none'`, `'sha256-…'`, `'nonce-…'`) do not. */
+function cspValueAdmitsRemote(value: string): boolean {
+  return (
+    /(^|\s)\*(\s|$)/.test(value) || // bare wildcard host
+    /https?:\/\//i.test(value) || // explicit http(s):// origin
+    /(^|\s)\/\//.test(value) || // protocol-relative //host origin
+    /(^|\s)https?:(\s|$)/i.test(value) || // bare http(s): scheme-source
+    /(^|\s)\*[:.]/.test(value) // *:scheme / *.host wildcard
+  )
+}
+
+/** CSP directives (across the full fetch/navigation set) that admit remote code / connections. */
 function cspAdmitsRemote(csp: Record<string, unknown>): string[] {
   const offenders: string[] = []
-  const risky = ['script-src', 'connect-src', 'default-src', 'style-src', 'img-src', 'frame-src']
-  for (const dir of risky) {
-    const raw = csp[dir]
+  for (const dir of CSP_FETCH_DIRECTIVES) {
+    const raw = cspDirective(csp, dir)
     const value = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
     if (!value) continue
-    if (/(^|\s)\*(\s|$)/.test(value) || /https?:\/\//i.test(value) || /(^|\s)(https?:|\*):/.test(value)) {
-      offenders.push(`${dir} ${value.trim()}`)
-    }
+    if (cspValueAdmitsRemote(value)) offenders.push(`${dir} ${value.trim()}`)
   }
   return offenders
 }
 
 /**
- * A CSP is CLOSED when it (a) admits no wildcard / remote origin (see
- * `cspAdmitsRemote`), AND (b) actually CONSTRAINS both the script-execution and
- * the network-connection surface — either via a non-empty `default-src`
- * fallback, or via explicit non-empty `script-src` and `connect-src`. An absent
- * or empty CSP (`undefined` / `{}`) is NOT closed: it declares no boundary for
- * the host sandbox to enforce, so the widget cannot be proven inert.
+ * A CSP is CLOSED when it (a) admits no wildcard / remote origin in ANY fetch
+ * directive (see `cspAdmitsRemote`), AND (b) declares a RESTRICTIVE `default-src`
+ * — present and consisting ONLY of `'none'` and/or `'self'`. The required
+ * `default-src` is the REAL boundary: it is the fallback for every unlisted
+ * fetch directive (`img-src`, `media-src`, `font-src`, `object-src`, …), so with
+ * it in place an ABSENT `img-src`/`media-src` is closed-by-fallback and an
+ * island cannot `new Image().src = "ht"+"tps://…"+document.cookie` /
+ * `new Audio().src` its way out regardless of string obfuscation. A CSP that
+ * pins only `script-src`+`connect-src` but omits `default-src` leaves those
+ * media/font/object surfaces UNCONSTRAINED and is therefore NOT closed. An
+ * absent or empty CSP (`undefined` / `{}`) is likewise not closed: it declares no
+ * boundary for the host sandbox to enforce.
  */
 function cspIsClosed(csp: Record<string, unknown> | undefined): boolean {
   if (!csp) return false
   if (cspAdmitsRemote(csp).length > 0) return false
-  const nonEmpty = (dir: string): boolean => {
-    for (const [k, raw] of Object.entries(csp)) {
-      if (k.toLowerCase() !== dir) continue
-      const v = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
-      if (v.trim().length > 0) return true
-    }
-    return false
-  }
-  const hasDefault = nonEmpty('default-src')
-  const scriptCovered = hasDefault || nonEmpty('script-src')
-  const connectCovered = hasDefault || nonEmpty('connect-src')
-  return scriptCovered && connectCovered
+  // REQUIRED restrictive default-src: present, and every token is 'none'/'self'.
+  const defTokens = cspSourceTokens(cspDirective(csp, 'default-src')).map((t) => t.toLowerCase())
+  if (defTokens.length === 0) return false
+  return defTokens.every((t) => t === "'none'" || t === "'self'")
 }
 
 // --- CSP hash-source (`'sha256-...'`) support for interactive islands ---------
@@ -1698,9 +1724,26 @@ export function cspScriptHash(scriptBody: string): string {
   return `'sha256-${bytesToBase64(sha256Raw(scriptBody))}'`
 }
 
-/** A CSP hash-source token: `'sha256-<b64>'` (also sha384/sha512 per spec). */
+/** A CSP hash-source token: `'sha256-<b64>'` (also sha384/sha512 per spec).
+ * Accepts standard-base64 (`+/`) and base64url (`-_`), padded or unpadded — all
+ * forms a browser accepts. */
 function isCspHashSource(tok: string): boolean {
   return /^'sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}'$/.test(tok)
+}
+
+/**
+ * Canonicalize a CSP hash-source token so a browser-ACCEPTED form is never
+ * false-failed on an exact-string compare: lowercase the algorithm, map
+ * base64url (`-_`) → standard base64 (`+/`), and DROP `=` padding. A CSP token
+ * in base64url/unpadded form and `cspScriptHash()`'s standard-padded output then
+ * canonicalize to the SAME string. A non-hash token is returned trimmed,
+ * unchanged (so a non-hash source never collides with a hash).
+ */
+function canonicalizeHashToken(tok: string): string {
+  const m = /^'(sha(?:256|384|512))-([A-Za-z0-9+/_-]+)={0,2}'$/.exec(tok.trim())
+  if (!m || !m[1] || !m[2]) return tok.trim()
+  const b64 = m[2].replace(/-/g, '+').replace(/_/g, '/')
+  return `'${m[1].toLowerCase()}-${b64}'`
 }
 
 /** Split a CSP directive value (string or joined array) into source tokens. */
@@ -1797,18 +1840,26 @@ function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: 
   }
   // csp is defined & closed here (cspIsClosed returns false for undefined).
   const cspObj = csp as Record<string, unknown>
-  // SCRIPT-EXECUTION SURFACE (island-safety): 'unsafe-inline' re-opens
-  // arbitrary/injected inline script and 'unsafe-eval' re-opens string→code —
-  // both defeat the closed CSP no matter what the srcDoc currently ships, so
-  // they FAIL unconditionally. (A remote origin in script-src was already
-  // caught by cspAdmitsRemote above.)
-  const scriptTokens = cspSourceTokens(cspDirective(cspObj, 'script-src') ?? cspDirective(cspObj, 'default-src'))
-  const lowerTokens = scriptTokens.map((t) => t.toLowerCase())
-  if (lowerTokens.includes("'unsafe-inline'")) {
-    return { verdict: 'fail', detail: `_meta.ui.csp script-src admits 'unsafe-inline' — the host would execute ANY inline script the srcDoc carries (or that is injected into it); a self-contained interactive island must pin each inline script by 'sha256-...' hash instead` }
+  // SCRIPT-EXECUTION SURFACE (island-safety). A browser applies the EFFECTIVE
+  // directive, not literally `script-src`: for an inline `<script>` ELEMENT it
+  // uses `script-src-elem ?? script-src ?? default-src`; for an inline event
+  // handler / `javascript:` ATTRIBUTE it uses `script-src-attr ?? script-src ??
+  // default-src`. So 'unsafe-inline'/'unsafe-eval' hidden in `script-src-elem`
+  // (a benign hash sitting in `script-src`) would re-open injected inline script
+  // yet grade safe if we only read `script-src`. Compute BOTH effective policies
+  // and reject the unsafe keywords in EITHER. (A remote origin in any of these
+  // was already caught by cspAdmitsRemote above.)
+  const effInlinePolicy = cspDirective(cspObj, 'script-src-elem') ?? cspDirective(cspObj, 'script-src') ?? cspDirective(cspObj, 'default-src')
+  const effAttrPolicy = cspDirective(cspObj, 'script-src-attr') ?? cspDirective(cspObj, 'script-src') ?? cspDirective(cspObj, 'default-src')
+  const elemTokens = cspSourceTokens(effInlinePolicy)
+  const attrTokens = cspSourceTokens(effAttrPolicy)
+  const elemLower = elemTokens.map((t) => t.toLowerCase())
+  const attrLower = attrTokens.map((t) => t.toLowerCase())
+  if (elemLower.includes("'unsafe-inline'") || attrLower.includes("'unsafe-inline'")) {
+    return { verdict: 'fail', detail: `_meta.ui.csp effective inline-script policy (script-src-elem/attr ?? script-src ?? default-src) admits 'unsafe-inline' — the host would execute ANY inline script/handler the srcDoc carries (or that is injected into it); a self-contained interactive island must pin each inline script by 'sha256-...' hash instead` }
   }
-  if (lowerTokens.includes("'unsafe-eval'")) {
-    return { verdict: 'fail', detail: `_meta.ui.csp script-src admits 'unsafe-eval' — string→code execution (eval / new Function) is an injection sink a self-contained widget must not enable` }
+  if (elemLower.includes("'unsafe-eval'") || attrLower.includes("'unsafe-eval'")) {
+    return { verdict: 'fail', detail: `_meta.ui.csp effective inline-script policy admits 'unsafe-eval' — string→code execution (eval / new Function) is an injection sink a self-contained widget must not enable` }
   }
   // SECONDARY: parse the srcDoc for actual executable external references
   // (element loads, remote url()/@import, and remote/beacon refs in script
@@ -1818,21 +1869,24 @@ function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: 
     return { verdict: 'fail', detail: `ui:// srcDoc has executable external references: ${refs.slice(0, 4).join(', ')} — an element that loads or a script that beacons to a remote origin is a host-sandbox + supply-chain + exfil risk; the srcDoc must be self-contained (inline/precompiled, no remote refs)` }
   }
   // INLINE ISLAND: every src-less <script> must be HASH-PINNED. With an inline
-  // script present, script-src must be a 'sha256-...' allow-list ONLY (not
-  // 'none'/'self'/a nonce), and each script's own hash must be in it. An
-  // un-pinned or hash-mismatched inline script would not execute under a
-  // correct host CSP and is a red flag the grader must not certify as safe.
+  // script present, the EFFECTIVE script-src-elem policy (the directive the
+  // browser uses for <script> ELEMENT hashes) must be a 'sha256-...' allow-list
+  // ONLY (not 'none'/'self'/a nonce), and each script's own hash must be in it.
+  // Compare hashes CANONICALIZED (base64url→base64, padding-normalized) so a
+  // spec-valid browser-accepted hash form is not false-failed. An un-pinned or
+  // hash-mismatched inline script would not execute under a correct host CSP and
+  // is a red flag the grader must not certify as safe.
   const inlineScripts = inlineScriptBodies(html)
   if (inlineScripts.length > 0) {
-    const hashSources = scriptTokens.filter(isCspHashSource)
-    if (hashSources.length === 0 || scriptTokens.some((t) => !isCspHashSource(t))) {
-      return { verdict: 'fail', detail: `the srcDoc ships ${inlineScripts.length} inline <script>(s) but script-src is not a 'sha256-...' hash allow-list (got: ${scriptTokens.join(' ') || "'none'"}) — an inline island is self-contained ONLY when script execution is restricted to specific pinned hashes` }
+    const hashSources = elemTokens.filter(isCspHashSource)
+    if (hashSources.length === 0 || elemTokens.some((t) => !isCspHashSource(t))) {
+      return { verdict: 'fail', detail: `the srcDoc ships ${inlineScripts.length} inline <script>(s) but the effective script-src-elem policy is not a 'sha256-...' hash allow-list (got: ${elemTokens.join(' ') || "'none'"}) — an inline island is self-contained ONLY when <script>-element execution is restricted to specific pinned hashes` }
     }
-    const hashSet = new Set(hashSources)
+    const hashSet = new Set(hashSources.map(canonicalizeHashToken))
     for (const body of inlineScripts) {
-      const h = cspScriptHash(body)
+      const h = canonicalizeHashToken(cspScriptHash(body))
       if (!hashSet.has(h)) {
-        return { verdict: 'fail', detail: `an inline <script> is not hash-pinned: its ${h} is absent from script-src (${[...hashSet].join(' ')}) — under a correct host CSP it would not execute; the grader will not certify an un-pinned or hash-mismatched inline script as safe` }
+        return { verdict: 'fail', detail: `an inline <script> is not hash-pinned: its ${cspScriptHash(body)} is absent from the effective script-src-elem hash set (${[...hashSet].join(' ')}) — under a correct host CSP it would not execute; the grader will not certify an un-pinned or hash-mismatched inline script as safe` }
       }
     }
     return pass(`srcDoc is self-contained: ${inlineScripts.length} inline island script(s) hash-pinned in script-src, no executable external refs, behind a closed CSP`)
