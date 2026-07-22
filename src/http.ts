@@ -113,9 +113,9 @@ export class Observer {
     }
 
     const started = Date.now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
     try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
       const headers: Record<string, string> = { accept: init.accept ?? '*/*' }
       let body: string | undefined
       if (init.body !== undefined) {
@@ -167,8 +167,18 @@ export class Observer {
         hop += 1
         currentUrl = nextUrl
       }
-      clearTimeout(timer)
+      // Keep the abort timer ARMED across the body read (ax-gf2 slow-loris fix).
+      // Previously `clearTimeout(timer)` fired HERE, before readCapped streamed
+      // the body — so a server that returned 200 headers then slow-lorised /
+      // dripped the body held the probe open past timeoutMs (the AbortController),
+      // bounded only by maxBodyBytes. With the timer still armed, the
+      // AbortController fires DURING a slow body drip and aborts the underlying
+      // stream, so total connect+headers+body time is bounded by timeoutMs.
+      // readCapped surfaces the abort as a clean rejection (caught below and
+      // recorded as a timeout error) — no hang, no unhandled rejection — and the
+      // maxBodyBytes cap still applies to a fast body.
       const text = await this.readCapped(res)
+      clearTimeout(timer)
       const kept: Record<string, string> = {}
       for (const h of HEADER_ALLOWLIST) {
         const v = res.headers.get(h)
@@ -179,6 +189,7 @@ export class Observer {
         res.status, res.headers.get('content-type'), kept, text, Date.now() - started,
       )
     } catch (err) {
+      clearTimeout(timer)
       return this.record(
         role, url, method, init.accept, null, null, {}, null, Date.now() - started,
         err instanceof Error ? `${err.name}: ${err.message}` : String(err),
@@ -238,9 +249,9 @@ export class Observer {
       await new Promise((r) => setTimeout(r, this.opts.delayMs))
     }
     const started = Date.now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
     try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
       const headers: Record<string, string> = {
         accept,
         'content-type': 'application/json',
@@ -255,8 +266,10 @@ export class Observer {
         signal: controller.signal,
         redirect: 'manual',
       })
-      clearTimeout(timer)
+      // Timer stays ARMED across the body read (ax-gf2): a slow-lorised / dripped
+      // MCP response body cannot hold this probe past timeoutMs either.
       const text = await this.readCapped(res)
+      clearTimeout(timer)
       const kept: Record<string, string> = {}
       for (const h of HEADER_ALLOWLIST) {
         const v = res.headers.get(h)
@@ -268,6 +281,7 @@ export class Observer {
       if (sid) kept['mcp-session-id'] = sid
       return this.record(role, url, method, accept, res.status, res.headers.get('content-type'), kept, text, Date.now() - started)
     } catch (err) {
+      clearTimeout(timer)
       return this.record(role, url, method, accept, null, null, {}, null, Date.now() - started,
         err instanceof Error ? `${err.name}: ${err.message}` : String(err))
     }
