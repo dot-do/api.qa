@@ -47,6 +47,29 @@ export function reportBody(report: VerificationReport): string {
   return canonicalJson(body)
 }
 
+/**
+ * A STABLE fingerprint of the ATTESTED VERDICT — the letter grade, the AX
+ * score, and the R-k checklist item verdicts (+ any honesty-check failures) —
+ * and NOTHING else. Unlike `discovery.evidenceDigest`, this deliberately folds
+ * OUT the fresh per-run `seed` and the wall-clock probe timings the evidence
+ * digest carries, so two runs that reached the SAME verdict on an unchanged
+ * target produce the SAME verdict digest, while any behavioral regression (a
+ * dropped check, a downgraded grade) flips it. This is the signal api.qa's
+ * attestation-change alert watches (bd ax-e6b.29.3): "the attested verdict for
+ * this target changed since the last run" — a property unique to api.qa's
+ * attested, replayable model.
+ */
+export async function verdictDigest(report: VerificationReport): Promise<string> {
+  const items = report.axScore.items.map((i) => [i.item, i.verdict])
+  const honesty = report.checks
+    .filter((c) => c.axItem === undefined)
+    .map((c) => [c.id, c.verdict])
+    .sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
+  return sha256Hex(
+    canonicalJson({ grade: report.grade, points: report.axScore.points, items, honesty }),
+  )
+}
+
 export async function attestReport(
   report: VerificationReport,
   keys: CryptoKeyPair,

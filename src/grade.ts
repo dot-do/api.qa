@@ -46,3 +46,14 @@ const ORDER: Grade[] = ['F', 'D', 'C', 'B', 'A', 'A+']
 function minGrade(a: Grade, b: Grade): Grade {
   return ORDER.indexOf(a) <= ORDER.indexOf(b) ? a : b
 }
+
+/**
+ * The ordinal rank of a grade (F=0 … A+=5) — the single ordering the alert
+ * layer's grade-regression rule reuses so "did this run's grade drop vs the
+ * prior run" is judged by the SAME scale the grader itself caps by. An
+ * unknown/legacy string ranks -1 (below F), so it can never be read as a
+ * regression FROM, only degradation is ever flagged.
+ */
+export function gradeRank(grade: string): number {
+  return ORDER.indexOf(grade as Grade)
+}
