@@ -84,6 +84,16 @@ export interface ReporterModel {
  *       (SSRF, unreachable) which lands as `passed: false` — exits non-zero.
  *   VerificationReport (advisory grade)
  *     → `grade === 'F' ? 1 : 0`. Advisory grading is not a pinned gate.
+ *   ContractDiffReport
+ *     → NON-ZERO iff the live surface broke the published contract (`breaking
+ *       > 0`) — additive-only drift is not a gate failure — OR NOTHING was
+ *       actually verified (`openapiValid === false` — an un-diffable / wrong-
+ *       shape spec — or `operationsProbed === 0` — every declared operation
+ *       was unprobeable/absent). `breaking` is trivially 0 whenever zero
+ *       operations were probed, so gating on `breaking > 0` alone would exit
+ *       0/PASSED on a run that verified NOTHING — the CI gate's own silent
+ *       green. Fail closed: a contract-diff that verified nothing is never a
+ *       pass.
  *
  * A digest-pin mismatch or an unreachable/refused target throws BEFORE a report
  * exists; the CLI catch converts that throw to a non-zero exit. Both paths are
@@ -101,7 +111,10 @@ export function exitCodeFor(report: AnyRunReport): number {
       // The contract-diff CI gate (ax-gyh): NON-ZERO iff the live surface broke
       // the published contract. Additive-only drift (live has MORE than
       // declared) is NOT a gate failure — a client written to the contract is
-      // unaffected.
+      // unaffected. But a gate that verified ZERO operations (no valid OpenAPI
+      // to diff against, or every declared operation was unprobeable/absent)
+      // must NEVER exit 0 — "nothing was probed" is not "nothing is broken".
+      if (!report.openapiValid || report.operationsProbed === 0) return 1
       return report.breaking > 0 ? 1 : 0
   }
 }

@@ -126,6 +126,12 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       result = { verdict: 'fail', detail: 'root ignores Accept: application/json — a JSON-requesting agent received a wall of HTML instead of a JSON (or at least non-HTML, agent-actionable) representation' }
     } else if (jsonServed) {
       result = pass('Accept: */* got non-HTML text; Accept: text/html got HTML; Accept: application/json got a parseable JSON body')
+    } else if (jsonBodyParses) {
+      // A JSON body WAS served (it parses) but not labeled with a JSON
+      // content-type — distinct from "no JSON body at all". Not a false-fail
+      // (the content itself is agent-actionable), but the detail must say what
+      // actually happened rather than claim no JSON body was served.
+      result = pass('Accept: */* got non-HTML text; Accept: text/html got HTML; Accept: application/json served a parseable JSON body under a non-JSON content-type (partial credit)')
     } else {
       // md/html negotiate correctly and the JSON probe did NOT return HTML
       // (it returned non-HTML text, e.g. markdown, or a non-2xx). No JSON

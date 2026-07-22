@@ -229,6 +229,21 @@ async function main(): Promise<number> {
       allowPrivate,
       delayMs: isLocalTarget(target) ? 0 : 150,
     })
+    // A gate that verified NOTHING must never exit 0/PASSED (the CLI's own
+    // silent-green fix): `breaking` is trivially 0 whenever no operation was
+    // probed, so an un-diffable spec (wrong file, lost `paths`, unrecognized
+    // shape) or a spec whose every declared operation is unprobeable would
+    // otherwise print a clean PASSED report. die() loudly instead of emitting
+    // a "clean" report; exitCodeFor() below is ALSO fixed (defense in depth
+    // for any other caller of the raw report).
+    if (!report.openapiValid) {
+      return die(`contract-diff: ${specFile} has no valid OpenAPI contract to diff — refusing to report a clean pass`)
+    }
+    if (report.operationsProbed === 0) {
+      return die(
+        `contract-diff: zero probeable operations in ${specFile} against ${target} — refusing to report a clean pass`,
+      )
+    }
     return emit(report, contractDiffMarkdown(report), flags)
   }
 

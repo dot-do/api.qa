@@ -714,4 +714,80 @@ describe('contract-diff CLI verb (ax-gyh)', () => {
     })
     expect(report.target).toBe(GOOD)
   })
+
+  // -------------------------------------------------------------------------
+  // HIGH FIX: a gate that verified NOTHING must never exit 0/PASSED. `breaking`
+  // is trivially 0 whenever nothing was probed, so gating on `breaking > 0`
+  // alone silently green-lights a wrong-file / stripped-`paths` / unrecognized-
+  // shape spec, or a spec whose every declared operation is unprobeable. Both
+  // exitCodeFor() (safe for ANY caller) and the CLI verb itself must fail
+  // closed on `openapiValid === false` or `operationsProbed === 0`.
+  // -------------------------------------------------------------------------
+
+  it('un-diffable spec ({hello:"world"}, valid JSON but NOT OpenAPI) → EXITS NON-ZERO, never a silent clean pass', async () => {
+    const report = await runContractDiff(JSON.stringify({ hello: 'world' }), GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.openapiValid).toBe(false)
+    expect(report.operationsDeclared).toBe(0)
+    expect(report.operationsProbed).toBe(0)
+    expect(report.breaking).toBe(0) // trivially zero — nothing was probed
+    expect(report.clean).toBe(true) // and the diff itself is (vacuously) "clean"
+    // ...yet the CI gate must NEVER treat this as a pass:
+    expect(exitCodeFor(report)).not.toBe(0)
+  })
+
+  it('a valid OpenAPI doc with paths:{} (zero declared operations) → EXITS NON-ZERO', async () => {
+    const emptySpec = JSON.stringify({ openapi: '3.1.0', info: { title: 't', version: '1' }, paths: {} })
+    const report = await runContractDiff(emptySpec, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.openapiValid).toBe(true)
+    expect(report.operationsDeclared).toBe(0)
+    expect(report.operationsProbed).toBe(0)
+    expect(report.breaking).toBe(0)
+    expect(exitCodeFor(report)).not.toBe(0)
+  })
+
+  it('a spec whose only declared operations are all non-probeable (templated/required-params/secured) → EXITS NON-ZERO', async () => {
+    const noneProbeable = JSON.stringify({
+      openapi: '3.1.0',
+      info: { title: 't', version: '1' },
+      paths: {
+        '/api/widgets/{id}': {
+          get: { parameters: [{ name: 'id', in: 'path', required: true }], responses: { '200': { description: 'one' } } },
+        },
+      },
+    })
+    const report = await runContractDiff(noneProbeable, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.openapiValid).toBe(true)
+    expect(report.operationsDeclared).toBe(1)
+    expect(report.operationsProbed).toBe(0)
+    expect(exitCodeFor(report)).not.toBe(0)
+  })
+
+  it('a valid spec with real GET-safe operations and NO breaking change still EXITS 0 (the fix does not regress a genuinely clean diff)', async () => {
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0,
+    })
+    expect(report.openapiValid).toBe(true)
+    expect(report.operationsProbed).toBeGreaterThan(0)
+    expect(report.breaking).toBe(0)
+    expect(exitCodeFor(report)).toBe(0)
+  })
+
+  it('a breaking change still EXITS NON-ZERO (unchanged behavior)', async () => {
+    const report = await runContractDiff(spec, GOOD, {
+      fetcher: makeFetcher(withOverrides(goodTargetRoutes(), {
+        'GET /api/status': () => json({ ok: 'yes', widgets: 3 }),
+      })),
+      delayMs: 0,
+    })
+    expect(report.openapiValid).toBe(true)
+    expect(report.operationsProbed).toBeGreaterThan(0)
+    expect(report.breaking).toBeGreaterThan(0)
+    expect(exitCodeFor(report)).not.toBe(0)
+  })
 })

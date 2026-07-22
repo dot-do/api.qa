@@ -151,4 +151,25 @@ describe('content-negotiation grades Accept: application/json (ax-c7m)', () => {
     expect(score.points).toBe(10)
     expect(grade).toBe('A+')
   })
+
+  it('root serves a parseable JSON body under a non-JSON content-type — accurate detail, not "served no JSON body"', async () => {
+    // LOW fix: a JSON body WAS served (it parses), just mislabeled as
+    // text/plain. The old detail said "served no JSON body served", which is
+    // inaccurate — distinguish "no JSON body at all" from "JSON body under
+    // the wrong content-type". Verdict semantics unchanged (still a pass).
+    const { checks, score, grade } = await judge(withOverrides(goodTargetRoutes(), {
+      'GET /': (req: { accept: string }) =>
+        req.accept.includes('text/html')
+          ? { status: 200, contentType: 'text/html', body: '<!doctype html><html><body><h1>good</h1></body></html>' }
+          : req.accept.includes('application/json')
+            ? { status: 200, contentType: 'text/plain', body: JSON.stringify({ service: 'good.example' }) }
+            : { status: 200, contentType: 'text/markdown', body: '# good.example\n\n> markdown for agents, long enough to be substantive content here.' },
+    }))
+    expect(verdictOf(checks, 'content-negotiation')).toBe('pass')
+    const detail = detailOf(checks, 'content-negotiation')
+    expect(detail).toMatch(/parseable JSON body under a non-JSON content-type/i)
+    expect(detail).not.toMatch(/served no JSON body/i)
+    expect(score.points).toBe(10)
+    expect(grade).toBe('A+')
+  })
 })
