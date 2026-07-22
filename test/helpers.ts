@@ -202,6 +202,7 @@ Boundaries answer 402 with a structured offer. See \`GET /offers/upgrade\`.
       status: 402,
       contentType: 'application/json',
       body: JSON.stringify({
+        type: 'OFFER',
         id: 'pro',
         title: 'Pro tier',
         price: { amount: 10, currency: 'USD', interval: 'month' },

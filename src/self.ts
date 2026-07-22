@@ -282,6 +282,7 @@ export function selfOpenapi(): object {
 
 export function selfOffer(): object {
   return {
+    type: 'OFFER',
     id: 'attested-run',
     title: 'On-demand attested verification run',
     description:

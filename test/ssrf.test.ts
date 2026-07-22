@@ -200,6 +200,7 @@ describe('SSRF: redirect-follow off the declared probe (ax-6ql, second fix)', ()
         status: 402,
         contentType: 'application/json',
         body: JSON.stringify({
+          type: 'OFFER',
           id: 'pro',
           title: 'Pro tier',
           price: { amount: 10, currency: 'USD', interval: 'month' },

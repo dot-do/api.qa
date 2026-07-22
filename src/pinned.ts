@@ -323,6 +323,13 @@ export async function verifyPinnedSpec(
       finalUrls: new Map(),
     }
     probePlans.set(req.id, plan)
+    // Conditional applicability, evaluated BEFORE minDeclared: a metering probe
+    // whose gate says the target does not meter is NOT APPLICABLE — no channel
+    // need be declared and nothing is fetched.
+    if (req.appliesWhen !== undefined) {
+      const na = notApplicableReason(observer.items, phase1, req.appliesWhen)
+      if (na !== undefined) { plan.notApplicable = na; continue }
+    }
     const min = req.minDeclared ?? 1
     if (plan.declared.length < min) {
       plan.unresolved =
@@ -434,6 +441,16 @@ export async function verifyPinnedSpec(
         detail: `AX ${axScore.points}/10 (floor ${req.minScore})`, evidence: [],
       })
     } else if (req.kind === 'check') {
+      // A check requirement may be conditionally applicable (same contract as
+      // a probe): if its gate says not-applicable, it passes without judging
+      // the check — e.g. offers-402 applies only to a metered target.
+      if (req.appliesWhen !== undefined) {
+        const na = notApplicableReason(fullBundle.items, probeReqs, req.appliesWhen)
+        if (na !== undefined) {
+          results.push({ id: req.id, title: `check ${req.check}`, verdict: 'pass', detail: na, evidence: [] })
+          continue
+        }
+      }
       // Bind a MUST clause to a SPECIFIC api.qa check, not the coarse floor.
       const c = surfaceChecks.find((sc) => sc.id === req.check)
       const verdict: Verdict = c?.verdict === 'pass' ? 'pass' : 'fail'
@@ -475,6 +492,13 @@ export async function verifyPinnedSpec(
       })
     } else if (req.kind === 'probe') {
       const plan = probePlans.get(req.id)!
+      if (plan.notApplicable !== undefined) {
+        results.push({
+          id: req.id, title: `probe ${req.probe}`, verdict: 'pass',
+          detail: plan.notApplicable, evidence: [ROLE.agentsJson],
+        })
+        continue
+      }
       if (plan.unresolved !== undefined) {
         results.push({
           id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
@@ -747,10 +771,36 @@ interface ProbePlan {
   declared: ProbeEntry[]
   /** Fail-closed reason that dooms the whole requirement (never a skip). */
   unresolved?: string
+  /** Conditional-applicability opt-out: requirement passes as NOT APPLICABLE. */
+  notApplicable?: string
   /** Per-entry refusals (non-same-origin / non-GET) — never fetched. */
   entryProblems: Map<number, string>
   /** Final URLs actually observed (after verifier-owned param injection). */
   finalUrls: Map<number, string>
+}
+
+/**
+ * Evaluate a requirement's `appliesWhen` gate. Returns a NOT-APPLICABLE reason
+ * when the gate's source channel reports a value other than the required one,
+ * or `undefined` when the requirement APPLIES. Fail-closed: an unreadable
+ * source (missing evidence / absent path / non-JSON) APPLIES — a target cannot
+ * dodge an obligation by making its own gate unreadable.
+ */
+function notApplicableReason(
+  items: Evidence[],
+  probeReqs: Array<Extract<PinnedRequirement, { kind: 'probe' }>>,
+  cond: { fromProbe: string; path: string; equals: unknown },
+): string | undefined {
+  const srcReq = probeReqs.find((r) => r.probe === cond.fromProbe)
+  const srcEv = srcReq ? items.find((e) => e.role === `pinned:${srcReq.id}:0`) : undefined
+  let body: unknown
+  try { body = JSON.parse(srcEv?.body ?? '') } catch { return undefined }
+  const r = readPath(body, cond.path)
+  if (r.found && JSON.stringify(r.value) !== JSON.stringify(cond.equals)) {
+    return `not applicable: probes.${cond.fromProbe} reports ${cond.path}=${JSON.stringify(r.value)}, ` +
+      `this requirement applies only when ${cond.path}=${JSON.stringify(cond.equals)}`
+  }
+  return undefined
 }
 
 function dedupeByUrl(entries: ProbeEntry[]): ProbeEntry[] {
@@ -977,6 +1027,9 @@ function judgeExpect(ev: Evidence | undefined, expect: EndpointExpect): string[]
         if (p.exists !== undefined && r.found !== p.exists) problems.push(`path ${p.path} ${p.exists ? 'missing' : 'unexpectedly present'}`)
         if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
           problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
+        }
+        if (p.oneOf !== undefined && (!r.found || !p.oneOf.some((o) => JSON.stringify(r.value) === JSON.stringify(o)))) {
+          problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted one of ${JSON.stringify(p.oneOf)}`)
         }
         // Numeric comparators — the pinned floor/ceiling. A comparator on a
         // path that is absent or non-numeric is itself a failure (the target

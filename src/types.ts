@@ -271,6 +271,8 @@ export interface EndpointExpect {
   paths?: Array<{
     path: string
     equals?: unknown
+    /** The resolved value must be strictly equal to one of these (closed enum). */
+    oneOf?: unknown[]
     exists?: boolean
     gte?: number
     lte?: number
@@ -341,6 +343,17 @@ export type PinnedRequirement =
        */
       paramValue?: number | { fromProbe: string; path: string; multiply?: number }
       /**
+       * Conditional applicability. When present, this requirement is judged
+       * ONLY if another channel's observed body reports `path === equals`;
+       * otherwise the requirement is NOT APPLICABLE and passes without a
+       * probe being declared or fetched (e.g. hard-ceiling metering probes
+       * apply only when `probes.pricing` reports `model: "metered"`, so a
+       * free API is admissible without declaring an over-ceiling operation).
+       * Fail-closed: if applicability cannot be resolved (source unreadable /
+       * path absent), the requirement APPLIES.
+       */
+      appliesWhen?: { fromProbe: string; path: string; equals: unknown }
+      /**
        * When true, every declared entry's pathname must ALSO be observed
        * answering `200` with a top-level `type: "OK"` JSON envelope somewhere
        * in the same verification run (e.g. the keyless probe or the amount-0
@@ -361,7 +374,20 @@ export type PinnedRequirement =
    * verification instead of letting it ride a coarse floor that tolerates its
    * violation. A `skip` or unknown check id is a failure under `must: 'pass'`.
    */
-  | { id: string; kind: 'check'; check: string; must: 'pass' }
+  | {
+      id: string
+      kind: 'check'
+      check: string
+      must: 'pass'
+      /**
+       * Conditional applicability (same contract as the probe variant): judge
+       * this check ONLY when another channel's observed body reports
+       * `path === equals`; otherwise NOT APPLICABLE and passes (e.g. offers-402
+       * applies only when probes.pricing reports model:"metered"). Fail-closed:
+       * unresolvable applicability means the check APPLIES.
+       */
+      appliesWhen?: { fromProbe: string; path: string; equals: unknown }
+    }
 
 export interface PinnedSpec {
   $type: 'PinnedSpec'
