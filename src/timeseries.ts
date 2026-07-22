@@ -55,7 +55,9 @@ export interface SeriesPoint {
   /** Was the target/endpoint serving this run? (see `deriveUp`). */
   up: boolean
   /** Response latency, ms. Per-endpoint: that endpoint's probe latency
-   *  (mean of its probes that run). Target-level: mean across its endpoints. */
+   *  (mean of its probes that run). Target-level: probe-weighted mean across
+   *  ALL same-origin probes (Σ elapsedMs / Σ probe count) — consistent with
+   *  how the target-level errorRate is derived from the same probe set. */
   latencyMs: number
   /** Fraction 0..1 of this sample's probes that errored (network / 5xx). */
   errorRate: number
@@ -126,9 +128,15 @@ export interface SeriesQueryOpts {
   endpoint?: string
   /** Window lower bound, ms epoch (inclusive). Default: no lower bound. */
   fromMs?: number
-  /** Window upper bound, ms epoch (inclusive). Default: `nowMs`. */
+  /**
+   * Window upper bound, ms epoch (inclusive). Default: `nowMs` if supplied,
+   * else the latest timestamp actually present in the stored series
+   * (data-driven — the store never reads the wall clock; see
+   * `TimeseriesStore.query`).
+   */
   toMs?: number
-  /** Reference "now" for a relative window / the default upper bound. */
+  /** Reference "now" for a relative window / the default upper bound. Callers
+   *  that want a wall-clock-relative window must supply this themselves. */
   nowMs?: number
   /** Also compute a per-endpoint breakdown (target-level query only). */
   breakdown?: boolean
@@ -200,10 +208,8 @@ export function seriesPointsFromReport(
   }
 
   const endpointPoints: Array<Omit<SeriesPoint, 'freshness'>> = []
-  const endpointLatencies: number[] = []
   for (const [endpoint, g] of byEndpoint) {
     const latencyMs = round(g.latSum / g.total)
-    endpointLatencies.push(latencyMs)
     endpointPoints.push({
       at,
       target,
@@ -215,12 +221,15 @@ export function seriesPointsFromReport(
     })
   }
 
-  // Target-level aggregate over ALL same-origin probes.
+  // Target-level aggregate over ALL same-origin probes. latencyMs is
+  // PROBE-weighted — Σ(elapsedMs) / Σ(probe count) over every same-origin
+  // probe — matching how errorRate is derived from the SAME `items`
+  // population, rather than an unweighted mean of each endpoint's own mean
+  // (which would over-weight endpoints with few probes).
   const total = items.length
   const errCount = items.filter((it) => isProbeError(it.status)).length
-  const targetLatency = endpointLatencies.length
-    ? round(endpointLatencies.reduce((a, b) => a + b, 0) / endpointLatencies.length)
-    : 0
+  const latTotal = items.reduce((a, it) => a + Math.max(0, it.elapsedMs), 0)
+  const targetLatency = total > 0 ? round(latTotal / total) : 0
   const targetPoint: Omit<SeriesPoint, 'freshness'> = {
     at,
     target,
@@ -359,8 +368,14 @@ export class TimeseriesStore {
   async query(id: string, opts: SeriesQueryOpts = {}): Promise<SeriesQueryResult> {
     const raw = await this.readRaw(id)
     const rollups = await this.readRollups(id)
-    const nowMs = opts.nowMs ?? Date.now()
-    const toMs = opts.toMs ?? nowMs
+    // No wall-clock read here — the store's query API must be clock-
+    // independent for determinism (same stored data → same result on every
+    // call, forever). When neither `toMs` nor `nowMs` is supplied, the
+    // default window end is DATA-DRIVEN: the latest timestamp actually
+    // present in the stored series, never `Date.now()`. Callers that need a
+    // "now"-relative window (e.g. the Worker's /series routes) must pass an
+    // explicit `nowMs`/`toMs`.
+    const toMs = opts.toMs ?? opts.nowMs ?? latestStoredAt(raw, rollups)
     const fromMs = opts.fromMs ?? Number.NEGATIVE_INFINITY
     // Rollup buckets do not retain the target string; fall back to the series id.
     const target = raw.find((p) => p.target)?.target ?? id
@@ -379,6 +394,23 @@ export class TimeseriesStore {
 
     return { ...base, perEndpoint }
   }
+}
+
+/**
+ * Deterministic default window end when a query supplies neither `toMs` nor
+ * `nowMs`: the latest timestamp actually present in the stored data — the
+ * newest raw point's `at`, or the end of the newest rollup hour, whichever is
+ * later. NEVER the wall clock (see `TimeseriesStore.query`). An empty series
+ * (no raw points, no rollups) falls back to 0 — an empty window, not "now".
+ */
+function latestStoredAt(raw: SeriesPoint[], rollups: RollupBucket[]): number {
+  let latest = 0
+  for (const p of raw) if (p.at > latest) latest = p.at
+  for (const b of rollups) {
+    const end = b.hourStart + HOUR_MS
+    if (end > latest) latest = end
+  }
+  return latest
 }
 
 /** Fold one evicted raw point into its (hour, endpoint) rollup bucket. */
@@ -406,7 +438,7 @@ function computeStats(
     .filter((p) => p.endpoint === q.endpoint && p.at >= q.fromMs && p.at <= q.toMs)
     .sort((a, b) => a.at - b.at)
   const inWindowRollups = rollups.filter(
-    (b) => b.endpoint === q.endpoint && b.hourStart < q.toMs + HOUR_MS && b.hourStart + HOUR_MS > q.fromMs,
+    (b) => b.endpoint === q.endpoint && b.hourStart <= q.toMs && b.hourStart + HOUR_MS > q.fromMs,
   )
 
   let count = inWindowRaw.length

@@ -18,14 +18,17 @@ import { describe, it, expect } from 'vitest'
 import { createApp } from '../src/worker.js'
 import { ReportCache, MemoryKV } from '../src/cache.js'
 import { MonitorStore, monitorId } from '../src/monitors.js'
+import { sha256Hex } from '../src/digest.js'
 import {
   TimeseriesStore,
   percentile,
+  seriesPointsFromReport,
   type SeriesPoint,
   type SeriesQueryResult,
 } from '../src/timeseries.js'
 import { goodTargetRoutes, makeFetcher, GOOD } from './helpers.js'
 import type { Fetcher } from '../src/http.js'
+import type { Evidence, VerificationReport } from '../src/types.js'
 
 type Sample = Omit<SeriesPoint, 'freshness'>
 
@@ -42,6 +45,29 @@ function ep(at: number, endpoint: string, over: Partial<Sample> = {}): Sample {
 const req = (path: string, init?: RequestInit) => new Request(`https://api.qa${path}`, init)
 const jsonReq = (path: string, body: unknown) =>
   req(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+/** One observed same-origin probe, for hand-built seriesPointsFromReport fixtures. */
+function probe(method: string, path: string, elapsedMs: number, status = 200): Evidence {
+  return {
+    role: 'probe:test',
+    url: `${T}${path}`,
+    method,
+    status,
+    contentType: 'application/json',
+    headers: {},
+    body: null,
+    elapsedMs,
+  }
+}
+
+/** Minimal VerificationReport fixture: only the fields seriesPointsFromReport reads. */
+function fakeReport(items: Evidence[], grade = 'A+'): VerificationReport {
+  return {
+    target: T,
+    grade,
+    evidence: { target: T, fetchedAt: new Date(0).toISOString(), seed: 1, items },
+  } as unknown as VerificationReport
+}
 
 describe('percentile (pure, nearest-rank)', () => {
   it('computes nearest-rank p50/p95/p99 deterministically', () => {
@@ -151,6 +177,26 @@ describe('TimeseriesStore.query — per-endpoint breakdown', () => {
   })
 })
 
+describe('seriesPointsFromReport — target latency is probe-weighted (LOW fix)', () => {
+  it('endpoint A: 1 probe@100ms, endpoint B: 3 probes@0ms → target latency = 25ms (probe-weighted), not 50ms (endpoint-mean)', () => {
+    const report = fakeReport([
+      probe('GET', '/a', 100),
+      probe('GET', '/b', 0),
+      probe('GET', '/b', 0),
+      probe('GET', '/b', 0),
+    ])
+    const points = seriesPointsFromReport(report, 1000)
+    const target = points.find((p) => p.endpoint === undefined)!
+    expect(target.latencyMs).toBe(25) // (100+0+0+0)/4, NOT (100+0)/2 = 50
+
+    // Per-endpoint breakdown is unchanged: each endpoint's own mean.
+    const a = points.find((p) => p.endpoint === 'GET /a')!
+    const b = points.find((p) => p.endpoint === 'GET /b')!
+    expect(a.latencyMs).toBe(100)
+    expect(b.latencyMs).toBe(0)
+  })
+})
+
 describe('TimeseriesStore — freshness', () => {
   it('records the gap since the previous sample of the same series (0 for the first)', async () => {
     const store = new TimeseriesStore(new MemoryKV())
@@ -192,6 +238,58 @@ describe('TimeseriesStore.query — determinism', () => {
     const a = await store.query(id, { nowMs: 3000, breakdown: true })
     const b = await store.query(id, { nowMs: 3000, breakdown: true })
     expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+  })
+
+  it('store.query(id, {}) — omitting nowMs/toMs entirely — is still clock-independent: identical results over identical stored data', async () => {
+    const store = new TimeseriesStore(new MemoryKV())
+    const id = 'series-det-noargs'
+    await store.record(id, [0, 1000, 2000].map((at) => tp(at, { latencyMs: at / 100 })))
+    const a = await store.query(id, {})
+    const b = await store.query(id, {})
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+    // The default window end is DATA-DRIVEN (the latest stored point), not
+    // wall-clock — so it deterministically includes every stored point, and
+    // the resolved window.toMs is pinned to that stored point, not "now".
+    expect(a.count).toBe(3)
+    expect(a.points.map((p) => p.at)).toEqual([0, 1000, 2000])
+    expect(a.window.toMs).toBe(2000)
+  })
+})
+
+describe('TimeseriesStore.query — rollup window boundary (HIGH fix)', () => {
+  it('a window entirely INSIDE hour0 does not fold in a rollup bucket that STARTS after the window end', async () => {
+    // rawCap=1 forces immediate eviction-to-rollup as each new point arrives,
+    // exactly reproducing the reported scenario.
+    const store = new TimeseriesStore(new MemoryKV(), { rawCap: 1 })
+    const id = 'series-bound'
+    const HOUR = 3_600_000
+    // hour0: UP. hour1: DOWN/F. hour2: UP. Recorded one at a time so hour0
+    // and hour1 both get evicted to rollup buckets, leaving hour2 as the
+    // sole raw point.
+    await store.record(id, [tp(0, { up: true, grade: 'A+' })])
+    await store.record(id, [tp(HOUR, { up: false, grade: 'F', errorRate: 1 })])
+    await store.record(id, [tp(2 * HOUR, { up: true, grade: 'A+' })])
+
+    // Window is entirely inside hour0 — must NOT see hour1's DOWN bucket
+    // (hourStart = HOUR), which starts a full hour after the window end.
+    const res = await store.query(id, { fromMs: 0, toMs: 1 })
+    expect(res.count).toBe(1)
+    expect(res.uptimePct).toBe(100)
+  })
+
+  it('companion: a window that GENUINELY spans hour0 and hour1 still counts both buckets', async () => {
+    const store = new TimeseriesStore(new MemoryKV(), { rawCap: 1 })
+    const id = 'series-bound-span'
+    const HOUR = 3_600_000
+    await store.record(id, [tp(0, { up: true, grade: 'A+' })])
+    await store.record(id, [tp(HOUR, { up: false, grade: 'F', errorRate: 1 })])
+    await store.record(id, [tp(2 * HOUR, { up: true, grade: 'A+' })])
+
+    // Window runs from hour0 into the middle of hour1 (well short of hour2's
+    // raw point at 2*HOUR) — a genuine two-bucket span.
+    const res = await store.query(id, { fromMs: 0, toMs: HOUR + HOUR / 2 })
+    expect(res.count).toBe(2)
+    expect(res.uptimePct).toBe(50)
   })
 })
 
@@ -303,6 +401,56 @@ describe('integration — scheduledTick writes a per-target + per-endpoint serie
     expect(series.count).toBe(1)
     // The query performed NO additional fetches — pure read over stored data.
     expect(fetches).toBe(afterTick)
+  })
+
+  it('GET /series?target=&suiteDigest= (no environment) resolves the SAME id registration defaulted to (MED fix)', async () => {
+    const cache = new ReportCache(new MemoryKV(), 300)
+    const monitors = new MonitorStore(new MemoryKV())
+    const timeseries = new TimeseriesStore(new MemoryKV())
+    let clock = 0
+    const app = createApp(
+      {},
+      { externalFetcher: makeFetcher(goodTargetRoutes()), externalDelayMs: 0, cache, monitors, timeseries, now: () => clock },
+    )
+
+    // A single-environment suite, so registration WITHOUT an explicit
+    // `environment` defaults it to that one env (worker.ts ~628).
+    const suite = {
+      $type: 'Suite',
+      name: 'single-env',
+      version: '1',
+      environments: { only: { vars: { baseUrl: GOOD } } },
+      requirements: [
+        { id: 'llms', kind: 'endpoint', method: 'GET', path: '/llms.txt', expect: { status: 200 } },
+      ],
+    }
+    const suiteText = JSON.stringify(suite)
+    const suiteDigest = await sha256Hex(suiteText)
+    await cache.putSuiteText(suiteDigest, suiteText)
+
+    // Register WITHOUT an environment — the write path defaults it.
+    const reg = await app.fetch(jsonReq('/monitors', { target: 'good.example', suiteDigest, interval: 60 }))
+    expect(reg.status).toBe(201)
+    const { monitor } = (await reg.json()) as { monitor: { id: string; environment?: string } }
+    expect(monitor.environment).toBe('only')
+
+    clock = 1000
+    const summary = await app.scheduledTick(1000)
+    expect(summary.ran).toBe(1)
+
+    // Read back WITHOUT an environment param — before the fix this computed
+    // monitorId(origin, suiteDigest, undefined), a DIFFERENT id than the
+    // registration's defaulted-environment id, and returned an empty series.
+    const got = await app.fetch(req(`/series?target=good.example&suiteDigest=${suiteDigest}`))
+    expect(got.status).toBe(200)
+    const { series } = (await got.json()) as { series: SeriesQueryResult }
+    expect(series.count).toBe(1)
+    expect(series.points).toHaveLength(1)
+
+    // And it resolves to the SAME id /monitors/:id/series would use directly.
+    const direct = await app.fetch(req(`/monitors/${monitor.id}/series`))
+    const { series: directSeries } = (await direct.json()) as { series: SeriesQueryResult }
+    expect(directSeries.count).toBe(series.count)
   })
 
   it('refuses a private/IP-literal target on /series (same SSRF-consistent gate as the registry)', async () => {

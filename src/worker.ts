@@ -693,7 +693,27 @@ export function createApp(
           // could never be a monitor cannot address a series either.
           const normalized = normalizeTarget(target, env.ALLOW_PRIVATE_TARGETS === 'true')
           if ('error' in normalized) return json({ error: normalized.error }, 400)
-          const id = monitorId(normalized.origin, url.searchParams.get('suiteDigest') ?? undefined, url.searchParams.get('environment') ?? undefined)
+          const suiteDigest = url.searchParams.get('suiteDigest') ?? undefined
+          const environmentParam = url.searchParams.get('environment') ?? undefined
+          // The id must match what REGISTRATION stored under, not just the
+          // literal params: registration defaults `environment` to the
+          // suite's first environment when none was given (worker.ts ~628),
+          // so recomputing monitorId with an undefined environment here would
+          // resolve a DIFFERENT id than the write path used, and read back an
+          // empty series though data exists. Resolve by looking up the actual
+          // monitor RECORD (by origin + suiteDigest [+ environment, when
+          // given]) and using its STORED id — the read id always equals the
+          // write id, independent of how registration resolved the default.
+          let id = monitorId(normalized.origin, suiteDigest, environmentParam)
+          if (monitors) {
+            const match = (await monitors.list()).find(
+              (m) =>
+                m.target === normalized.origin &&
+                m.suiteDigest === suiteDigest &&
+                (environmentParam === undefined || m.environment === environmentParam),
+            )
+            if (match) id = match.id
+          }
           return json({ series: await seriesSource.query(id, seriesOptsFromUrl(url, now())) })
         }
         {
