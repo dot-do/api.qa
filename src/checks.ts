@@ -22,6 +22,13 @@ import {
   namespaceDomain,
   isGithubNamespace,
   githubNamespaceOwner,
+  parseJsonRpcMessage,
+  toolObjectsFrom,
+  uiTemplateOfTool,
+  resourceUriOfResult,
+  resourceContentOf,
+  externalUrlOf,
+  isMcpUiMime,
   type ServerJsonClaims,
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
@@ -555,6 +562,53 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       'server is present in the official MCP registry (informational)', undefined,
       [ROLE.mcpServerJson, ROLE.mcpRegistryPresence],
       judgeRegistryPresence(sjEv, server, presenceEv)))
+  }
+
+  // ── MCP-UI / streaming-component readiness (ax-odg, ADR-0022) ─────────────
+  //    "Renders trustworthily inside an agent host (ChatGPT/Claude/Goose/VS
+  //    Code)" made a gradeable claim — the trust primitive as the ecosystem
+  //    floods with unverified third-party widgets. This is an ADDITIVE readiness
+  //    dimension (every sub-check axItem undefined): a target with NO MCP-UI
+  //    (no tool advertises a `ui://` template) informationally SKIPs every
+  //    sub-check and is NEVER over-blocked — a non-MCP-UI API is unaffected.
+  //    A target that DECLARES MCP-UI but violates a sub-signal (broken/wrong-MIME
+  //    resource, remote code in the srcDoc, a secret leaked into a model-visible
+  //    channel, register divergence, no first-render tolerance) FAILs — an
+  //    honesty cap that grades the surface DOWN (a leaky/broken widget is worse
+  //    than none). DERIVED entirely from the target's published MCP surface.
+  {
+    const toolsEv = findEvidence(bundle, ROLE.mcpRemoteToolsList)
+    const callEv = findEvidence(bundle, ROLE.mcpUiToolsCall)
+    const readEv = findEvidence(bundle, ROLE.mcpUiResourceRead)
+    const extEv = findEvidence(bundle, ROLE.mcpUiExternalUrl)
+    const ui = buildMcpUiContext(toolsEv, callEv, readEv, extEv)
+
+    const uiEvidence = [ROLE.mcpRemoteToolsList, ROLE.mcpUiToolsCall, ROLE.mcpUiResourceRead, ROLE.mcpUiExternalUrl]
+
+    // (1) resource linkage + MIME
+    checks.push(check('mcp-ui-resource-linkage',
+      'MCP-UI tool result links a ui:// resource served with an MCP-Apps MIME', undefined,
+      uiEvidence, judgeMcpUiLinkage(ui)))
+
+    // (2) srcDoc self-containment + closed CSP
+    checks.push(check('mcp-ui-self-contained',
+      'ui:// srcDoc is self-contained (no remote code) and CSP-safe', undefined,
+      uiEvidence, judgeMcpUiSelfContained(ui)))
+
+    // (3) envelope hygiene — no secret in a model-visible channel (HIGH)
+    checks.push(check('mcp-ui-envelope-hygiene',
+      'no secret leaks into a model-visible channel (content/structuredContent)', undefined,
+      uiEvidence, judgeMcpUiEnvelopeHygiene(ui)))
+
+    // (4) three-register parity
+    checks.push(check('mcp-ui-register-parity',
+      'widget structuredContent is consistent with the agent/API register (no divergence)', undefined,
+      uiEvidence, judgeMcpUiRegisterParity(ui)))
+
+    // (5) host-render readiness
+    checks.push(check('mcp-ui-host-render',
+      'first-render-without-input tolerance + tool annotations / widgetDescription present', undefined,
+      uiEvidence, judgeMcpUiHostRender(ui)))
   }
 
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
@@ -1193,6 +1247,281 @@ function registryDocMentions(doc: unknown, name: string): boolean {
     if (scan(d.data)) return true
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// MCP-UI / streaming-component readiness judges (pure) — ax-odg, ADR-0022
+// ---------------------------------------------------------------------------
+
+/**
+ * The distilled MCP-UI evidence the five readiness judges share, parsed ONCE
+ * from the recorded tools/list, tools/call, resources/read, and (optional)
+ * externalUrl evidence. `claims` is the activation gate: false ⇒ the whole
+ * dimension informationally SKIPs (no tool advertised a `ui://` template), so a
+ * non-MCP-UI target is never over-blocked.
+ */
+interface McpUiContext {
+  /** A tool DEFINITION advertised a `ui://` template ⇒ the target CLAIMS MCP-UI. */
+  claims: boolean
+  /** The UI-bearing tool definition (for host-render readiness), if any. */
+  uiTool?: Record<string, unknown>
+  /** The `ui://` template the tool declared. */
+  templateUri?: string
+  /** The tool RESULT object (structuredContent / content / _meta). */
+  result?: Record<string, unknown>
+  /** The `ui://` resourceUri the RESULT linked (may differ from templateUri). */
+  linkedUri?: string
+  /** The resolved UIResource content (mimeType + srcDoc text). */
+  resource?: { mimeType?: string; text?: string; uri?: string }
+  /** An externalUrl UIResource target, if the resource is a uri-list. */
+  externalUrl?: string
+  /** The externalUrl fetch evidence (present only when it passed the SSRF gate). */
+  extEv?: Evidence
+  /** True when a resources/read was recorded at all (vs. never reached). */
+  readAttempted: boolean
+}
+
+function buildMcpUiContext(
+  toolsEv: Evidence | undefined,
+  callEv: Evidence | undefined,
+  readEv: Evidence | undefined,
+  extEv: Evidence | undefined,
+): McpUiContext {
+  const tools = toolObjectsFrom(parseJsonRpcMessage(toolsEv))
+  const uiTool = tools.find((t) => uiTemplateOfTool(t) !== undefined)
+  if (!uiTool) return { claims: false, readAttempted: false }
+
+  const templateUri = uiTemplateOfTool(uiTool)
+  const result = (parseJsonRpcMessage(callEv)?.result ?? undefined) as Record<string, unknown> | undefined
+  const linkedUri = resourceUriOfResult(result)
+  const wantUri = linkedUri ?? templateUri ?? ''
+  const readMsg = parseJsonRpcMessage(readEv)
+  const resource = wantUri ? resourceContentOf(readMsg, wantUri) : undefined
+  const externalUrl = externalUrlOf(resource)
+  return {
+    claims: true,
+    uiTool,
+    templateUri,
+    result,
+    linkedUri,
+    resource,
+    externalUrl,
+    extEv,
+    readAttempted: readEv !== undefined,
+  }
+}
+
+const NOT_READY = 'no MCP-UI declared (no tool advertises a ui:// template) — informational not-ready, not a failure'
+
+/**
+ * (1) Resource linkage + MIME. The tool result must carry `_meta.ui.resourceUri`
+ * → a `ui://` resource, and that resource must resolve with an MCP-Apps /
+ * MCP-UI MIME (`text/html;profile=mcp-app`, rawHtml, externalUrl, remote-dom).
+ * No claim ⇒ SKIP (not-ready). Claims but the link is missing / the resource is
+ * unresolved / served with the wrong MIME ⇒ FAIL (declares MCP-UI but broken).
+ */
+function judgeMcpUiLinkage(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.linkedUri) {
+    return { verdict: 'fail', detail: `a tool advertises a ui:// template (${ui.templateUri ?? '?'}) but its result carries no _meta.ui.resourceUri linking a rendered resource — the widget cannot be located by the host` }
+  }
+  if (!ui.resource) {
+    return { verdict: 'fail', detail: `tool result links ${ui.linkedUri} but resources/read returned no matching UIResource content — the claimed widget resource does not resolve` }
+  }
+  if (ui.externalUrl && !isPublicHttpsOffOriginAllowed(ui.externalUrl)) {
+    return { verdict: 'fail', detail: `UIResource externalUrl ${ui.externalUrl} is not a public https target (no cleartext, no private/metadata host) — refused without fetching (SSRF guard); a widget the host cannot safely load is not render-ready` }
+  }
+  if (!isMcpUiMime(ui.resource.mimeType)) {
+    return { verdict: 'fail', detail: `UIResource ${ui.linkedUri} is served as ${ui.resource.mimeType ?? '(no mimeType)'} — not an MCP-Apps/MCP-UI content type (text/html;profile=mcp-app, rawHtml, text/uri-list, or remote-dom); the host will not render it as a UI resource` }
+  }
+  return pass(`tool result links ${ui.linkedUri}, resolved with MCP-UI MIME ${ui.resource.mimeType}`)
+}
+
+/** The set of external http(s) references a srcDoc pulls — the supply-chain surface. */
+function externalRefsInSrcDoc(html: string): string[] {
+  const refs = new Set<string>()
+  const patterns: RegExp[] = [
+    /<script\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
+    /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
+    /<img\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
+    /@import\s+(?:url\()?["']?(https?:\/\/[^"'\s)]+)/gi,
+    /\b(?:fetch|import)\s*\(\s*["'](https?:\/\/[^"']+)/gi,
+    /\bnew\s+(?:WebSocket|EventSource)\s*\(\s*["']((?:https?|wss?):\/\/[^"']+)/gi,
+    /<iframe\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
+  ]
+  for (const re of patterns) {
+    let m: RegExpExecArray | null
+    while ((m = re.exec(html))) if (m[1]) refs.add(m[1])
+  }
+  return [...refs]
+}
+
+/** A CSP directive value that admits remote code / connections (a bare `*` or a remote origin). */
+function cspAdmitsRemote(csp: Record<string, unknown>): string[] {
+  const offenders: string[] = []
+  const risky = ['script-src', 'connect-src', 'default-src', 'style-src', 'img-src', 'frame-src']
+  for (const dir of risky) {
+    const raw = csp[dir]
+    const value = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
+    if (!value) continue
+    if (/(^|\s)\*(\s|$)/.test(value) || /https?:\/\//i.test(value) || /(^|\s)(https?:|\*):/.test(value)) {
+      offenders.push(`${dir} ${value.trim()}`)
+    }
+  }
+  return offenders
+}
+
+/**
+ * (2) srcDoc self-containment + closed CSP. The `ui://` srcDoc HTML must be
+ * self-contained — no external http(s) `<script>`/`<link>`/`<img>`/`<iframe>`,
+ * `@import`, or `fetch`/WebSocket to a remote host — because a widget that pulls
+ * remote code is a host-sandbox + supply-chain risk. Any `_meta.ui.csp` must be
+ * CLOSED (no wildcard / remote origin in a script/connect directive).
+ * No claim ⇒ SKIP. An externalUrl widget is graded on the fetched page (or, when
+ * unfetchable, on the linkage check, not here).
+ */
+function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  // The HTML under scrutiny: the inline srcDoc, or a fetched externalUrl page.
+  const html = ui.extEv?.body ?? ui.resource?.text
+  if (typeof html !== 'string' || html.length === 0) {
+    // externalUrl refused by the SSRF gate (never fetched) — the linkage check
+    // already FAILs it; here we cannot inspect self-containment, so SKIP so as
+    // not to double-count the same defect.
+    if (ui.externalUrl) return { verdict: 'skip', detail: `externalUrl UIResource ${ui.externalUrl} not inlined — self-containment judged on the linked page (see resource-linkage)` }
+    return { verdict: 'fail', detail: `UIResource ${ui.linkedUri ?? '?'} carries no srcDoc HTML to render — an empty widget is not render-ready` }
+  }
+  const refs = externalRefsInSrcDoc(html)
+  const meta = ui.result?._meta
+  const uiMeta = meta && typeof meta === 'object' ? ((meta as Record<string, unknown>).ui as Record<string, unknown> | undefined) : undefined
+  const csp = uiMeta && typeof uiMeta.csp === 'object' && uiMeta.csp !== null ? (uiMeta.csp as Record<string, unknown>) : undefined
+  const cspOffenders = csp ? cspAdmitsRemote(csp) : []
+  if (refs.length > 0) {
+    return { verdict: 'fail', detail: `ui:// srcDoc pulls remote code/assets: ${refs.slice(0, 4).join(', ')} — a widget that loads remote resources is a host-sandbox + supply-chain risk; the srcDoc must be self-contained (inline/precompiled, no external http(s) refs)` }
+  }
+  if (cspOffenders.length > 0) {
+    return { verdict: 'fail', detail: `_meta.ui.csp is not closed: ${cspOffenders.slice(0, 3).join('; ')} — a widget CSP that admits a wildcard or remote origin defeats the host sandbox` }
+  }
+  return pass(`srcDoc is self-contained (no external http(s) refs)${csp ? ' with a closed CSP' : ''}`)
+}
+
+/** Model-visible strings that look like leaked secrets — targeted, low-false-positive. */
+function secretsIn(value: unknown): string[] {
+  const hits: string[] = []
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '')
+  const patterns: Array<[RegExp, string]> = [
+    [/\bsk-[A-Za-z0-9]{16,}\b/, 'OpenAI-style secret key (sk-…)'],
+    [/\bAKIA[0-9A-Z]{16}\b/, 'AWS access key id (AKIA…)'],
+    [/\bghp_[A-Za-z0-9]{20,}\b/, 'GitHub token (ghp_…)'],
+    [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, 'Slack token (xox…)'],
+    [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'PEM private key'],
+    [/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, 'JWT (three-segment)'],
+    [/\bBearer\s+[A-Za-z0-9._-]{16,}/, 'inline Bearer token'],
+    [/"(?:api[_-]?key|secret|password|access[_-]?token|client[_-]?secret)"\s*:\s*"[^"]{8,}"/i, 'secret-named field with a value'],
+  ]
+  for (const [re, label] of patterns) if (re.test(text)) hits.push(label)
+  return hits
+}
+
+/**
+ * (3) Envelope hygiene (HIGH). The three-way split — structuredContent (model +
+ * widget), content (model narration), _meta (widget-only) — must not leak a
+ * secret into a MODEL-VISIBLE channel. A token/key in `content` or
+ * `structuredContent` ⇒ FAIL (it is exfiltrated to the model/agent transcript).
+ * `_meta` is widget-only and not scanned here. No claim ⇒ SKIP.
+ */
+function judgeMcpUiEnvelopeHygiene(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.result) return { verdict: 'skip', detail: 'MCP-UI claimed but no tool result recorded — nothing to inspect for envelope hygiene' }
+  const modelVisible: Array<[string, unknown]> = [
+    ['structuredContent', ui.result.structuredContent],
+    ['content', ui.result.content],
+  ]
+  for (const [channel, value] of modelVisible) {
+    if (value === undefined) continue
+    const hits = secretsIn(value)
+    if (hits.length > 0) {
+      return { verdict: 'fail', detail: `a secret (${hits[0]}) leaks into the model-visible \`${channel}\` channel — model-visible channels must never carry credentials; secrets belong only in the widget-only _meta` }
+    }
+  }
+  return pass('no secret detected in the model-visible content/structuredContent channels')
+}
+
+/** Deep key/value conflicts between two objects (same key present in both, different value). */
+function conflictingKeys(a: unknown, b: unknown, prefix = ''): string[] {
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return []
+  const out: string[] = []
+  const ao = a as Record<string, unknown>
+  const bo = b as Record<string, unknown>
+  for (const key of Object.keys(ao)) {
+    if (!(key in bo)) continue
+    const av = ao[key]
+    const bv = bo[key]
+    const path = prefix ? `${prefix}.${key}` : key
+    if (av && bv && typeof av === 'object' && typeof bv === 'object') {
+      out.push(...conflictingKeys(av, bv, path))
+    } else if (JSON.stringify(av) !== JSON.stringify(bv)) {
+      out.push(`${path} (${JSON.stringify(av)} ≠ ${JSON.stringify(bv)})`)
+    }
+  }
+  return out
+}
+
+/**
+ * (4) Three-register parity. The widget's data must be CONSISTENT with the
+ * agent/API register — the widget must not show different data than the twin.
+ * `structuredContent` is the model+widget register; any widget-only data payload
+ * (`_meta.ui.data` / `_meta.ui.props`) must not CONTRADICT it. A conflicting key
+ * ⇒ FAIL (the widget renders divergent data from what the agent/API sees). When
+ * MCP-UI is claimed but there is NO structuredContent for the widget/model to
+ * share, there is nothing byte-consistent to render ⇒ FAIL. No claim ⇒ SKIP.
+ */
+function judgeMcpUiRegisterParity(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  if (!ui.result) return { verdict: 'skip', detail: 'MCP-UI claimed but no tool result recorded — nothing to check parity against' }
+  const structured = ui.result.structuredContent
+  const meta = ui.result._meta
+  const uiMeta = meta && typeof meta === 'object' ? ((meta as Record<string, unknown>).ui as Record<string, unknown> | undefined) : undefined
+  const widgetData = uiMeta ? (uiMeta.data ?? uiMeta.props) : undefined
+  if (widgetData !== undefined && (structured === undefined || structured === null)) {
+    return { verdict: 'fail', detail: 'the widget renders from a _meta.ui data payload but the tool result carries NO structuredContent — the widget register has no agent/API twin to be consistent with (register divergence)' }
+  }
+  if (widgetData !== undefined && structured !== undefined) {
+    const conflicts = conflictingKeys(widgetData, structured)
+    if (conflicts.length > 0) {
+      return { verdict: 'fail', detail: `widget data diverges from the agent/API register (structuredContent): ${conflicts.slice(0, 4).join('; ')} — the widget must show the same data as the json/markdown twin` }
+    }
+  }
+  if (structured === undefined || structured === null) {
+    return { verdict: 'fail', detail: 'MCP-UI is claimed but the tool result carries no structuredContent — the widget has no byte-consistent state shared with the model/API register' }
+  }
+  return pass('widget structuredContent is present and consistent with the agent/API register (no divergence)')
+}
+
+/**
+ * (5) Host-render readiness. The widget should render on first turn WITHOUT user
+ * input (no required tool inputs), and the tool should carry the host-facing
+ * affordances a host needs: a description / `widgetDescription` and annotations.
+ * No claim ⇒ SKIP. Claims but requires input to first-render, or lacks a
+ * description/annotations ⇒ FAIL (a widget the host cannot present unprompted).
+ */
+function judgeMcpUiHostRender(ui: McpUiContext): { verdict: Verdict; detail: string } {
+  if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
+  const tool = ui.uiTool ?? {}
+  const inputSchema = tool.inputSchema && typeof tool.inputSchema === 'object' ? (tool.inputSchema as Record<string, unknown>) : undefined
+  const required = Array.isArray(inputSchema?.required) ? (inputSchema!.required as unknown[]) : []
+  if (required.length > 0) {
+    return { verdict: 'fail', detail: `the UI tool requires input(s) [${required.join(', ')}] before it can be called — the widget cannot first-render without user input, so the host cannot present it unprompted` }
+  }
+  const meta = tool._meta && typeof tool._meta === 'object' ? (tool._meta as Record<string, unknown>) : undefined
+  const uiMeta = meta && typeof meta.ui === 'object' && meta.ui !== null ? (meta.ui as Record<string, unknown>) : undefined
+  const widgetDescription = typeof uiMeta?.widgetDescription === 'string' && uiMeta.widgetDescription.length > 0
+  const hasDescription = typeof tool.description === 'string' && tool.description.length > 0
+  const hasAnnotations = tool.annotations && typeof tool.annotations === 'object' && Object.keys(tool.annotations as Record<string, unknown>).length > 0
+  if (!widgetDescription && !hasDescription && !hasAnnotations) {
+    return { verdict: 'fail', detail: 'the UI tool declares no description, widgetDescription, or annotations — the host has no affordance text to present the widget trustworthily' }
+  }
+  return pass(`first-render tolerant (no required inputs) with ${widgetDescription ? 'widgetDescription' : hasDescription ? 'a description' : 'annotations'} for the host`)
 }
 
 function looksLikeHtml(body: string): boolean {

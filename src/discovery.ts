@@ -77,6 +77,13 @@ export const ROLE = {
   mcpRegistryDnsTxt: 'probe:mcp:registry-dns-txt',
   /** OPTIONAL/informational: presence in the official MCP registry, by name. */
   mcpRegistryPresence: 'probe:mcp:registry-presence',
+  // ── MCP-UI / streaming-component readiness (ax-odg, ADR-0022) ─────────────
+  /** tools/call (POST) on a UI-bearing tool — the result carries the ui:// link. */
+  mcpUiToolsCall: 'probe:mcp:ui-tools-call',
+  /** resources/read (POST) of the declared ui:// UIResource (srcDoc + MIME). */
+  mcpUiResourceRead: 'probe:mcp:ui-resource-read',
+  /** GET of an externalUrl UIResource target (SSRF-gated; only when public-https). */
+  mcpUiExternalUrl: 'probe:mcp:ui-external-url',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -710,6 +717,227 @@ async function observeMcpRegistry(origin: string, observer: Observer): Promise<v
   }
 }
 
+// ---------------------------------------------------------------------------
+// MCP-UI / streaming-component readiness (ax-odg, ADR-0022)
+// ---------------------------------------------------------------------------
+
+/**
+ * The MCP Apps (SEP-1865) UIResource MIME profile. A `resources/read` of a
+ * `ui://` template returns HTML under this profile so the host renders it in a
+ * sandboxed iframe. We ALSO accept the three MCP-UI content types that predate
+ * (and fold into) the profile, so a target on either spelling is recognized.
+ */
+export const MCP_APP_MIME = 'text/html;profile=mcp-app'
+
+/** True when `mime` is a recognized MCP-UI / MCP-Apps UIResource content type. */
+export function isMcpUiMime(mime: string | undefined | null): boolean {
+  if (typeof mime !== 'string') return false
+  const m = mime.toLowerCase().replace(/\s+/g, '')
+  // MCP Apps profile, MCP-UI rawHtml, externalUrl (uri-list), remote-dom.
+  return (
+    m.startsWith('text/html;profile=mcp-app') ||
+    m === 'text/html' ||
+    m.startsWith('text/html;') ||
+    m.startsWith('text/uri-list') ||
+    m.startsWith('application/vnd.mcp-ui.remote-dom')
+  )
+}
+
+/**
+ * Parse a JSON-RPC message out of an MCP POST body, tolerating BOTH plain
+ * `application/json` and SSE (`text/event-stream`) framing where the JSON rides
+ * on `data:` lines. Pure. Shared by the MCP-UI observe (here) and the judges
+ * (checks.ts). Mirrors the SSE tolerance the registry-live judge already has.
+ */
+export function parseJsonRpcMessage(ev: Evidence | undefined): Record<string, unknown> | undefined {
+  if (!ev || ev.body === null) return undefined
+  const body = ev.body
+  try {
+    const parsed = JSON.parse(body)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+  } catch { /* fall through to SSE */ }
+  let found: Record<string, unknown> | undefined
+  for (const line of body.split(/\r?\n/)) {
+    const m = /^data:\s?(.*)$/.exec(line)
+    if (!m || !m[1]) continue
+    try {
+      const parsed = JSON.parse(m[1])
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) found = parsed as Record<string, unknown>
+    } catch { /* ignore */ }
+  }
+  return found
+}
+
+/** The `result.tools[]` (full objects, not just names) from a tools/list message. */
+export function toolObjectsFrom(message: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  const result = message?.result
+  if (!result || typeof result !== 'object') return []
+  const tools = (result as Record<string, unknown>).tools
+  if (!Array.isArray(tools)) return []
+  return tools.filter((t): t is Record<string, unknown> => !!t && typeof t === 'object' && !Array.isArray(t))
+}
+
+/** A `ui://` string, or undefined. */
+function asUiUri(v: unknown): string | undefined {
+  return typeof v === 'string' && v.startsWith('ui://') ? v : undefined
+}
+
+/**
+ * The `ui://` template a tool DEFINITION declares, under either the MCP Apps
+ * `_meta.ui.resourceUri` key or the OpenAI Apps SDK `_meta['openai/outputTemplate']`
+ * dialect. This is the affirmative "this target CLAIMS MCP-UI" signal — a tool
+ * with no template means the whole dimension informationally SKIPs, so a plain
+ * (non-MCP-UI) MCP server is NEVER probed further and never over-blocked.
+ */
+export function uiTemplateOfTool(tool: Record<string, unknown> | undefined): string | undefined {
+  const meta = tool?._meta
+  if (!meta || typeof meta !== 'object') return undefined
+  const m = meta as Record<string, unknown>
+  const ui = m.ui && typeof m.ui === 'object' ? (m.ui as Record<string, unknown>) : undefined
+  return asUiUri(ui?.resourceUri) ?? asUiUri(m['openai/outputTemplate'])
+}
+
+/** The `ui://` resourceUri a tool RESULT links to (same two dialect keys). */
+export function resourceUriOfResult(result: Record<string, unknown> | undefined): string | undefined {
+  const meta = result?._meta
+  if (!meta || typeof meta !== 'object') return undefined
+  const m = meta as Record<string, unknown>
+  const ui = m.ui && typeof m.ui === 'object' ? (m.ui as Record<string, unknown>) : undefined
+  return asUiUri(ui?.resourceUri) ?? asUiUri(m['openai/outputTemplate'])
+}
+
+/**
+ * The first UIResource content entry from a `resources/read` result whose uri
+ * matches `wantUri` (or the first content when no uri is echoed). Returns the
+ * `{ mimeType, text }` the judge inspects for MIME + srcDoc + externalUrl.
+ */
+export function resourceContentOf(
+  message: Record<string, unknown> | undefined,
+  wantUri: string,
+): { mimeType?: string; text?: string; uri?: string } | undefined {
+  const result = message?.result
+  if (!result || typeof result !== 'object') return undefined
+  const contents = (result as Record<string, unknown>).contents
+  if (!Array.isArray(contents)) return undefined
+  const entries = contents.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+  const matched = entries.find((c) => c.uri === wantUri) ?? entries[0]
+  if (!matched) return undefined
+  return {
+    mimeType: typeof matched.mimeType === 'string' ? matched.mimeType : undefined,
+    text: typeof matched.text === 'string' ? matched.text : undefined,
+    uri: typeof matched.uri === 'string' ? matched.uri : undefined,
+  }
+}
+
+/** The externalUrl a UIResource points at, when its content is `text/uri-list`. */
+export function externalUrlOf(content: { mimeType?: string; text?: string } | undefined): string | undefined {
+  if (!content || typeof content.text !== 'string') return undefined
+  const isUriList = typeof content.mimeType === 'string' && content.mimeType.toLowerCase().replace(/\s+/g, '').startsWith('text/uri-list')
+  if (!isUriList) return undefined
+  // A uri-list is newline-delimited; comment lines start with '#'. Take the first URL.
+  const first = content.text.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0 && !l.startsWith('#'))
+  return first
+}
+
+/** The MCP `tools/call` JSON-RPC request for a named UI-bearing tool. */
+function mcpToolsCallRequest(name: string): unknown {
+  return { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name, arguments: {} } }
+}
+
+/** The MCP `resources/read` JSON-RPC request for a `ui://` template uri. */
+function mcpResourcesReadRequest(uri: string): unknown {
+  return { jsonrpc: '2.0', id: 4, method: 'resources/read', params: { uri } }
+}
+
+/**
+ * Observe the MCP-UI / streaming-component readiness surfaces (ax-odg, ADR-0022).
+ * Runs AFTER observeMcpRegistry so it can REUSE that pass's already-recorded
+ * initialize (session id) + tools/list evidence for the same server.json remote
+ * — no re-handshake, no extra budget for the common case.
+ *
+ * ACTIVATION is zero-overhead and honest: it fires the tool-call + resource-read
+ * probes ONLY when a tool DEFINITION advertises a `ui://` template (MCP Apps
+ * `_meta.ui.resourceUri` or the Apps-SDK `openai/outputTemplate` dialect). A
+ * plain MCP server (no UI template) is never probed further, so a legit
+ * non-MCP-UI API adds no calls and the whole dimension informationally SKIPs.
+ *
+ * SSRF: this touches TARGET-CONTROLLED URLs and gates every one. The tools/call
+ * and resources/read POSTs go to the SAME remote the registry pass already
+ * gated (public-https off-origin allowance + observeMcp's private-host backstop
+ * + never-follow-redirect). A `ui://` uri is resolved over that gated MCP
+ * transport (never fetched as a scheme). An `externalUrl` UIResource is the one
+ * attacker-influenced http(s) target: it is fetched ONLY when it passes the
+ * SAME narrow public-https gate (https, public host, no private/metadata IP);
+ * a private/non-https externalUrl is REFUSED WITHOUT a byte leaving, and the
+ * judge re-derives that refusal from the recorded uri-list. No new un-gated
+ * fetch is introduced.
+ */
+async function observeMcpUi(origin: string, observer: Observer): Promise<void> {
+  // Resolve the MCP remote: server.json remotes[0] (already gated by the
+  // registry pass), falling back to a card-declared interfaces.mcp.url. Both are
+  // re-gated through the narrow public-https off-origin allowance here.
+  const items = observer.items
+  const bundleView: EvidenceBundle = { target: origin, fetchedAt: '', seed: 0, items }
+  const sjEv = findEvidence(bundleView, ROLE.mcpServerJson)
+  const server = parseServerJson(parseJsonBody(sjEv))
+  const agentsEv = findEvidence(bundleView, ROLE.agentsJson)
+  const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
+
+  // The server.json remote MAY legitimately be off-origin (the registry pattern),
+  // so it uses the narrow public-https off-origin allowance. A card-declared
+  // interfaces.mcp.url is the OAuth resource server and MUST be SAME-ORIGIN
+  // (mirroring the MCP-OAuth posture) — an off-origin mcp.url is refused, exactly
+  // as the OAuth chain refuses it, so this adds no new off-origin fetch surface.
+  let remoteUrl: string | undefined
+  const sjRemote = server?.remotes.find((r) => typeof r.url === 'string' && r.url.length > 0)?.url
+  if (sjRemote && isPublicHttpsOffOriginAllowed(sjRemote)) remoteUrl = sjRemote
+  else if (agents.mcp?.url && isPubliclyRoutableSameOrigin(agents.mcp.url, origin)) remoteUrl = agents.mcp.url
+  if (!remoteUrl) return
+
+  // Reuse the registry pass's initialize (session) + tools/list when they hit
+  // this remote; otherwise perform a minimal handshake of our own (gated).
+  const recordedInit = findEvidence(bundleView, ROLE.mcpRemoteInit)
+  const initEv =
+    recordedInit && recordedInit.url === remoteUrl
+      ? recordedInit
+      : await observer.observeMcp(ROLE.mcpRemoteInit, remoteUrl, mcpInitializeRequest())
+  if (!initEv || initEv.status === null || initEv.status < 200 || initEv.status >= 300) return
+  const sid = initEv.headers['mcp-session-id']
+  const sessionHeaders: Record<string, string> = sid ? { 'mcp-session-id': sid } : {}
+
+  const recordedTools = findEvidence(bundleView, ROLE.mcpRemoteToolsList)
+  const toolsEv =
+    recordedTools && recordedTools.url === remoteUrl
+      ? recordedTools
+      : await observer.observeMcp(ROLE.mcpRemoteToolsList, remoteUrl, mcpToolsListRequest(), sessionHeaders)
+
+  const tools = toolObjectsFrom(parseJsonRpcMessage(toolsEv))
+  const uiTool = tools.find((t) => uiTemplateOfTool(t) !== undefined)
+  if (!uiTool) return // no tool advertises a ui:// template — informational SKIP
+
+  // CLAIMS MCP-UI — call the tool and read its declared UIResource.
+  const toolName = typeof uiTool.name === 'string' ? uiTool.name : ''
+  if (!toolName) return
+  const callEv = await observer.observeMcp(ROLE.mcpUiToolsCall, remoteUrl, mcpToolsCallRequest(toolName), sessionHeaders)
+
+  const callResult = (parseJsonRpcMessage(callEv)?.result ?? undefined) as Record<string, unknown> | undefined
+  const resourceUri = resourceUriOfResult(callResult) ?? uiTemplateOfTool(uiTool)
+  if (!resourceUri) return // claimed a template but the result linked none — judge FAILs from evidence
+
+  const readEv = await observer.observeMcp(ROLE.mcpUiResourceRead, remoteUrl, mcpResourcesReadRequest(resourceUri), sessionHeaders)
+  const content = resourceContentOf(parseJsonRpcMessage(readEv), resourceUri)
+  const ext = externalUrlOf(content)
+  if (ext) {
+    // The ONE attacker-influenced http(s) target — gate it EXACTLY like every
+    // other off-origin target url. A private/non-https externalUrl is refused
+    // here without a byte leaving; the judge re-derives the refusal from the
+    // recorded uri-list so it still grades the claim DOWN.
+    if (isPublicHttpsOffOriginAllowed(ext)) {
+      await observer.observe(ROLE.mcpUiExternalUrl, ext, { accept: 'text/html,application/xhtml+xml' })
+    }
+  }
+}
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -874,6 +1102,14 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //     no server.json performs only the one well-known probe (404 => the whole
   //     dimension SKIPs).
   await observeMcpRegistry(origin, observer)
+
+  // 4c. MCP-UI / streaming-component readiness (ax-odg, ADR-0022): when a tool
+  //     advertises a `ui://` template, call it and read the declared UIResource
+  //     so the judge can grade whether it renders trustworthily inside an agent
+  //     host. Zero-overhead for non-MCP-UI targets (no template ⇒ no probe).
+  //     Every fetch is SSRF-gated (see observeMcpUi); reuses the registry pass's
+  //     initialize session, so it adds no handshake for the common case.
+  await observeMcpUi(origin, observer)
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
