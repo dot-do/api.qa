@@ -31,6 +31,13 @@ export const ROLE = {
   icpJson: 'surface:icp.json',
   openapi: 'surface:openapi',
   keyless: (method: string, path: string) => `probe:endpoint:${method} ${path}`,
+  /**
+   * Contract-diff probe (ax-e6b.28.4): a declared GET-safe path fetched for the
+   * FULL OpenAPI<->live diff (every GET-safe path, not just the seeded keyless
+   * sample). A path the keyless sample already fetched is reused from its
+   * `probe:endpoint:` role instead of being probed again.
+   */
+  contract: (method: string, path: string) => `contract:${method} ${path}`,
   offer: 'probe:402-offer',
   // MCP OAuth conformance (RFC 9728 / 8414 / 7591 / 7636 / 8707). Recorded only
   // when agents.json declares an HTTP/SSE MCP interface (interfaces.mcp.url).
@@ -413,6 +420,20 @@ function scrubAsMetadataEvidence(ev: Evidence | undefined): void {
 
 export const MAX_KEYLESS_PROBES = 3
 
+/**
+ * Upper bound on requests the contract-diff pass (step 5, below) will itself
+ * fire, independent of however much of the shared politeness budget happens
+ * to remain. This is the explicit reserve for the fixed high-value probes
+ * (402-offer, MCP-OAuth chain, AAP agent-configuration) that all run BEFORE
+ * this pass: even in the worst case where every one of them fires (up to ~17
+ * requests across steps 1–4 of a default 24-request budget), this cap still
+ * leaves the contract pass real headroom, and guarantees it can never by
+ * itself account for the whole budget. An endpoint-rich target beyond this
+ * cap has its remaining declared GET-safe paths reported as UNPROBED by the
+ * contract judge (contract.ts) — never as a violation.
+ */
+export const MAX_CONTRACT_PROBES = 8
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -484,6 +505,13 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //    the fetch site itself re-checks same-origin GET, so even a probe that
   //    reached this point unfiltered can never send a request off-origin or
   //    at a private/metadata address (SSRF).
+  //
+  //    ORDERED BEFORE the contract-diff pass (below, 2b→5): this is a FIXED,
+  //    high-value conformance probe — declared once, at most one request —
+  //    and must never be starved of budget by the UNBOUNDED contract-diff
+  //    enumeration of an endpoint-rich target's declared surface (ax-e6b.28.4
+  //    budget-starvation fix). Running it here, ahead of the contract pass,
+  //    RESERVES its share of the shared politeness budget by construction.
   if (
     agents.offerProbe &&
     agents.offerProbe.method === 'GET' &&
@@ -553,6 +581,44 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
         await observer.observe(ROLE.agentIdentity, idEndpoint, { accept: 'application/json' })
       }
     }
+  }
+
+  // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
+  //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
+  //    sample above — so the diff enumerates every declared operation, not a
+  //    random three. A path the keyless sample ALREADY fetched is reused (the
+  //    contract judge falls back to its `probe:endpoint:` evidence), so the
+  //    observer never double-fetches it. Same SSRF posture as every other
+  //    card-derived probe: same-origin + publicly-routable, via the gated
+  //    Observer.observe (which also structurally refuses private/metadata
+  //    hosts and off-origin redirects). No new un-gated fetch surface.
+  //
+  //    PRIORITY / BUDGET-STARVATION FIX: this pass runs LAST and is capped at
+  //    MAX_CONTRACT_PROBES, deliberately AFTER every fixed high-value probe
+  //    above (402-offer, MCP-OAuth unauth + discovery chain, and — earlier
+  //    still — the always-fixed AAP agent-configuration well-known). An
+  //    endpoint-rich declared surface (more GET-safe paths than budget/cap
+  //    allow) must never drain the shared politeness budget out from under
+  //    those fixed probes and starve them to a null status — that produced
+  //    false FAILs on a perfectly compliant target. The remainder beyond the
+  //    cap (or beyond whatever budget is actually left) is simply never
+  //    fetched; the contract judge (contract.ts) reports those declared
+  //    operations as UNPROBED, not as a violation. Determinism holds — the
+  //    candidate set is sorted and seed-independent, so the same prefix is
+  //    always the one probed for a given declaration.
+  const alreadyProbed = new Set(
+    observer.items
+      .filter((e) => e.role.startsWith('probe:endpoint:GET '))
+      .map((e) => e.role.slice('probe:endpoint:GET '.length)),
+  )
+  let contractProbesUsed = 0
+  for (const path of candidatePaths) {
+    if (alreadyProbed.has(path)) continue
+    if (contractProbesUsed >= MAX_CONTRACT_PROBES) break
+    const url = `${origin}${path}`
+    if (!isPubliclyRoutableSameOrigin(url, origin)) continue
+    await observer.observe(ROLE.contract('GET', path), url, { accept: 'application/json' })
+    contractProbesUsed++
   }
 
   return { target: origin, fetchedAt: new Date().toISOString(), seed, items: observer.items }

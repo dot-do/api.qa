@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { validateSchema, readPath } from '../src/schema.js'
+import type { MiniSchema } from '../src/types.js'
 import { canonicalJson, sha256Hex, sampleSeeded } from '../src/digest.js'
 import { normalizeTarget } from '../src/http.js'
 import { axScoreOf, gradeOf } from '../src/grade.js'
@@ -22,6 +23,45 @@ describe('mini schema validator', () => {
   it('readPath walks objects and arrays', () => {
     expect(readPath({ a: { b: [{ c: 42 }] } }, 'a.b.0.c')).toEqual({ found: true, value: 42 })
     expect(readPath({ a: 1 }, 'a.b')).toEqual({ found: false })
+  })
+
+  // contract-diff false-positive #1 (HIGH): OpenAPI 3.1 / JSON-Schema-2020-12
+  // expresses nullable as `type: ['string', 'null']` — an ARRAY, never `===`
+  // a scalar type string. A conformant nullable field must fail OPEN, and a
+  // genuine type violation must still be caught.
+  it("3.1 nullable idiom type:['string','null'] fails open on a live string or null, still catches a real type violation", () => {
+    const schema: MiniSchema = { type: ['string', 'null'] }
+    expect(validateSchema('hello', schema)).toEqual([])
+    expect(validateSchema(null, schema)).toEqual([])
+    expect(validateSchema(42, schema)).toHaveLength(1)
+    expect(validateSchema(42, schema)[0]?.message).toMatch(/expected string \| null, got number/)
+  })
+
+  it('scalar type is unchanged for a non-nullable field', () => {
+    expect(validateSchema('hello', { type: 'string' })).toEqual([])
+    expect(validateSchema(null, { type: 'string' })).toHaveLength(1)
+    expect(validateSchema(42, { type: 'string' })).toHaveLength(1)
+  })
+
+  it("a type ARRAY still recurses into object/array structure (type:['object','null'])", () => {
+    const schema: MiniSchema = {
+      type: ['object', 'null'],
+      required: ['id'],
+      properties: { id: { type: 'string' } },
+    }
+    expect(validateSchema({ id: 'a' }, schema)).toEqual([])
+    expect(validateSchema(null, schema)).toEqual([])
+    expect(validateSchema({}, schema)).toHaveLength(1) // required missing
+  })
+
+  // contract-diff false-positive #2 (LOW): OpenAPI 3.0's `nullable: true`
+  // idiom (a scalar `type` plus a sibling flag) must ALSO fail open on a live
+  // null — the 3.0 counterpart to the 3.1 array idiom above.
+  it("3.0 nullable:true accepts a live null alongside its declared scalar type", () => {
+    const schema = { type: 'string' as const, nullable: true }
+    expect(validateSchema(null, schema)).toEqual([])
+    expect(validateSchema('hello', schema)).toEqual([])
+    expect(validateSchema(42, schema)).toHaveLength(1) // still catches a real violation
   })
 })
 

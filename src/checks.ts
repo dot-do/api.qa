@@ -20,6 +20,7 @@ import {
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
+import { contractDiff } from './contract.js'
 import type { CheckResult, Evidence, EvidenceBundle, Verdict } from './types.js'
 
 /**
@@ -422,6 +423,44 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         : lying.length === 0
           ? pass('every probed claimed endpoint exists (no 404/5xx)')
           : { verdict: 'fail', detail: `claimed but dead: ${lying.map((p) => `${p.url} → ${p.status}`).join(', ')}` }))
+  }
+
+  // ── Honesty check C: full OpenAPI 3.1 <-> live contract diff (ax-e6b.28.4) ─
+  //    Generalizes schema-conformance (sampled bodies) + claims-honesty
+  //    (sampled 404s) into a FULL diff: every declared GET-safe (path, status,
+  //    content-type) is compared against the live response, endpoint-level
+  //    declared-but-absent + undeclared-but-present are enumerated, and every
+  //    deviation is classified breaking-vs-additive. A BREAKING deviation (a
+  //    declared thing the live API violates — missing required field, wrong
+  //    type, enum violation, absent endpoint, removed status) FAILs the check,
+  //    which (as an honesty check, axItem undefined) CAPS the grade — a lying
+  //    contract is worse than a missing one. Additive-only (live has MORE than
+  //    declared) still PASSES. No live openapi or no GET-safe operation => SKIP.
+  //    The structured report rides on the CheckResult (`contractDiff`) so the
+  //    diff is a monitorable signal, and the check is pinnable via kind:'check'.
+  {
+    const diff = contractDiff(bundle)
+    let result: { verdict: Verdict; detail: string }
+    if (!diff.openapiValid) {
+      result = { verdict: 'skip', detail: 'no valid OpenAPI contract to diff against the live surface' }
+    } else if (diff.operationsProbed === 0) {
+      result = { verdict: 'skip', detail: `OpenAPI declares ${diff.operationsDeclared} operation(s) but none are GET-safe to probe (all templated / parameterized / secured)` }
+    } else if (diff.breaking > 0) {
+      const top = diff.deviations.filter((d) => d.classification === 'breaking').slice(0, 5).map((d) => d.detail)
+      result = { verdict: 'fail', detail: `${diff.breaking} breaking contract deviation(s) across ${diff.operationsProbed} probed operation(s)${diff.additive ? ` (+${diff.additive} additive)` : ''}: ${top.join('; ')}` }
+    } else if (diff.additive > 0) {
+      result = { verdict: 'pass', detail: `live surface conforms to every declared contract; ${diff.additive} additive deviation(s) (undeclared field/endpoint — live has more than declared, non-breaking)` }
+    } else {
+      result = { verdict: 'pass', detail: `clean diff: ${diff.operationsProbed} probed operation(s) match their declared status/content-type/schema; no declared-but-absent or undeclared-but-present endpoints` }
+    }
+    const evidenceRoles = diff.perOperation
+      .map((o) => ROLE.contract('GET', o.path))
+      .concat(diff.perOperation.map((o) => ROLE.keyless('GET', o.path)))
+      .filter((role) => findEvidence(bundle, role) !== undefined)
+    const c = check('contract-diff', 'live responses match the published OpenAPI contract (full diff)', undefined,
+      evidenceRoles.length ? evidenceRoles : [ROLE.openapi], result)
+    c.contractDiff = diff
+    checks.push(c)
   }
 
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─

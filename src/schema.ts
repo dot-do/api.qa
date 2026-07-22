@@ -28,19 +28,36 @@ export function validateSchema(value: unknown, schema: MiniSchema, path = '$'): 
     return out
   }
 
-  if (schema.type) {
+  // 3.0 nullable idiom: `{ type: 'string', nullable: true }` accepts a live
+  // `null` regardless of the declared scalar `type` — fail OPEN on this
+  // idiom BEFORE the type check, since `jsonType(null) === 'null'` would
+  // otherwise never match a scalar `type: 'string'`.
+  if (schema.nullable === true && value === null) {
+    return out
+  }
+
+  if (schema.type !== undefined) {
     const actual = jsonType(value)
-    const ok =
-      schema.type === actual ||
-      (schema.type === 'integer' && actual === 'number' && Number.isInteger(value as number)) ||
-      (schema.type === 'number' && actual === 'number')
+    // 3.1 / JSON-Schema-2020-12 nullable idiom: `type` may be a SINGLE scalar
+    // ('string') OR an ARRAY of scalars (['string', 'null']) — the value is
+    // valid if it matches ANY member of the (normalized) set. This is the
+    // fail-OPEN fix for the 3.1 nullable false-positive: an array is never
+    // `===` a scalar type string, so without normalizing, a conformant
+    // `type: ['string', 'null']` field was always flagged wrong-type.
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type]
+    const ok = types.some(
+      (t) =>
+        t === actual ||
+        (t === 'integer' && actual === 'number' && Number.isInteger(value as number)) ||
+        (t === 'number' && actual === 'number'),
+    )
     if (!ok) {
-      out.push({ path, message: `expected ${schema.type}, got ${actual}` })
+      out.push({ path, message: `expected ${types.join(' | ')}, got ${actual}` })
       return out
     }
   }
 
-  if (schema.type === 'object' || schema.properties || schema.required) {
+  if (typeIncludes(schema.type, 'object') || schema.properties || schema.required) {
     const obj = value as Record<string, unknown>
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
       for (const key of schema.required ?? []) {
@@ -52,11 +69,17 @@ export function validateSchema(value: unknown, schema: MiniSchema, path = '$'): 
     }
   }
 
-  if (schema.type === 'array' && schema.items && Array.isArray(value)) {
+  if (typeIncludes(schema.type, 'array') && schema.items && Array.isArray(value)) {
     value.forEach((item, i) => out.push(...validateSchema(item, schema.items!, `${path}[${i}]`)))
   }
 
   return out
+}
+
+/** True when `type` (a scalar, an array of scalars, or absent) names `want`. */
+function typeIncludes(type: MiniSchema['type'], want: string): boolean {
+  if (type === undefined) return false
+  return Array.isArray(type) ? (type as string[]).includes(want) : type === want
 }
 
 function jsonType(value: unknown): string {

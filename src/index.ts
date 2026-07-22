@@ -22,6 +22,7 @@ export {
   ROLE,
 } from './discovery.js'
 export { runChecks } from './checks.js'
+export { contractDiff, enumerateOperations } from './contract.js'
 export { axScoreOf, gradeOf } from './grade.js'
 export {
   attestReport,
