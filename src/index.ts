@@ -3,6 +3,15 @@
 export * from './types.js'
 export { verifyTarget, rejudge, VERIFIER_VERSION, type VerifyTargetOpts } from './verify.js'
 export {
+  grade,
+  gradePinned,
+  type GradeTarget,
+  type GradeOpts,
+  type GradePinnedOpts,
+  type FetchHandler,
+  type FetchHandlerFn,
+} from './local.js'
+export {
   verifyPinnedSpec,
   parsePinnedSpec,
   validateRequirements,

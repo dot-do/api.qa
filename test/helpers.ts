@@ -91,7 +91,7 @@ type Handler = (req: { method: string; accept: string; body?: string }) => {
 
 export type Routes = Record<string, Handler>
 
-export function goodTargetRoutes(): Routes {
+export function goodTargetRoutes(origin: string = GOOD): Routes {
   const llms = `# good.example
 
 > The reference agent-first widget API. Everything one command deep.
@@ -99,7 +99,7 @@ export function goodTargetRoutes(): Routes {
 ## Try it (no key, no account)
 
 \`\`\`sh
-curl ${GOOD}/api/status
+curl ${origin}/api/status
 \`\`\`
 
 ## Surfaces
@@ -118,12 +118,12 @@ Boundaries answer 402 with a structured offer. See \`GET /offers/upgrade\`.
     description: 'Reference agent-first widget API.',
     interfaces: {
       http: {
-        status: { method: 'GET', url: `${GOOD}/api/status`, auth: 'none' },
-        widgets: { method: 'GET', url: `${GOOD}/api/widgets`, auth: 'none' },
+        status: { method: 'GET', url: `${origin}/api/status`, auth: 'none' },
+        widgets: { method: 'GET', url: `${origin}/api/widgets`, auth: 'none' },
       },
       mcp: { transport: 'stdio', command: 'npx good.example mcp', tools: ['list_widgets'] },
     },
-    openapi: `${GOOD}/openapi.json`,
+    openapi: `${origin}/openapi.json`,
     attestationLadder: [
       { rung: 'anonymous', durability: 'ephemeral' },
       { rung: 'attested-agent', durability: 'durable' },
@@ -131,7 +131,7 @@ Boundaries answer 402 with a structured offer. See \`GET /offers/upgrade\`.
     monetization: {
       model: '402 offers at boundaries',
       offers: [{ id: 'pro', title: 'Pro tier', price: { amount: 10, currency: 'USD', interval: 'month' } }],
-      probe: { method: 'GET', url: `${GOOD}/offers/upgrade` },
+      probe: { method: 'GET', url: `${origin}/offers/upgrade` },
     },
   }
   const icp = {
@@ -205,7 +205,7 @@ Boundaries answer 402 with a structured offer. See \`GET /offers/upgrade\`.
         id: 'pro',
         title: 'Pro tier',
         price: { amount: 10, currency: 'USD', interval: 'month' },
-        checkoutUrl: `${GOOD}/checkout/pro`,
+        checkoutUrl: `${origin}/checkout/pro`,
         alternatives: [{ id: 'free', how: 'stay on the free tier' }],
       }),
     }),
@@ -238,6 +238,24 @@ export function makeFetcher(routes: Routes, origin = GOOD): Fetcher {
       status: out.status,
       headers: { 'content-type': out.contentType ?? 'text/plain', ...(out.headers ?? {}) },
     })
+  }
+}
+
+/**
+ * Wrap a route table as a Worker-style in-process handler (`{ fetch(request) }`)
+ * — the exact shape `grade()` / the `dev` verb / the vitest matcher mount in
+ * memory. Bodies on write methods are read off the Request (a `new Request(url,
+ * { body })` carries the body as a stream, not a string) so pinned POST probes
+ * see their payload.
+ */
+export function makeWorker(routes: Routes, origin = GOOD): { fetch: (request: Request) => Promise<Response> } {
+  const f = makeFetcher(routes, origin)
+  return {
+    async fetch(request: Request): Promise<Response> {
+      const method = request.method.toUpperCase()
+      const body = method !== 'GET' && method !== 'HEAD' ? await request.text() : undefined
+      return f(request.url, { method, headers: request.headers, body })
+    },
   }
 }
 
