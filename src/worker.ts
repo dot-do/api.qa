@@ -40,6 +40,7 @@ import {
   type Cooldown,
   type CooldownDecision,
   type DONamespaceLike,
+  type DOState,
 } from './cooldown.js'
 import {
   MonitorStore,
@@ -74,6 +75,17 @@ export interface Env {
   REPORTS?: KVLike
   /** Per-domain politeness Durable Object namespace (class DomainCooldown). */
   COOLDOWN?: DONamespaceLike
+  /**
+   * Singleton scheduler Durable Object namespace (class MonitorSchedulerDO,
+   * bd ax-e6b.29.1 MED fix). When bound, scheduledTick() delegates the ENTIRE
+   * tick to idFromName(MONITOR_SCHEDULER_SINGLETON_NAME) on this namespace —
+   * exactly one such DO instance exists globally, so every isolate's
+   * scheduled() call ends up running against that ONE DO's memoized
+   * MonitorStore, making claimDue's claim cross-isolate-atomic (not just
+   * same-instance). Unbound falls back to a local, same-instance-only tick
+   * (still guarded by MonitorStore.claimDue's private claimChain).
+   */
+  MONITOR_SCHEDULER?: DONamespaceLike
   /** Cache freshness / per-target cooldown horizon, seconds. */
   CACHE_TTL_SECONDS?: string
   /** Minimum inter-probe interval per domain across isolates, ms. */
@@ -100,6 +112,14 @@ export interface TickSummary {
   skippedCooldown: number
   /** Due monitors deferred to a later tick because the per-tick cap was hit. */
   deferredOverCap: number
+  /**
+   * Due monitors whose claim+verify+record threw (e.g. verifyTarget's
+   * normalizeTarget throwing on a corrupted stored target) — bd ax-e6b.29.1
+   * LOW fix. Isolated per monitor so one throw cannot abort the rest of the
+   * tick's batch; the monitor's schedule is still advanced so it is not
+   * retried every tick or left permanently stuck.
+   */
+  errored: number
   runs: MonitorRunRecord[]
 }
 
@@ -107,6 +127,15 @@ const LINKSET =
   '</llms.txt>; rel="service-doc", </.well-known/agents.json>; rel="service-desc", </openapi.json>; rel="describedby"'
 
 const DOMAIN_ROUTE = /^\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)$/i
+
+/**
+ * The one global id every isolate's scheduledTick() resolves to on the
+ * MONITOR_SCHEDULER namespace — the cross-isolate serialization point (bd
+ * ax-e6b.29.1 MED fix: Workers KV has no CAS, so two isolates that each read
+ * `nextDueAt` before either writes it can otherwise both claim and
+ * double-run the same due slot).
+ */
+const MONITOR_SCHEDULER_SINGLETON_NAME = 'monitor-scheduler'
 
 export interface App {
   fetch(request: Request): Promise<Response>
@@ -128,6 +157,13 @@ export function createApp(
     cache?: ReportCache
     /** Injected for tests; falls back to env.COOLDOWN when present. */
     cooldown?: Cooldown
+    /**
+     * Injected for tests; falls back to env.MONITOR_SCHEDULER when present.
+     * When set, scheduledTick() delegates the ENTIRE tick to this DO
+     * namespace's singleton instance instead of running it locally — the
+     * cross-isolate-atomic claim path (bd ax-e6b.29.1 MED fix).
+     */
+    scheduler?: DONamespaceLike
     /** Injected for tests; falls back to env.REPORTS when present. */
     monitors?: MonitorStore
     /** Override the per-tick monitor cap (else env / default). */
@@ -149,6 +185,7 @@ export function createApp(
   const cache = opts.cache ?? (env.REPORTS ? new ReportCache(env.REPORTS, ttlSeconds) : undefined)
   const cooldown =
     opts.cooldown ?? (env.COOLDOWN ? new DurableObjectCooldown(env.COOLDOWN, minIntervalMs) : undefined)
+  const scheduler = opts.scheduler ?? env.MONITOR_SCHEDULER
   const monitors = opts.monitors ?? (env.REPORTS ? new MonitorStore(env.REPORTS) : undefined)
   const maxPerTick =
     opts.maxPerTick ?? (env.MONITOR_MAX_PER_TICK ? Number(env.MONITOR_MAX_PER_TICK) : DEFAULT_MAX_PER_TICK)
@@ -167,6 +204,141 @@ export function createApp(
   const loopback: Fetcher = (u, init) => app.fetch(new Request(u, init))
   const routed: Fetcher = (u, init) =>
     u.startsWith(SELF_ORIGIN) ? loopback(u, init) : (opts.externalFetcher ?? fetch)(u, init)
+
+  /**
+   * The actual tick body: claim + re-verify every DUE monitor through the
+   * SAME attested verifyTarget/verifySuite/cooldown/SSRF path a fetch run
+   * uses — no gate-skipping fork. Called directly when no scheduler DO is
+   * configured (local dev / a single-instance test — same-instance overlap
+   * is still guarded by MonitorStore.claimDue's private claimChain), and by
+   * MonitorSchedulerDO.fetch() (via its own inner createApp()) for the
+   * cross-isolate-atomic production path (bd ax-e6b.29.1 MED fix).
+   */
+  async function runLocalTick(nowMs: number): Promise<TickSummary> {
+    const summary: TickSummary = {
+      tickedAt: nowMs,
+      due: 0,
+      ran: 0,
+      skippedCooldown: 0,
+      deferredOverCap: 0,
+      errored: 0,
+      runs: [],
+    }
+    if (!monitors) return summary
+
+    // Idle-eviction housekeeping (LOW abuse-surface bound): reclaim any
+    // monitor that hasn't run/refreshed within its TTL before it can occupy
+    // a MAX_MONITORS slot or be considered for this tick. Real per-principal
+    // quota + registration auth await bd ax-e6b.30 (currently 402-blocked)
+    // — this is a coarse interim bound.
+    await monitors.evictExpired(nowMs)
+
+    // Due = nextDueAt has passed. Run the MOST-overdue first so a cap does
+    // not perpetually starve one monitor (fair carry-over).
+    const all = await monitors.list()
+    const due = all.filter((mon) => mon.nextDueAt <= nowMs).sort((a, b) => a.nextDueAt - b.nextDueAt)
+    summary.due = due.length
+
+    for (const mon of due) {
+      if (summary.ran >= maxPerTick) {
+        // Cap hit: defer the rest to a later tick (they stay due, unchanged).
+        summary.deferredOverCap += 1
+        continue
+      }
+
+      // Cross-isolate politeness: a monitor whose domain is in cooldown is
+      // SKIPPED this tick (not forced) and retried next — we do NOT advance
+      // its nextDueAt, so it remains due. Self (loopback) never gates.
+      const isSelf = hostKey(mon.target) === 'api.qa'
+      if (!isSelf && cooldown) {
+        const decision = await cooldown.reserve(hostKey(mon.target))
+        if (!decision.allowed) {
+          summary.skippedCooldown += 1
+          continue
+        }
+      }
+
+      // One monitor's throw must not abort the rest of this tick's batch
+      // (bd ax-e6b.29.1 LOW fix) — isolate claim+verify+record per monitor.
+      try {
+        // --- Claim this monitor's due slot BEFORE the verify await --------
+        // Cloudflare does NOT guarantee non-overlapping scheduled()
+        // invocations: two overlapping ticks can both have listed this same
+        // pre-advance snapshot above. claimDue() is a best-effort OPTIMISTIC
+        // claim: it skips if another concurrent tick already advanced this
+        // monitor's nextDueAt past the snapshot (i.e. already claimed/ran it
+        // this pass). Advancing nextDueAt HERE, as part of the claim and
+        // before the verify await, means a crash (or a failed verify)
+        // mid-run skips at most one slot rather than double-running it — a
+        // genuinely due monitor still advances even when verify fails.
+        const claimed = await monitors.claimDue(mon.id, mon.nextDueAt, nowMs + mon.intervalSec * 1000)
+        if (!claimed) {
+          // Lost the race to a concurrent tick (or deleted mid-tick) — not
+          // due for US anymore. Not a skip worth counting; just move on.
+          continue
+        }
+
+        // Re-verify through the SAME attested verify path a fetch run uses.
+        const report = await verifyTarget(claimed.target, {
+          mode: 'remote',
+          fetcher: routed,
+          delayMs: isSelf ? 0 : externalDelayMs,
+          signingKeys: await keys(),
+          allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+        })
+
+        let suiteVerdict: boolean | undefined
+        if (claimed.suiteDigest && cache) {
+          const suiteText = await cache.getSuiteText(claimed.suiteDigest)
+          if (suiteText !== null && claimed.environment) {
+            const suiteReport = await verifySuite(suiteText, claimed.environment, {
+              mode: 'remote',
+              fetcher: routed,
+              target: claimed.target,
+              delayMs: isSelf ? 0 : externalDelayMs,
+              allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+            })
+            suiteVerdict = suiteReport.passed
+          }
+        }
+
+        const run: MonitorRunRecord = {
+          monitorId: claimed.id,
+          at: nowMs,
+          grade: report.grade,
+          ...(suiteVerdict !== undefined ? { suiteVerdict } : {}),
+          digest: report.discovery.evidenceDigest,
+        }
+        await monitors.appendRun(run)
+        summary.runs.push(run)
+        summary.ran += 1
+
+        // A completed run refreshes lastRunAt + the idle-eviction TTL.
+        // nextDueAt was already advanced at claim time above.
+        claimed.lastRunAt = nowMs
+        claimed.expiresAt = nowMs + monitorTtlMs
+        await monitors.update(claimed)
+      } catch (err) {
+        // Isolate the failure to THIS monitor (bd ax-e6b.29.1 LOW fix): log
+        // it and keep going so the rest of the due batch still runs this
+        // tick. claimDue already advanced nextDueAt before the throwing
+        // await in the common case (e.g. verifyTarget->normalizeTarget
+        // throwing on a corrupted stored target); defensively re-check and
+        // force the schedule forward here too, so a throw before/inside the
+        // claim itself can never leave the monitor stuck re-due every tick.
+        summary.errored += 1
+        const message = err instanceof Error ? err.message : String(err)
+        console.error(`scheduledTick: monitor ${mon.id} errored and was skipped this tick: ${message}`)
+        const rec = await monitors.get(mon.id)
+        if (rec && rec.nextDueAt === mon.nextDueAt) {
+          await monitors.update({ ...rec, nextDueAt: nowMs + mon.intervalSec * 1000 })
+        }
+        continue
+      }
+    }
+
+    return summary
+  }
 
   const app: App = {
     async fetch(request: Request): Promise<Response> {
@@ -486,112 +658,83 @@ export function createApp(
     },
 
     async scheduledTick(nowMs: number = now()): Promise<TickSummary> {
-      const summary: TickSummary = {
-        tickedAt: nowMs,
-        due: 0,
-        ran: 0,
-        skippedCooldown: 0,
-        deferredOverCap: 0,
-        runs: [],
+      if (scheduler) {
+        // Delegate the WHOLE tick to the singleton scheduler DO (bd
+        // ax-e6b.29.1 MED fix). idFromName(MONITOR_SCHEDULER_SINGLETON_NAME)
+        // always resolves to the SAME Durable Object instance, so every
+        // isolate's scheduled() call ends up running against that ONE DO's
+        // memoized App/MonitorStore — same JS object, same private
+        // claimChain field — which serializes claims across isolates, not
+        // just within one. The DO runs this exact tick body (runLocalTick,
+        // via its own inner createApp()) — verifyTarget/verifySuite/
+        // cooldown/SSRF are byte-for-byte the same path a fetch-triggered
+        // run takes; no gate-skipping fork.
+        const stub = scheduler.get(scheduler.idFromName(MONITOR_SCHEDULER_SINGLETON_NAME))
+        const res = await stub.fetch(
+          new Request(`https://monitor-scheduler.internal/tick?nowMs=${nowMs}`, { method: 'POST' }),
+        )
+        if (!res.ok) throw new Error(`scheduler DO tick failed: ${res.status} ${await res.text()}`)
+        return (await res.json()) as TickSummary
       }
-      if (!monitors) return summary
-
-      // Idle-eviction housekeeping (LOW abuse-surface bound): reclaim any
-      // monitor that hasn't run/refreshed within its TTL before it can
-      // occupy a MAX_MONITORS slot or be considered for this tick. Real
-      // per-principal quota + registration auth await bd ax-e6b.30
-      // (currently 402-blocked) — this is a coarse interim bound.
-      await monitors.evictExpired(nowMs)
-
-      // Due = nextDueAt has passed. Run the MOST-overdue first so a cap does
-      // not perpetually starve one monitor (fair carry-over).
-      const all = await monitors.list()
-      const due = all.filter((mon) => mon.nextDueAt <= nowMs).sort((a, b) => a.nextDueAt - b.nextDueAt)
-      summary.due = due.length
-
-      for (const mon of due) {
-        if (summary.ran >= maxPerTick) {
-          // Cap hit: defer the rest to a later tick (they stay due, unchanged).
-          summary.deferredOverCap += 1
-          continue
-        }
-
-        // Cross-isolate politeness: a monitor whose domain is in cooldown is
-        // SKIPPED this tick (not forced) and retried next — we do NOT advance
-        // its nextDueAt, so it remains due. Self (loopback) never gates.
-        const isSelf = hostKey(mon.target) === 'api.qa'
-        if (!isSelf && cooldown) {
-          const decision = await cooldown.reserve(hostKey(mon.target))
-          if (!decision.allowed) {
-            summary.skippedCooldown += 1
-            continue
-          }
-        }
-
-        // --- Claim this monitor's due slot BEFORE the verify await --------
-        // Cloudflare does NOT guarantee non-overlapping scheduled()
-        // invocations: two overlapping ticks can both have listed this same
-        // pre-advance snapshot above. claimDue() is a best-effort OPTIMISTIC
-        // claim (KV has no native CAS): it skips if another concurrent tick
-        // already advanced this monitor's nextDueAt past the snapshot (i.e.
-        // already claimed/ran it this pass). Advancing nextDueAt HERE, as
-        // part of the claim and before the verify await, means a crash (or
-        // a failed verify) mid-run skips at most one slot rather than
-        // double-running it — a genuinely due monitor still advances even
-        // when verify fails.
-        const claimed = await monitors.claimDue(mon.id, mon.nextDueAt, nowMs + mon.intervalSec * 1000)
-        if (!claimed) {
-          // Lost the race to a concurrent tick (or deleted mid-tick) — not
-          // due for US anymore. Not a skip worth counting; just move on.
-          continue
-        }
-
-        // Re-verify through the SAME attested verify path a fetch run uses.
-        const report = await verifyTarget(claimed.target, {
-          mode: 'remote',
-          fetcher: routed,
-          delayMs: isSelf ? 0 : externalDelayMs,
-          signingKeys: await keys(),
-          allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
-        })
-
-        let suiteVerdict: boolean | undefined
-        if (claimed.suiteDigest && cache) {
-          const suiteText = await cache.getSuiteText(claimed.suiteDigest)
-          if (suiteText !== null && claimed.environment) {
-            const suiteReport = await verifySuite(suiteText, claimed.environment, {
-              mode: 'remote',
-              fetcher: routed,
-              target: claimed.target,
-              delayMs: isSelf ? 0 : externalDelayMs,
-              allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
-            })
-            suiteVerdict = suiteReport.passed
-          }
-        }
-
-        const run: MonitorRunRecord = {
-          monitorId: claimed.id,
-          at: nowMs,
-          grade: report.grade,
-          ...(suiteVerdict !== undefined ? { suiteVerdict } : {}),
-          digest: report.discovery.evidenceDigest,
-        }
-        await monitors.appendRun(run)
-        summary.runs.push(run)
-        summary.ran += 1
-
-        // A completed run refreshes lastRunAt + the idle-eviction TTL.
-        // nextDueAt was already advanced at claim time above.
-        claimed.lastRunAt = nowMs
-        claimed.expiresAt = nowMs + monitorTtlMs
-        await monitors.update(claimed)
-      }
-
-      return summary
+      // No scheduler DO configured (local dev / a single-instance test):
+      // run the tick body directly. Same-instance overlap is still guarded
+      // by MonitorStore.claimDue's private claimChain.
+      return runLocalTick(nowMs)
     },
   }
   return app
+}
+
+/**
+ * The singleton scheduler Durable Object (bd ax-e6b.29.1 MED fix — Option A).
+ * Exactly ONE instance of this class exists globally: every isolate's
+ * scheduled() call resolves the SAME id (MONITOR_SCHEDULER_SINGLETON_NAME) on
+ * the MONITOR_SCHEDULER namespace and lands here. It memoizes one
+ * createApp() — and therefore one MonitorStore, with its private claimChain —
+ * for its own lifetime, so concurrent tick requests (same-isolate OR
+ * cross-isolate) serialize through that one object: MonitorStore's existing
+ * same-instance guard, just promoted to a cross-isolate scope by being routed
+ * through a single DO. It reuses the SAME createApp() the fetch path uses, so
+ * verifyTarget/verifySuite/cooldown/SSRF are exactly the same path a
+ * fetch-triggered run takes — no gate-skipping fork.
+ *
+ * The env handed to the INNER createApp() has MONITOR_SCHEDULER stripped so
+ * that inner App's own scheduledTick() runs the tick body (runLocalTick)
+ * directly instead of looping back through this very DO via HTTP — a Durable
+ * Object's env mirrors the same bindings declared for the Worker script that
+ * defines it, so leaving MONITOR_SCHEDULER in place would self-recurse.
+ *
+ * The real Cloudflare runtime only ever constructs this class with the two
+ * standard DO args (state, env); `testOpts` is a THIRD, optional parameter
+ * that only test doubles pass — it forwards the same externalFetcher/
+ * externalDelayMs/now test seams `createApp` already accepts, so a fake DO
+ * namespace in tests can inject a network-free fetcher into the DO's inner
+ * app instead of it falling back to a real, slow, non-deterministic `fetch`.
+ */
+export class MonitorSchedulerDO {
+  private appInstance: App | undefined
+
+  constructor(
+    private readonly state: DOState,
+    private readonly env: Env,
+    private readonly testOpts?: { externalFetcher?: Fetcher; externalDelayMs?: number; now?: () => number },
+  ) {}
+
+  private getApp(): App {
+    if (!this.appInstance) {
+      const { MONITOR_SCHEDULER: _selfBinding, ...innerEnv } = this.env
+      this.appInstance = createApp(innerEnv, this.testOpts)
+    }
+    return this.appInstance
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    const nowMsParam = url.searchParams.get('nowMs')
+    const nowMs = nowMsParam !== null && nowMsParam !== '' ? Number(nowMsParam) : undefined
+    const summary = await this.getApp().scheduledTick(nowMs)
+    return new Response(JSON.stringify(summary), { headers: { 'content-type': 'application/json' } })
+  }
 }
 
 function text(body: string, status = 200, extra: Record<string, string> = {}): Response {

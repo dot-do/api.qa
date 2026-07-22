@@ -16,9 +16,9 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { createApp } from '../src/worker.js'
+import { createApp, MonitorSchedulerDO, type Env } from '../src/worker.js'
 import { ReportCache, MemoryKV } from '../src/cache.js'
-import { MemoryCooldown } from '../src/cooldown.js'
+import { MemoryCooldown, type DOState, type DOStorage, type DONamespaceLike } from '../src/cooldown.js'
 import { MonitorStore, parseIntervalSec, monitorId } from '../src/monitors.js'
 import { sha256Hex } from '../src/digest.js'
 import { goodTargetRoutes, makeFetcher, GOOD } from './helpers.js'
@@ -69,6 +69,47 @@ function apisDirectoryFetcher(): Fetcher {
       return jsonRes({ runId: decodeURIComponent(m[1]!), settled: true })
     }
     return surfaces(url, init)
+  }
+}
+
+/** In-memory DO storage double — zero runtime, zero network (mirrors cooldown.test.ts). */
+function fakeDOState(): DOState {
+  const m = new Map<string, unknown>()
+  const storage: DOStorage = {
+    async get<T = unknown>(key: string) {
+      return m.has(key) ? (m.get(key) as T) : undefined
+    },
+    async put<T = unknown>(key: string, value: T) {
+      m.set(key, value)
+    },
+  }
+  return { storage }
+}
+
+/**
+ * A fake MONITOR_SCHEDULER namespace that routes idFromName(name) to ONE
+ * MonitorSchedulerDO instance per name — exactly like the real runtime's
+ * singleton-by-id semantics — proving cross-isolate serialization works.
+ * `env` is the SAME env every "isolate" App shares (in particular the same
+ * REPORTS KV), so the DO's own inner MonitorStore sees the same data.
+ * `testOpts` forwards a network-free fetcher into the DO's inner app (the
+ * DO only receives `env`, not `opts`, so without this it would fall back to
+ * a real, slow `fetch`).
+ */
+function fakeSchedulerNamespace(
+  env: Env,
+  testOpts?: { externalFetcher?: Fetcher; externalDelayMs?: number },
+): DONamespaceLike {
+  const instances = new Map<string, MonitorSchedulerDO>()
+  return {
+    idFromName(name: string) {
+      return name
+    },
+    get(id: unknown) {
+      const key = String(id)
+      if (!instances.has(key)) instances.set(key, new MonitorSchedulerDO(fakeDOState(), env, testOpts))
+      return instances.get(key)!
+    },
   }
 }
 
@@ -274,6 +315,87 @@ describe('scheduled tick concurrency — no double-run under overlapping ticks (
     const summary = await app.scheduledTick(1000)
     expect(summary.ran).toBe(1)
     expect(summary.runs).toHaveLength(1)
+  })
+})
+
+describe('scheduled tick cross-isolate concurrency — singleton scheduler DO (MED fix)', () => {
+  it('two isolates (separate app/MonitorStore instances over one shared KV) sharing ONE scheduler DO race scheduledTick() for one due monitor -> exactly ONE run record', async () => {
+    // The realistic race this reproduces 100%: two Worker ISOLATES each
+    // constructing their OWN MonitorStore (own private claimChain) over the
+    // SAME KV namespace — without the scheduler DO, both can read
+    // nextDueAt before either writes it and both claim+run.
+    const sharedKV = new MemoryKV()
+    const env: Env = { REPORTS: sharedKV }
+    const schedulerNs = fakeSchedulerNamespace(env, { externalFetcher: siteFetcher(), externalDelayMs: 0 })
+
+    const appA = createApp(env, { externalFetcher: siteFetcher(), externalDelayMs: 0, scheduler: schedulerNs, now: () => 0 })
+    const appB = createApp(env, { externalFetcher: siteFetcher(), externalDelayMs: 0, scheduler: schedulerNs, now: () => 0 })
+    // Sanity: these really are two distinct MonitorStore instances (the
+    // pre-fix race condition), sharing only the underlying KV.
+    expect(appA).not.toBe(appB)
+
+    const reg = await appA.fetch(jsonReq('/monitors', { target: 'good.example', interval: 300 }))
+    expect(reg.status).toBe(201)
+    const { monitor } = (await reg.json()) as { monitor: { id: string } }
+
+    // Race two overlapping ticks, one per "isolate" — both route through the
+    // SAME scheduler DO stub, which is the single serialization point.
+    const [a, b] = await Promise.all([appA.scheduledTick(1000), appB.scheduledTick(1000)])
+    expect(a.ran + b.ran).toBe(1) // exactly one of the two actually ran it — was 2 pre-fix
+
+    const monitors = new MonitorStore(sharedKV)
+    expect(await monitors.listRuns(monitor.id)).toHaveLength(1)
+    const rec = await monitors.get(monitor.id)
+    expect(rec?.nextDueAt).toBe(1000 + 300_000) // advanced exactly once, not twice
+  })
+
+  it('without a scheduler DO configured, a normal single tick still runs a genuinely-due monitor (local fallback intact)', async () => {
+    const sharedKV = new MemoryKV()
+    const env: Env = { REPORTS: sharedKV }
+    const app = createApp(env, { externalFetcher: siteFetcher(), externalDelayMs: 0, now: () => 0 })
+    await app.fetch(jsonReq('/monitors', { target: 'good.example', interval: 300 }))
+    const summary = await app.scheduledTick(1000)
+    expect(summary.ran).toBe(1)
+    expect(summary.runs).toHaveLength(1)
+  })
+})
+
+describe('scheduled tick batch isolation — one throwing monitor does not abort the batch (LOW fix)', () => {
+  it('a corrupted monitor (throws in verifyTarget) first in the batch does not prevent a second healthy due monitor from running the same tick', async () => {
+    const monitors = new MonitorStore(new MemoryKV())
+    const app = createApp(
+      {},
+      { externalFetcher: siteFetcher(), externalDelayMs: 0, cache: new ReportCache(new MemoryKV(), 300), monitors, now: () => 0 },
+    )
+
+    // Register two due monitors normally (through the SSRF-gated route).
+    const bad = await app.fetch(jsonReq('/monitors', { target: 'a.example', interval: 300 }))
+    const good = await app.fetch(jsonReq('/monitors', { target: 'b.example', interval: 300 }))
+    const badId = ((await bad.json()) as { monitor: { id: string } }).monitor.id
+    const goodId = ((await good.json()) as { monitor: { id: string } }).monitor.id
+
+    // Corrupt the FIRST monitor's stored target directly in the store (e.g. a
+    // bad migration/manual edit) so verifyTarget->normalizeTarget throws for
+    // it specifically — nextDueAt unchanged, so it's still the earliest-due
+    // (sorted first) of the two.
+    const badRec = await monitors.get(badId)
+    await monitors.update({ ...badRec!, target: '127.0.0.1' })
+
+    const summary = await app.scheduledTick(1000)
+    expect(summary.due).toBe(2)
+    expect(summary.errored).toBe(1) // the corrupted monitor was isolated, not fatal
+    expect(summary.ran).toBe(1) // the healthy second monitor still ran THIS tick
+    expect(summary.runs).toHaveLength(1)
+    expect(summary.runs[0]!.monitorId).toBe(goodId)
+
+    // The healthy monitor recorded a real run.
+    expect(await monitors.listRuns(goodId)).toHaveLength(1)
+    // The corrupted monitor recorded NO run (it never produced an attested
+    // report) but its schedule still advanced — not stuck, not retried every
+    // tick forever.
+    expect(await monitors.listRuns(badId)).toHaveLength(0)
+    const badAfter = await monitors.get(badId)
+    expect(badAfter?.nextDueAt).toBe(1000 + 300_000)
   })
 })
 
