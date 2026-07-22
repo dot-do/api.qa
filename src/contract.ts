@@ -22,6 +22,7 @@
  */
 
 import { ROLE, findEvidence, parseJsonBody, parseAgentsJson } from './discovery.js'
+import { BUDGET_EXHAUSTED_ERROR } from './http.js'
 import { validateSchema } from './schema.js'
 import type {
   ContractDeviation,
@@ -113,21 +114,60 @@ function enumerateResponses(op: Record<string, unknown>, root: Record<string, un
   return out
 }
 
-/** Resolve one-level `$ref` into components.schemas; leave inline schemas as-is. */
-function resolveSchema(schema: unknown, root: Record<string, unknown>): MiniSchema | undefined {
+/**
+ * Resolve `$ref` into components.schemas RECURSIVELY — at the top level AND at
+ * every nested schema position (`properties.*`, `items`, `additionalProperties`)
+ * — so a component reference under a nested position is dereferenced exactly
+ * like the top-level media-type schema. Before this fix, only the top-level
+ * `$ref` was resolved: a nested `{ $ref }` node was left as-is, and
+ * `validateSchema` treats an unrecognized node (no `type`/`properties`/`enum`/
+ * `const`) as an EMPTY schema that accepts anything — so a violation under a
+ * component reference (the normal real-spec shape) passed silently.
+ *
+ * `visited` guards against a `$ref` cycle (a schema that (in)directly refers to
+ * itself): each ref name is added to a COPY of the set before descending into
+ * the referenced schema, so a repeat of the SAME ref along the SAME resolution
+ * path is caught and resolution stops there (returning an empty — accept-
+ * anything — schema at the cycle point) rather than recursing forever. Sibling
+ * branches that reuse the same component (not a cycle) are unaffected, since
+ * each branch gets its own copy of `visited`.
+ */
+function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: ReadonlySet<string> = new Set()): MiniSchema | undefined {
   if (!schema || typeof schema !== 'object') return undefined
   const s = schema as Record<string, unknown>
   const ref = s.$ref
   if (typeof ref === 'string') {
+    if (visited.has(ref)) return {} // cycle: stop resolving further, accept-anything at this point
     const m = ref.match(/^#\/components\/schemas\/(.+)$/)
     const components = root.components as Record<string, unknown> | undefined
     const schemas = components?.schemas as Record<string, unknown> | undefined
     if (m && schemas && m[1] && schemas[m[1]] && typeof schemas[m[1]] === 'object') {
-      return schemas[m[1]] as MiniSchema
+      const nextVisited = new Set(visited)
+      nextVisited.add(ref)
+      return resolveSchema(schemas[m[1]], root, nextVisited)
     }
     return undefined
   }
-  return s as MiniSchema
+  // Not a $ref: recursively resolve every nested schema position so no
+  // component reference survives unresolved anywhere in the tree.
+  const out: MiniSchema = { ...(s as MiniSchema) }
+  if (out.properties) {
+    const props: Record<string, MiniSchema> = {}
+    for (const [key, sub] of Object.entries(out.properties)) {
+      const resolved = resolveSchema(sub, root, visited)
+      if (resolved) props[key] = resolved
+    }
+    out.properties = props
+  }
+  if (out.items) {
+    const resolved = resolveSchema(out.items, root, visited)
+    if (resolved) out.items = resolved
+  }
+  if (out.additionalProperties && typeof out.additionalProperties === 'object') {
+    const resolved = resolveSchema(out.additionalProperties, root, visited)
+    if (resolved) out.additionalProperties = resolved
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +226,6 @@ export function contractDiff(bundle: EvidenceBundle): ContractDiffReport {
   // ── Per (path, method) diff for every GET-safe operation ──────────────────
   for (const op of ops) {
     if (!op.probeable) continue
-    operationsProbed++
     const live = liveEvidence(bundle, op.path)
     const deviations: ContractDeviation[] = []
     const declaredStatuses = [...new Set(op.responses.map((r) => r.status))]
@@ -200,7 +239,29 @@ export function contractDiff(bundle: EvidenceBundle): ContractDiffReport {
       ...extra,
     })
 
-    if (!live || live.status === null) {
+    // UNPROBED (not a violation): the contract loop RESERVES budget for the
+    // higher-value fixed probes (402-offer, MCP-OAuth, AAP) ahead of itself,
+    // and — for an endpoint-rich target — may still cap out or drain the
+    // shared politeness budget before reaching every declared GET-safe path.
+    // That is a coverage limit, not a claim the target broke: report it as
+    // `probed: false` with zero deviations, never as declared-but-absent /
+    // breaking. Distinguished from a GENUINE fetch failure (dishonest claim,
+    // still breaking below) by the exact budget-exhausted marker error.
+    if (live === undefined || (live.status === null && live.error === BUDGET_EXHAUSTED_ERROR)) {
+      perOperation.push({
+        path: op.path,
+        method: op.method,
+        probed: false,
+        liveStatus: null,
+        declaredStatuses,
+        deviations: [],
+      })
+      continue
+    }
+
+    operationsProbed++
+
+    if (live.status === null) {
       // Declared, but unreachable — a dishonest claim (BREAKING).
       const d = at({
         kind: 'endpoint-unreachable',
