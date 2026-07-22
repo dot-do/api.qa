@@ -203,17 +203,43 @@ export class ReportCache {
     return `mockspec:${digest}`
   }
 
+  private static readonly MOCK_SPEC_INDEX_KEY = 'mockspecs:index'
+
+  private async mockSpecIndex(): Promise<string[]> {
+    const raw = await this.kv.get(ReportCache.MOCK_SPEC_INDEX_KEY)
+    if (!raw) return []
+    try {
+      const ids = JSON.parse(raw) as unknown
+      return Array.isArray(ids) ? (ids as string[]) : []
+    } catch {
+      return []
+    }
+  }
+
   /**
    * The mock REGISTRY: content-addressed OpenAPI spec text stored by its digest
    * so `GET /mock/:digest/<path>` can serve a generated response by digest
    * alone. Durable (not TTL-expired) like the suite registry — the digest is
-   * the identity, and the SAME digest is always the SAME spec text.
+   * the identity, and the SAME digest is always the SAME spec text. An index
+   * key tracks every registered digest so the Worker can enforce
+   * `MAX_MOCK_SPECS` (mirrors the monitors registry's own index — KVLike has
+   * no native list/count operation).
    */
   async putMockSpec(digest: string, text: string): Promise<void> {
     await this.kv.put(this.mockSpecK(digest), text)
+    const ids = await this.mockSpecIndex()
+    if (!ids.includes(digest)) {
+      ids.push(digest)
+      await this.kv.put(ReportCache.MOCK_SPEC_INDEX_KEY, JSON.stringify(ids))
+    }
   }
   async getMockSpec(digest: string): Promise<string | null> {
     return this.kv.get(this.mockSpecK(digest))
+  }
+
+  /** Count of DISTINCT registered mock specs — the MAX_MOCK_SPECS cap check. */
+  async countMockSpecs(): Promise<number> {
+    return (await this.mockSpecIndex()).length
   }
 
   /** A prior suite verdict, keyed by (target, suite digest, environment, seed). */

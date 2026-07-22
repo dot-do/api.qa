@@ -2,7 +2,9 @@
  * Minimal structural JSON-schema validator — deliberately dependency-free
  * and deterministic. Covers the subset api.qa derives from OpenAPI response
  * schemas and pinned specs: type / properties / required / items / enum /
- * const. Anything richer is a seam (see DESIGN.md).
+ * const / allOf / minLength / maxLength / pattern / minItems / maxItems /
+ * uniqueItems / multipleOf / exclusiveMinimum / exclusiveMaximum /
+ * minProperties. Anything richer is a seam (see DESIGN.md).
  */
 
 import type { MiniSchema } from './types.js'
@@ -73,7 +75,79 @@ export function validateSchema(value: unknown, schema: MiniSchema, path = '$'): 
     value.forEach((item, i) => out.push(...validateSchema(item, schema.items!, `${path}[${i}]`)))
   }
 
+  // allOf (HIGH fix): the contract-diff / self-consistency dogfood must
+  // actually enforce every branch, not just be silently vacuous. A value
+  // satisfies `allOf` only if it satisfies EVERY listed subschema — recurse
+  // into each and surface all violations at the SAME path (the branches
+  // describe the SAME value, not a sub-position of it).
+  if (schema.allOf) {
+    for (const sub of schema.allOf) out.push(...validateSchema(value, sub, path))
+  }
+
+  if (typeof value === 'string') {
+    if (typeof schema.minLength === 'number' && value.length < schema.minLength) {
+      out.push({ path, message: `expected minLength ${schema.minLength}, got length ${value.length}` })
+    }
+    if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) {
+      out.push({ path, message: `expected maxLength ${schema.maxLength}, got length ${value.length}` })
+    }
+    if (typeof schema.pattern === 'string') {
+      const re = safeRegExp(schema.pattern)
+      if (re && !re.test(value)) {
+        out.push({ path, message: `does not match pattern ${schema.pattern}` })
+      }
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (typeof schema.multipleOf === 'number' && schema.multipleOf > 0) {
+      const ratio = value / schema.multipleOf
+      if (Math.abs(ratio - Math.round(ratio)) > 1e-9) {
+        out.push({ path, message: `expected multipleOf ${schema.multipleOf}, got ${value}` })
+      }
+    }
+    if (typeof schema.exclusiveMinimum === 'number' && !(value > schema.exclusiveMinimum)) {
+      out.push({ path, message: `expected > ${schema.exclusiveMinimum} (exclusiveMinimum), got ${value}` })
+    }
+    if (typeof schema.exclusiveMaximum === 'number' && !(value < schema.exclusiveMaximum)) {
+      out.push({ path, message: `expected < ${schema.exclusiveMaximum} (exclusiveMaximum), got ${value}` })
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === 'number' && value.length < schema.minItems) {
+      out.push({ path, message: `expected minItems ${schema.minItems}, got ${value.length}` })
+    }
+    if (typeof schema.maxItems === 'number' && value.length > schema.maxItems) {
+      out.push({ path, message: `expected maxItems ${schema.maxItems}, got ${value.length}` })
+    }
+    if (schema.uniqueItems === true) {
+      const seen = new Set(value.map((v) => JSON.stringify(v)))
+      if (seen.size !== value.length) out.push({ path, message: 'expected uniqueItems, found a duplicate' })
+    }
+  }
+
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    if (typeof schema.minProperties === 'number' && Object.keys(value).length < schema.minProperties) {
+      out.push({
+        path,
+        message: `expected minProperties ${schema.minProperties}, got ${Object.keys(value).length}`,
+      })
+    }
+  }
+
   return out
+}
+
+/** A `pattern` is author-controlled (schema, not attacker input, but still
+ * arbitrary) — guard the `new RegExp` construction so a malformed pattern
+ * fails OPEN (skips the check) rather than throwing out of the validator. */
+function safeRegExp(pattern: string): RegExp | undefined {
+  try {
+    return new RegExp(pattern)
+  } catch {
+    return undefined
+  }
 }
 
 /** True when `type` (a scalar, an array of scalars, or absent) names `want`. */

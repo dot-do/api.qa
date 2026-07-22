@@ -26,7 +26,13 @@ import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
 import { generateSigningKey, importSigningKeyPair, verdictDigest } from './attest.js'
 import { sha256Hex } from './digest.js'
-import { serveMock, enumerateMockOperations, DEFAULT_MOCK_SEED } from './mock.js'
+import {
+  serveMock,
+  enumerateMockOperations,
+  DEFAULT_MOCK_SEED,
+  MAX_MOCK_SPEC_BYTES,
+  DEFAULT_MAX_MOCK_SPECS,
+} from './mock.js'
 import type { Fetcher } from './http.js'
 import {
   ReportCache,
@@ -115,6 +121,10 @@ export interface Env {
   /** Idle-eviction TTL, in days: a monitor not run/refreshed this long is
    * treated as abandoned (excluded from listing/ticking, evictable). */
   MONITOR_TTL_DAYS?: string
+  /** Cap on DISTINCT registered mock specs — bounds the open, unauthenticated
+   * POST /mock abuse surface (mirrors MAX_MONITORS; real per-principal auth
+   * awaits bd ax-e6b.30, still 402-blocked). */
+  MAX_MOCK_SPECS?: string
   /** Time-series raw-point ring cap per series before rollup (bd ax-e6b.29.2). */
   TS_RAW_CAP?: string
   /** Time-series hourly rollup-bucket cap before oldest are evicted. */
@@ -271,6 +281,8 @@ export function createApp(
   const maxMonitors = env.MAX_MONITORS ? Number(env.MAX_MONITORS) : DEFAULT_MAX_MONITORS
   const monitorTtlMs =
     (env.MONITOR_TTL_DAYS ? Number(env.MONITOR_TTL_DAYS) : DEFAULT_MONITOR_TTL_DAYS) * 24 * 60 * 60 * 1000
+  // Same LOW abuse-surface bound, mirrored for the mock registry (MED fix).
+  const maxMockSpecs = env.MAX_MOCK_SPECS ? Number(env.MAX_MOCK_SPECS) : DEFAULT_MAX_MOCK_SPECS
 
   // Loopback: any verification of api.qa itself dispatches back into this
   // handler — the verifier discovers itself over its own protocols. Hoisted to
@@ -501,6 +513,15 @@ export function createApp(
           if (specText === undefined) {
             return json({ error: 'body must include "spec" or "specText" (an OpenAPI 3.1 doc)' }, 400)
           }
+          // MED fix: bound the registrable spec size before it is parsed or
+          // stored at all (mirrors the monitors registry's own abuse-surface
+          // discipline).
+          if (specText.length > MAX_MOCK_SPEC_BYTES) {
+            return json(
+              { error: `spec too large (${specText.length} bytes, max ${MAX_MOCK_SPEC_BYTES}) — refusing to register` },
+              413,
+            )
+          }
           let doc: unknown
           try {
             doc = JSON.parse(specText)
@@ -512,6 +533,24 @@ export function createApp(
             return json({ error: 'spec declares no operations (not a usable OpenAPI paths doc)' }, 400)
           }
           const digest = await sha256Hex(specText)
+          // MED fix: cap the DISTINCT-spec registry size, mirroring
+          // MAX_MONITORS — re-registering the SAME (already-stored) digest is
+          // idempotent and never counts against the cap; only genuinely new
+          // growth does.
+          const alreadyRegistered = (await cache.getMockSpec(digest)) !== null
+          if (!alreadyRegistered) {
+            const count = await cache.countMockSpecs()
+            if (count >= maxMockSpecs) {
+              return json(
+                {
+                  error: `mock spec registry full (${count}/${maxMockSpecs}) — refusing new registration`,
+                  detail:
+                    'per-principal quota + registration auth await ax-e6b.30 (402-blocked); MAX_MOCK_SPECS is a coarse interim cap, env-overridable',
+                },
+                429,
+              )
+            }
+          }
           await cache.putMockSpec(digest, specText)
           return json({
             digest,

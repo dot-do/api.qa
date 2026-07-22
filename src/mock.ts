@@ -25,6 +25,7 @@
 
 import { resolveSchema } from './contract.js'
 import { seededRandom } from './digest.js'
+import { validateSchema } from './schema.js'
 import type { MiniSchema } from './types.js'
 
 const HTTP_METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const
@@ -32,9 +33,6 @@ const HTTP_METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch'
 /** A schema node may carry OpenAPI keywords MiniSchema does not model. */
 interface RichSchema extends MiniSchema {
   example?: unknown
-  oneOf?: unknown[]
-  anyOf?: unknown[]
-  allOf?: unknown[]
   format?: string
   minimum?: number
   maximum?: number
@@ -64,6 +62,24 @@ export interface MockOperation {
 
 /** Default seed when a request does not select one — keeps bodies stable. */
 export const DEFAULT_MOCK_SEED = 1
+
+/**
+ * Max registrable spec body size (bytes) for `POST /mock` (MED fix, mirrors
+ * the monitors byte-size discipline). A legitimate OpenAPI doc for a mock
+ * target is comfortably under this; anything larger is refused before it is
+ * stored (or even resolved) at all.
+ */
+export const MAX_MOCK_SPEC_BYTES = 512 * 1024
+
+/**
+ * Default cap on the number of DISTINCT registered mock specs the registry
+ * will hold (content-addressed by digest — re-registering the SAME spec text
+ * is idempotent and never counts against growth). Mirrors
+ * `DEFAULT_MAX_MONITORS` (monitors.ts): a coarse, env-overridable bound on the
+ * open, unauthenticated `POST /mock` registration surface (real per-principal
+ * auth + quota await bd ax-e6b.30, still 402-blocked).
+ */
+export const DEFAULT_MAX_MOCK_SPECS = 1000
 
 // ---------------------------------------------------------------------------
 // Enumeration — declared operations + their responses (schema + example)
@@ -189,11 +205,24 @@ function genValue(schemaIn: MiniSchema | undefined, rand: () => number, depth: n
   if (s.enum && s.enum.length > 0) return clone(s.enum[0])
   if (s.default !== undefined) return clone(s.default)
 
-  // 2. Composition: first branch of oneOf / anyOf / allOf (branches may still
-  //    be a bare `$ref`, so resolve each before recursing — resolveSchema is
-  //    only applied to the standard positions at enumeration time).
-  const branch = s.oneOf?.[0] ?? s.anyOf?.[0] ?? s.allOf?.[0]
-  if (branch !== undefined) return genValue(resolveBranch(branch), rand, depth + 1)
+  // 2. Composition. Branches are already fully dereferenced by resolveSchema
+  //    (contract.ts) by the time a served operation's schema reaches here —
+  //    `resolveBranch` below stays defensive for direct/test callers that
+  //    hand genValue a raw (not-yet-resolved-through-resolveSchema) schema.
+  //
+  //    oneOf: generate a candidate from each branch in turn until exactly ONE
+  //    branch validates it (oneOf's actual semantic) — `oneOf: [integer,
+  //    number]` previously generated an integer that validates against BOTH,
+  //    silently violating "exactly one".
+  if (s.oneOf && s.oneOf.length > 0) return genOneOf(s.oneOf, rand, depth)
+  //    anyOf: any branch validating is fine — the first is as good as any.
+  if (s.anyOf && s.anyOf.length > 0) return genValue(resolveBranch(s.anyOf[0]), rand, depth + 1)
+  //    allOf: the value must satisfy EVERY branch at once — deep-merge all
+  //    branches into one schema (union properties/required, intersect
+  //    constraints) and generate a single value against the merge, instead of
+  //    the old first-branch-only behavior that silently dropped every other
+  //    branch's requirements.
+  if (s.allOf && s.allOf.length > 0) return genValue(mergeAllOf(s.allOf), rand, depth + 1)
 
   // 3. Resolve the effective type: `type` may be a scalar or a 3.1 tuple
   //    (['string','null']). Prefer the first non-null member.
@@ -212,10 +241,8 @@ function genValue(schemaIn: MiniSchema | undefined, rand: () => number, depth: n
       return genNumber(s, rand, false)
     case 'string':
       return genString(s)
-    case 'array': {
-      // A single-element array of the item schema (empty when unconstrained).
-      return s.items ? [genValue(s.items, rand, depth + 1)] : []
-    }
+    case 'array':
+      return genArray(s, rand, depth)
     case 'object':
       return genObject(s, rand, depth)
     default:
@@ -243,31 +270,197 @@ function genObject(s: RichSchema, rand: () => number, depth: number): Record<str
   for (const key of s.required ?? []) {
     if (!(key in out)) out[key] = null
   }
+  // minProperties (previously unread): top up with synthetic filler
+  // properties when the declared/required properties don't reach the floor
+  // — but only on an OPEN object; a closed (additionalProperties: false)
+  // object cannot gain undeclared keys without becoming non-conformant, so
+  // it is left as the best-effort declared shape.
+  if (typeof s.minProperties === 'number' && s.additionalProperties !== false) {
+    let i = 0
+    while (Object.keys(out).length < s.minProperties) {
+      const key = `extra${i++}`
+      if (!(key in out)) out[key] = 'string'
+    }
+  }
   return out
 }
 
-function genNumber(s: RichSchema, rand: () => number, integer: boolean): number {
-  const min = typeof s.minimum === 'number' ? s.minimum : undefined
-  const max = typeof s.maximum === 'number' ? s.maximum : undefined
-  if (min !== undefined && max !== undefined) {
-    const v = min + rand() * (max - min)
-    return integer ? Math.floor(v) : v
+/** A single-element array of the item schema by default; honors minItems /
+ * maxItems (repeats the item to reach the floor, caps at the ceiling) and
+ * uniqueItems (disambiguates otherwise-identical generated items). */
+function genArray(s: RichSchema, rand: () => number, depth: number): unknown[] {
+  const min = typeof s.minItems === 'number' ? s.minItems : undefined
+  const max = typeof s.maxItems === 'number' ? s.maxItems : undefined
+  let count = min !== undefined ? min : s.items ? 1 : 0
+  if (max !== undefined && count > max) count = max
+  if (count < 0) count = 0
+  if (!s.items) return new Array(Math.max(count, 0)).fill(null)
+  const out: unknown[] = []
+  for (let i = 0; i < count; i++) {
+    let item = genValue(s.items, rand, depth + 1)
+    if (s.uniqueItems === true) item = disambiguate(item, out, i)
+    out.push(item)
   }
-  if (min !== undefined) return integer ? Math.ceil(min) : min
-  if (max !== undefined) return integer ? Math.floor(max) : max
-  // Unconstrained: a seeded, stable value.
-  return integer ? Math.floor(rand() * 1000) : Math.round(rand() * 1000 * 100) / 100
+  return out
 }
+
+/** Nudge `item` to be distinct from everything already in `existing` when a
+ * plain re-generation would collide (e.g. an unconstrained string/number
+ * schema deterministically produces the SAME value every call). Best-effort:
+ * a 2-valued type (boolean) or a fixed const/enum cannot be disambiguated
+ * beyond its value space and is left as-is. */
+function disambiguate(item: unknown, existing: unknown[], index: number): unknown {
+  const key = JSON.stringify(item)
+  if (!existing.some((e) => JSON.stringify(e) === key)) return item
+  if (typeof item === 'string') return `${item}_${index}`
+  if (typeof item === 'number') return item + index
+  return item
+}
+
+function genNumber(s: RichSchema, rand: () => number, integer: boolean): number {
+  let min = typeof s.minimum === 'number' ? s.minimum : undefined
+  let max = typeof s.maximum === 'number' ? s.maximum : undefined
+  // exclusiveMinimum/exclusiveMaximum (JSON-Schema-2020-12 / OpenAPI 3.1: a
+  // NUMBER, not the 3.0 boolean modifier) — narrow the inclusive [min, max]
+  // range so a bound value itself is never produced.
+  if (typeof s.exclusiveMinimum === 'number') {
+    const bound = integer ? s.exclusiveMinimum + 1 : s.exclusiveMinimum + 1e-6
+    min = min === undefined ? bound : Math.max(min, bound)
+  }
+  if (typeof s.exclusiveMaximum === 'number') {
+    const bound = integer ? s.exclusiveMaximum - 1 : s.exclusiveMaximum - 1e-6
+    max = max === undefined ? bound : Math.min(max, bound)
+  }
+
+  let v: number
+  if (min !== undefined && max !== undefined) {
+    const raw = min + rand() * (max - min)
+    v = integer ? Math.floor(raw) : raw
+    if (integer && v < min) v = Math.ceil(min)
+    if (integer && v > max) v = Math.floor(max)
+  } else if (min !== undefined) {
+    v = integer ? Math.ceil(min) : min
+  } else if (max !== undefined) {
+    v = integer ? Math.floor(max) : max
+  } else {
+    // Unconstrained: a seeded, stable value.
+    v = integer ? Math.floor(rand() * 1000) : Math.round(rand() * 1000 * 100) / 100
+  }
+
+  if (typeof s.multipleOf === 'number' && s.multipleOf > 0) {
+    v = snapToMultiple(v, s.multipleOf, min, max)
+    if (integer) v = Math.round(v)
+  }
+  return v
+}
+
+/** Snap `v` to the nearest multiple of `m`, then pull it back inside
+ * [min, max] (to the nearest in-range multiple) if snapping pushed it out. */
+function snapToMultiple(v: number, m: number, min: number | undefined, max: number | undefined): number {
+  let snapped = Math.round(v / m) * m
+  if (min !== undefined && snapped < min) snapped = Math.ceil(min / m) * m
+  if (max !== undefined && snapped > max) snapped = Math.floor(max / m) * m
+  return Math.round(snapped * 1e9) / 1e9 // floating-point cleanup
+}
+
+/** A small allowlist of "simple" patterns the generator can satisfy exactly
+ * (any richer pattern falls back safely to the plain/format string below —
+ * `validateSchema`, unlike the generator, checks ANY valid regex). */
+const SIMPLE_DIGIT_PATTERNS = new Set(['^\\d+$', '^[0-9]+$'])
+const SIMPLE_ALPHA_PATTERNS = new Set(['^[A-Za-z]+$', '^[a-zA-Z]+$', '^[a-z]+$', '^[A-Z]+$'])
 
 function genString(s: RichSchema): string {
-  if (typeof s.format === 'string' && FORMAT_VALUES[s.format] !== undefined) return FORMAT_VALUES[s.format]!
-  return 'string'
+  let base: string | undefined
+  if (typeof s.pattern === 'string') {
+    const len = Math.max(s.minLength ?? 1, 1)
+    if (SIMPLE_DIGIT_PATTERNS.has(s.pattern)) base = '1'.repeat(len)
+    else if (SIMPLE_ALPHA_PATTERNS.has(s.pattern)) base = 'a'.repeat(len)
+  }
+  if (base === undefined) {
+    base = typeof s.format === 'string' && FORMAT_VALUES[s.format] !== undefined ? FORMAT_VALUES[s.format]! : 'string'
+  }
+  return clampLength(base, s.minLength, s.maxLength)
 }
 
-/** Resolve a composition branch that may be a bare `$ref` node. */
+/** Truncate to satisfy `maxLength`, then pad (by repetition) to satisfy
+ * `minLength` — deterministic, and safe for the pattern-matched bases above
+ * (repeating an all-digit/all-letter string stays all-digit/all-letter). */
+function clampLength(base: string, minLength?: number, maxLength?: number): string {
+  let v = base
+  if (typeof maxLength === 'number' && v.length > maxLength) v = v.slice(0, Math.max(0, maxLength))
+  if (typeof minLength === 'number' && v.length < minLength) {
+    while (v.length < minLength) v += v.length > 0 ? v : 'a'
+    v = v.slice(0, minLength)
+  }
+  return v
+}
+
+/** Resolve a composition branch that may be a bare `$ref` node — defensive
+ * fallback for a caller that hands genValue a schema NOT already threaded
+ * through resolveSchema (which now dereferences oneOf/anyOf/allOf branches
+ * itself; see contract.ts). */
 function resolveBranch(branch: unknown): MiniSchema | undefined {
   if (!branch || typeof branch !== 'object') return undefined
   return branch as MiniSchema
+}
+
+/**
+ * oneOf's actual semantic is "matches EXACTLY ONE branch" — generate a
+ * candidate from each branch in turn (deterministic order) and keep the
+ * first one that validates against EXACTLY one of the declared branches.
+ * Falls back to the first branch's value if none disambiguate cleanly
+ * (e.g. every branch is structurally identical) rather than looping forever.
+ */
+function genOneOf(branches: MiniSchema[], rand: () => number, depth: number): unknown {
+  const resolved = branches.map((b) => resolveBranch(b) ?? {})
+  for (const candidateSchema of resolved) {
+    const candidate = genValue(candidateSchema, rand, depth + 1)
+    const matches = resolved.reduce((n, b) => n + (validateSchema(candidate, b).length === 0 ? 1 : 0), 0)
+    if (matches === 1) return candidate
+  }
+  return genValue(resolved[0], rand, depth + 1)
+}
+
+/**
+ * Deep-merge every `allOf` branch into ONE schema so generation (and, by
+ * construction, validation) treats allOf conjunctively: properties/required
+ * are UNIONED across branches, and range/length/item constraints are
+ * INTERSECTED (the tightest bound from any branch wins) rather than only the
+ * first branch's shape surviving.
+ */
+function mergeAllOf(branches: MiniSchema[]): RichSchema {
+  const merged: RichSchema = {}
+  const properties: Record<string, MiniSchema> = {}
+  const required = new Set<string>()
+  for (const raw of branches) {
+    const sub = (resolveBranch(raw) ?? {}) as RichSchema
+    if (sub.type !== undefined && merged.type === undefined) merged.type = sub.type
+    if (sub.properties) for (const [k, v] of Object.entries(sub.properties)) properties[k] = v
+    for (const r of sub.required ?? []) required.add(r)
+    merged.minimum = tighten(merged.minimum, sub.minimum, Math.max)
+    merged.maximum = tighten(merged.maximum, sub.maximum, Math.min)
+    merged.minLength = tighten(merged.minLength, sub.minLength, Math.max)
+    merged.maxLength = tighten(merged.maxLength, sub.maxLength, Math.min)
+    merged.minItems = tighten(merged.minItems, sub.minItems, Math.max)
+    merged.maxItems = tighten(merged.maxItems, sub.maxItems, Math.min)
+    merged.minProperties = tighten(merged.minProperties, sub.minProperties, Math.max)
+    if (sub.pattern !== undefined && merged.pattern === undefined) merged.pattern = sub.pattern
+    if (sub.multipleOf !== undefined && merged.multipleOf === undefined) merged.multipleOf = sub.multipleOf
+    if (sub.items !== undefined && merged.items === undefined) merged.items = sub.items
+    if (sub.additionalProperties !== undefined) merged.additionalProperties = sub.additionalProperties
+    if (sub.nullable === true) merged.nullable = true
+    if (sub.enum && merged.enum === undefined) merged.enum = sub.enum
+    if (sub.const !== undefined && merged.const === undefined) merged.const = sub.const
+  }
+  merged.properties = properties
+  merged.required = [...required]
+  if (merged.type === undefined && (Object.keys(properties).length > 0 || required.size > 0)) merged.type = 'object'
+  return merged
+}
+
+function tighten(current: number | undefined, next: number | undefined, pick: (a: number, b: number) => number): number | undefined {
+  if (next === undefined) return current
+  return current === undefined ? next : pick(current, next)
 }
 
 function clone<T>(v: T): T {
