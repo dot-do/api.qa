@@ -132,7 +132,7 @@ function enumerateResponses(op: Record<string, unknown>, root: Record<string, un
  * branches that reuse the same component (not a cycle) are unaffected, since
  * each branch gets its own copy of `visited`.
  */
-function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: ReadonlySet<string> = new Set()): MiniSchema | undefined {
+export function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: ReadonlySet<string> = new Set()): MiniSchema | undefined {
   if (!schema || typeof schema !== 'object') return undefined
   const s = schema as Record<string, unknown>
   const ref = s.$ref

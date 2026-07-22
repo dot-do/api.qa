@@ -197,6 +197,25 @@ export class ReportCache {
     return this.kv.get(this.suiteTextK(digest))
   }
 
+  // --- Mock server (ax-e6b.28.3) -------------------------------------------
+
+  private mockSpecK(digest: string): string {
+    return `mockspec:${digest}`
+  }
+
+  /**
+   * The mock REGISTRY: content-addressed OpenAPI spec text stored by its digest
+   * so `GET /mock/:digest/<path>` can serve a generated response by digest
+   * alone. Durable (not TTL-expired) like the suite registry — the digest is
+   * the identity, and the SAME digest is always the SAME spec text.
+   */
+  async putMockSpec(digest: string, text: string): Promise<void> {
+    await this.kv.put(this.mockSpecK(digest), text)
+  }
+  async getMockSpec(digest: string): Promise<string | null> {
+    return this.kv.get(this.mockSpecK(digest))
+  }
+
   /** A prior suite verdict, keyed by (target, suite digest, environment, seed). */
   async getSuite(
     target: string,

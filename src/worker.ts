@@ -26,6 +26,7 @@ import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
 import { generateSigningKey, importSigningKeyPair, verdictDigest } from './attest.js'
 import { sha256Hex } from './digest.js'
+import { serveMock, enumerateMockOperations, DEFAULT_MOCK_SEED } from './mock.js'
 import type { Fetcher } from './http.js'
 import {
   ReportCache,
@@ -480,6 +481,88 @@ export function createApp(
       const path = url.pathname
 
       try {
+        // --- Mock server (ax-e6b.28.3) ---------------------------------------
+        // POST /mock                 {spec?|specText?} → register an OpenAPI doc
+        //                            by digest (content-addressed, like /suite)
+        // *    /mock/:digest/<path>  → serve the DETERMINISTIC, schema/example-
+        //                            conformant response for that declared
+        //                            (path, method, status, content-type). Any
+        //                            HTTP method the spec declares is served;
+        //                            an undeclared path/method → 404. PURE — the
+        //                            mock serves ONLY generated local responses
+        //                            (no outbound fetch, no SSRF surface).
+        if (request.method === 'POST' && path === '/mock') {
+          if (!cache) return json({ error: 'no mock registry configured' }, 501)
+          const body = (await request.json().catch(() => undefined)) as
+            | { spec?: unknown; specText?: string }
+            | undefined
+          const specText =
+            body?.specText ?? (body?.spec !== undefined ? JSON.stringify(body.spec) : undefined)
+          if (specText === undefined) {
+            return json({ error: 'body must include "spec" or "specText" (an OpenAPI 3.1 doc)' }, 400)
+          }
+          let doc: unknown
+          try {
+            doc = JSON.parse(specText)
+          } catch {
+            return json({ error: 'spec is not valid JSON' }, 400)
+          }
+          const ops = enumerateMockOperations(doc)
+          if (ops.length === 0) {
+            return json({ error: 'spec declares no operations (not a usable OpenAPI paths doc)' }, 400)
+          }
+          const digest = await sha256Hex(specText)
+          await cache.putMockSpec(digest, specText)
+          return json({
+            digest,
+            operations: ops.length,
+            mock: `${SELF_ORIGIN}/mock/${digest}`,
+            operationsList: ops.map((o) => `${o.method} ${o.path}`),
+          })
+        }
+
+        if (path.startsWith('/mock/')) {
+          if (!cache) return json({ error: 'no mock registry configured' }, 501)
+          const rest = path.slice('/mock/'.length)
+          const slash = rest.indexOf('/')
+          const digest = slash === -1 ? rest : rest.slice(0, slash)
+          const opPath = slash === -1 ? '/' : rest.slice(slash)
+          if (digest.length === 0) return json({ error: 'mock request must name a spec digest' }, 400)
+          const specText = await cache.getMockSpec(digest)
+          if (specText === null) return json({ error: `no registered mock spec for digest ${digest}` }, 404)
+          let doc: unknown
+          try {
+            doc = JSON.parse(specText)
+          } catch {
+            return json({ error: 'stored mock spec is not valid JSON' }, 500)
+          }
+          // Seed (deterministic generator) + explicit status selection are
+          // taken from the query string; the Accept header content-negotiates.
+          const seedRaw = url.searchParams.get('seed')
+          const seed = seedRaw !== null && Number.isFinite(Number(seedRaw)) ? Number(seedRaw) : DEFAULT_MOCK_SEED
+          const statusSel = url.searchParams.get('status') ?? preferCode(request.headers.get('prefer'))
+          const served = serveMock(doc, request.method, opPath, {
+            accept,
+            ...(statusSel ? { status: statusSel } : {}),
+            seed,
+          })
+          if (!served) {
+            return json(
+              { error: `mock declares no ${request.method} ${opPath}`, digest, see: `${SELF_ORIGIN}/mock/${digest}` },
+              404,
+            )
+          }
+          return new Response(request.method === 'HEAD' ? null : served.body, {
+            status: served.status,
+            headers: {
+              'content-type': served.contentType,
+              'access-control-allow-origin': '*',
+              'x-mock-server': 'api.qa',
+              'x-mock-seed': String(seed),
+            },
+          })
+        }
+
         if (request.method === 'GET' || request.method === 'HEAD') {
           if (path === '/') {
             return accept.includes('text/html')
@@ -978,6 +1061,13 @@ function parseWindowMs(raw: string | null): number | undefined {
     default:
       return undefined
   }
+}
+
+/** Parse a Postman-style `Prefer: code=NNN` mock-status selector, if present. */
+function preferCode(prefer: string | null): string | undefined {
+  if (!prefer) return undefined
+  const m = prefer.match(/(?:^|[,;\s])code=(\d{3})(?:$|[,;\s])/i)
+  return m ? m[1] : undefined
 }
 
 function text(body: string, status = 200, extra: Record<string, string> = {}): Response {
