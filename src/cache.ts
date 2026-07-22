@@ -18,6 +18,7 @@
  * so an identical (target, pinned spec) pair is served without re-probing.
  */
 
+import { normalizeTarget } from './http.js'
 import type { VerificationReport } from './types.js'
 import type { PinnedReport, SuiteReport } from './pinned.js'
 
@@ -43,6 +44,22 @@ export function hostKey(domain: string): string {
     .replace(/\/.*$/, '')
     .replace(/:\d+$/, '')
     .toLowerCase()
+}
+
+/**
+ * The NORMALIZED-ORIGIN key (scheme + host + port) for a target, via the same
+ * `normalizeTarget` the verifier itself runs — so the cache keys on the exact
+ * identity a run executes against. hostKey() strips scheme AND port, so two runs
+ * against the SAME host on different ports/schemes (http://h:8787 vs
+ * https://h:9999) would otherwise COLLIDE and serve each other a stale/wrong
+ * verdict for a DIFFERENT service. The verdict caches (pinned/suite) key on this
+ * origin instead (ax-4c4). `allowPrivate` is on so a consented local target
+ * (http://localhost:8787) still gets a stable, distinct origin key; an
+ * un-normalizable input falls back to hostKey rather than throwing.
+ */
+export function originKey(target: string): string {
+  const n = normalizeTarget(target, true)
+  return 'origin' in n ? n.origin.toLowerCase() : hostKey(target)
 }
 
 /**
@@ -91,7 +108,10 @@ export class ReportCache {
     return `report:${hostKey(domain)}:${digest}`
   }
   private pinnedK(domain: string, specDigest: string, seed: number | undefined): string {
-    return `pinned:${hostKey(domain)}:${specDigest}:${seedKey(seed)}`
+    // Keyed on the normalized ORIGIN (scheme+host+port), not hostKey — a run on
+    // a different port/scheme of the same host is a DIFFERENT service and must
+    // NOT share a verdict entry (ax-4c4).
+    return `pinned:${originKey(domain)}:${specDigest}:${seedKey(seed)}`
   }
 
   /** Latest domain-mode verdict, if any. `fresh` = within the TTL window. */
@@ -159,7 +179,9 @@ export class ReportCache {
     return `suitetext:${digest}`
   }
   private suiteK(target: string, suiteDigest: string, envName: string, seed: number | undefined): string {
-    return `suite:${hostKey(target)}:${suiteDigest}:${envName}:${seedKey(seed)}`
+    // Normalized ORIGIN, not hostKey — same-host/different-port is a distinct
+    // service and must not cross-serve a cached suite verdict (ax-4c4).
+    return `suite:${originKey(target)}:${suiteDigest}:${envName}:${seedKey(seed)}`
   }
 
   /**

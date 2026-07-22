@@ -206,9 +206,59 @@ const PRIVATE_HOST = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|
 // checks in PRIVATE_HOST above.
 const IP_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$|^\[|^\d+$|^0x[0-9a-f]+$/i
 
+/**
+ * Decode any inet_aton-style numeric IPv4 host to its canonical dotted-quad, or
+ * null when `host` is not a purely-numeric IPv4 form. WHATWG-`URL` canonicalizes
+ * these forms itself (`new URL('http://2852039166/').hostname === '169.254.169.254'`),
+ * so a caller that already ran the host through `new URL()` is covered — but
+ * isPrivateHost must NOT depend on that. This decodes the same forms the URL
+ * parser accepts, so isPrivateHost is correct on a RAW string too:
+ *   - bare decimal      2852039166            → 169.254.169.254
+ *   - bare 0x-hex       0xA9FEA9FE            → 169.254.169.254
+ *   - bare octal        025177724776          → 169.254.169.254
+ *   - dotted, mixed radix / short forms       0xA9.0376.169.254, 127.1, …
+ * inet_aton packs the LAST part into the remaining low-order bytes; leading
+ * parts are one byte each. A part out of range, an empty part, or any non-numeric
+ * label makes the whole host a DNS name (→ null, not an IP). The dotted-octal and
+ * dotted-hex forms are the ones the flat IP_LITERAL regex above CANNOT catch, so
+ * this is the load-bearing addition; bare decimal/hex are already caught by
+ * IP_LITERAL and stay refused regardless.
+ */
+function numericIpv4ToDotted(host: string): string | null {
+  const labels = host.split('.')
+  if (labels.length === 0 || labels.length > 4) return null
+  const parts: number[] = []
+  for (const label of labels) {
+    if (label.length === 0) return null
+    let n: number
+    if (/^0x[0-9a-f]+$/i.test(label)) n = parseInt(label.slice(2), 16)
+    else if (/^0[0-7]+$/.test(label)) n = parseInt(label, 8)
+    else if (/^(0|[1-9][0-9]*)$/.test(label)) n = parseInt(label, 10)
+    else return null
+    if (!Number.isFinite(n) || n < 0) return null
+    parts.push(n)
+  }
+  const n = parts.length
+  const bytesForLast = 4 - (n - 1)
+  for (let i = 0; i < n - 1; i++) if (parts[i]! > 0xff) return null
+  const last = parts[n - 1]!
+  const maxLast = Math.pow(256, bytesForLast) - 1
+  if (last > maxLast) return null
+  let leading = 0
+  for (let i = 0; i < n - 1; i++) leading = leading * 256 + parts[i]!
+  const value = (leading * Math.pow(256, bytesForLast) + last) >>> 0
+  return `${(value >>> 24) & 0xff}.${(value >>> 16) & 0xff}.${(value >>> 8) & 0xff}.${value & 0xff}`
+}
+
 /** A private/loopback/link-local/metadata host — never a public probe target. */
 export function isPrivateHost(host: string): boolean {
-  return PRIVATE_HOST.test(host) || IP_LITERAL.test(host)
+  if (PRIVATE_HOST.test(host) || IP_LITERAL.test(host)) return true
+  // Self-defense: normalize/parse the numeric IPv4 forms (dotted octal/hex and
+  // short forms the flat IP_LITERAL regex misses) and re-run the private-range
+  // check on the canonical dotted-quad. Purely ADDITIVE — it can only make MORE
+  // hosts private, never fewer, so every host currently refused stays refused.
+  const dotted = numericIpv4ToDotted(host)
+  return dotted !== null && PRIVATE_HOST.test(dotted)
 }
 
 /**

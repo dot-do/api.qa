@@ -279,6 +279,13 @@ export async function verifyPinnedSpec(
     // from the bundle and reports the same detail. This is the SSRF gate for a
     // TARGET-CONTROLLED captured value: it cannot smuggle an off-origin request.
     if (!resolved.ok) continue
+    // Defense-in-depth re-gate at the fetch site: resolveEndpoint already refused
+    // an off-origin/private resolved URL, but re-assert the SAME shared gate
+    // immediately before observe() so a future edit between resolution and fetch
+    // cannot reopen a hole (mirrors the probe-path re-gate below and the redirect
+    // hop re-gate). Consented-private-same-origin still passes, exactly as
+    // resolveEndpoint allowed it.
+    if (!isPubliclyRoutableSameOrigin(resolved.url, origin)) continue
     const ev = await observer.observe(`pinned:${req.id}`, resolved.url, {
       method: resolved.method,
       accept: 'application/json',
@@ -362,6 +369,17 @@ export async function verifyPinnedSpec(
         const u = new URL(url)
         u.searchParams.set(entry.param, String(amount))
         url = u.toString()
+      }
+      // Re-gate the FINAL url AFTER param injection, mirroring resolveEndpoint's
+      // post-interpolation same-origin re-gate. searchParams.set can only mutate
+      // the query today, so this never fires for a legit entry — but if a future
+      // edit ever lets `param`/`amount` affect more than the query (a new URL
+      // form, a decoded reserved char, an alternate injection site), the mutated
+      // url is re-checked here and REFUSED before it is observed, instead of
+      // silently going off-origin/private. The judge reports it via entryProblems.
+      if (!isPubliclyRoutableSameOrigin(url, origin)) {
+        plan.entryProblems.set(i, `probe url ${url} is not a same-origin GET after param injection — refused, fail closed`)
+        continue
       }
       plan.finalUrls.set(i, url)
       await observer.observe(`pinned:${req.id}:${i}`, url, { accept: 'application/json' })

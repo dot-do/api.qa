@@ -333,6 +333,80 @@ function absolutize(url: string, origin: string): string {
   }
 }
 
+// The RFC 8414 AS-metadata top-level members the judge (checks.ts) actually
+// reads: issuer/authorization_endpoint/token_endpoint (mcp-oauth-as-metadata),
+// code_challenge_methods_supported (mcp-pkce), registration_endpoint
+// (mcp-oauth-dcr), subject_token_types_supported (ID-JAG AS scan). Everything
+// else in the off-origin body is unjudged and must not be retained.
+const AS_METADATA_KEEP = [
+  'issuer',
+  'authorization_endpoint',
+  'token_endpoint',
+  'code_challenge_methods_supported',
+  'registration_endpoint',
+  'subject_token_types_supported',
+] as const
+
+// The agent_auth sub-keys the judge reads: identity/claim/events endpoints
+// (parseAgentAuth) plus the accepted-subject-token / assertion-type fields the
+// ID-JAG scan (advertisesIdJag) inspects. Everything else in the block is
+// unjudged reflection.
+const AGENT_AUTH_KEEP = [
+  'identity_endpoint',
+  'claim_endpoint',
+  'events_endpoint',
+  'subject_token_types',
+  'subject_token_types_supported',
+  'accepted_assertion_types',
+  'assertion_types',
+] as const
+
+/**
+ * Scrub the `agent_auth` block down to the judged sub-keys. A present-but-not-an-
+ * object block (JSON array/string/number/null) is the DEFECTIVE case the judge
+ * FAILs; collapse it to `null` so that "present and not an object" signal is
+ * preserved WITHOUT retaining the verbatim (possibly large/attacker-chosen)
+ * value. A plain object keeps only the judged sub-keys.
+ */
+function scrubAgentAuth(block: unknown): unknown {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return null
+  const src = block as Record<string, unknown>
+  const kept: Record<string, unknown> = {}
+  for (const k of AGENT_AUTH_KEEP) if (k in src) kept[k] = src[k]
+  return kept
+}
+
+/**
+ * AS-metadata evidence scrub (ax-2ck): the `authorization_servers[0]` AS-metadata
+ * fetch is the ONE off-origin GET api.qa performs (a delegated authorization
+ * server MAY live off the target's origin — the `isPublicHttpsOffOriginAllowed`
+ * hole). Its raw response BODY would otherwise be retained VERBATIM in the
+ * publicly-served evidence bundle — a bounded reflection primitive against an
+ * arbitrary public host. Replace the stored body with ONLY the RFC 8414 /
+ * agent_auth fields the judge parses, so the bundle carries the parsed contract,
+ * never the attacker-chosen off-origin body.
+ *
+ * VERDICT-PRESERVING: every field checks.ts judges is kept, and every
+ * presence/absence/defective distinction parseAgentAuth relies on is preserved.
+ * A body that is not a JSON object carries nothing the judge reads (parseJsonBody
+ * would return undefined either way), so it becomes `null` — killing the
+ * reflection without changing any verdict. Mutates the Evidence in place (the
+ * same object held in `observer.items`), before the bundle digest is taken.
+ */
+function scrubAsMetadataEvidence(ev: Evidence | undefined): void {
+  if (!ev || ev.body === null) return
+  let parsed: unknown
+  try { parsed = JSON.parse(ev.body) } catch { ev.body = null; return }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { ev.body = null; return }
+  const src = parsed as Record<string, unknown>
+  const kept: Record<string, unknown> = {}
+  for (const k of AS_METADATA_KEEP) if (k in src) kept[k] = src[k]
+  // Preserve agent_auth's presence + shape (scrubbed) so parseAgentAuth keeps its
+  // absent→SKIP / defective→FAIL / object→judge distinction and the ID-JAG scan.
+  if ('agent_auth' in src) kept.agent_auth = scrubAgentAuth(src.agent_auth)
+  ev.body = JSON.stringify(kept)
+}
+
 // ---------------------------------------------------------------------------
 // Observe phase
 // ---------------------------------------------------------------------------
@@ -449,12 +523,17 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     if (asBase && isPublicHttpsOffOriginAllowed(asBase)) {
       const asUrl = wellKnownAt(asBase, 'oauth-authorization-server')
       const asEv = asUrl ? await observer.observe(ROLE.mcpAsMetadata, asUrl, { accept: 'application/json' }) : undefined
+      // Scrub the OFF-ORIGIN AS-metadata body to only the judged fields BEFORE it
+      // is retained in the evidence bundle (ax-2ck) — no verbatim off-origin body.
+      scrubAsMetadataEvidence(asEv)
       // RFC 8414 fallback: OpenID Connect discovery document.
       let asMetaEv = asEv
       if (!asEv || asEv.status === null || asEv.status < 200 || asEv.status >= 300) {
         const oidcUrl = wellKnownAt(asBase, 'openid-configuration')
         if (oidcUrl) {
           const oidcEv = await observer.observe(ROLE.mcpAsMetadataOidc, oidcUrl, { accept: 'application/json' })
+          // The OIDC fallback is fetched from the SAME off-origin AS — scrub it too.
+          scrubAsMetadataEvidence(oidcEv)
           if (oidcEv.status !== null && oidcEv.status >= 200 && oidcEv.status < 300) asMetaEv = oidcEv
         }
       }
