@@ -299,6 +299,218 @@ describe('contract-diff — SSRF posture: same-origin probes only', () => {
   })
 })
 
+describe('contract-diff — nested $ref is resolved RECURSIVELY (not just the top-level media-type schema)', () => {
+  // components.schemas.Owner <- components.schemas.Widget.properties.owner <- the
+  // top-level response schema's properties.widget. Two levels of $ref beneath
+  // the top-level schema — the shape a real OpenAPI spec actually uses.
+  function nestedRefOpenapi(): unknown {
+    return {
+      openapi: '3.1.0',
+      info: { title: 't', version: '1' },
+      paths: {
+        '/api/nested': {
+          get: {
+            responses: {
+              '200': {
+                description: 'ok',
+                content: {
+                  'application/json': {
+                    schema: {
+                      type: 'object',
+                      required: ['widget'],
+                      properties: { widget: { $ref: '#/components/schemas/Widget' } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Widget: {
+            type: 'object',
+            required: ['id', 'owner'],
+            properties: {
+              id: { type: 'string' },
+              owner: { $ref: '#/components/schemas/Owner' },
+            },
+          },
+          Owner: {
+            type: 'object',
+            required: ['name'],
+            properties: { name: { type: 'string' } },
+          },
+        },
+      },
+    }
+  }
+
+  async function runNested(body: unknown) {
+    return run(
+      withOverrides(goodTargetRoutes(), {
+        'GET /openapi.json': () => json(nestedRefOpenapi()),
+        'GET /api/nested': () => json(body),
+      }),
+    )
+  }
+
+  it('a violation TWO $ref-levels deep (wrong type under Widget.owner.name) is now DETECTED as breaking', async () => {
+    const { diff, checks } = await runNested({ widget: { id: 'w1', owner: { name: 42 } } })
+    const dev = diff.deviations.find((d) => d.location === '$.widget.owner.name')
+    expect(dev?.kind).toBe('wrong-type')
+    expect(dev?.classification).toBe('breaking')
+    expect(diffCheck(checks).verdict).toBe('fail')
+  })
+
+  it('a required field missing UNDER a nested $ref (Widget.owner missing name) is now DETECTED as breaking', async () => {
+    const { diff } = await runNested({ widget: { id: 'w1', owner: {} } })
+    const dev = diff.deviations.find((d) => d.location === '$.widget.owner.name')
+    expect(dev?.kind).toBe('missing-required')
+    expect(dev?.classification).toBe('breaking')
+  })
+
+  it('a conformant nested-$ref\'d body has zero breaking deviations and the check passes', async () => {
+    const { diff, checks } = await runNested({ widget: { id: 'w1', owner: { name: 'Bob' } } })
+    // breaking (not `clean`): the base fixture's agents.json still declares
+    // /api/status + /api/widgets, which this minimal openapi doesn't — those
+    // are additive undeclared-but-present ghosts, not a conformance failure.
+    expect(diff.breaking).toBe(0)
+    expect(diffCheck(checks).verdict).toBe('pass')
+  })
+
+  it('a cyclic $ref (a schema that refers to itself) resolves without hanging or throwing', async () => {
+    const cyclicOpenapi = {
+      openapi: '3.1.0',
+      info: { title: 't', version: '1' },
+      paths: {
+        '/api/node': {
+          get: {
+            responses: {
+              '200': {
+                description: 'ok',
+                content: { 'application/json': { schema: { $ref: '#/components/schemas/Node' } } },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Node: {
+            type: 'object',
+            required: ['value'],
+            properties: {
+              value: { type: 'string' },
+              child: { $ref: '#/components/schemas/Node' }, // self-referential
+            },
+          },
+        },
+      },
+    }
+    const { diff, checks } = await run(
+      withOverrides(goodTargetRoutes(), {
+        'GET /openapi.json': () => json(cyclicOpenapi),
+        'GET /api/node': () => json({ value: 'a', child: { value: 'b', child: { value: 'c' } } }),
+      }),
+    )
+    // Completing at all (vitest's own timeout) proves the cycle guard held; the
+    // shallow levels the guard DID resolve must still validate cleanly.
+    expect(diff.$type).toBe('ContractDiffReport')
+    expect(diffCheck(checks).verdict).not.toBe('skip')
+  })
+})
+
+describe('contract-diff — budget priority (ax-e6b.28.4 starvation fix)', () => {
+  const MCP_CHECK_IDS = [
+    'mcp-oauth-protected-resource',
+    'mcp-oauth-as-metadata',
+    'mcp-pkce',
+    'mcp-oauth-dcr',
+    'mcp-oauth-resource-indicators',
+    'mcp-www-authenticate',
+  ] as const
+
+  it('an endpoint-rich target (20 declared GET paths) + MCP + 402 + AAP does NOT starve the MCP-OAuth / 402 / AAP checks; the un-probed contract remainder is reported unprobed, never breaking', async () => {
+    const N = 20
+    const paths: Record<string, unknown> = {}
+    const over: Routes = {}
+    for (let i = 0; i < N; i++) {
+      const name = `p${i}`
+      paths[`/api/${name}`] = {
+        get: {
+          responses: {
+            '200': {
+              description: 'ok',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
+                },
+              },
+            },
+          },
+        },
+      }
+      over[`GET /api/${name}`] = () => json({ id: name })
+    }
+    const openapi = { openapi: '3.1.0', info: { title: 'rich', version: '1' }, paths }
+
+    const agentsBody = JSON.parse(
+      goodTargetRoutes()['GET /.well-known/agents.json']!({ method: 'GET', accept: '*/*' }).body!,
+    )
+    agentsBody.interfaces.mcp = { transport: 'streamable-http', url: `${GOOD}/mcp`, tools: ['list'] }
+
+    const protectedResource = { resource: `${GOOD}/mcp`, authorization_servers: [GOOD] }
+    const asMetadata = {
+      issuer: GOOD,
+      authorization_endpoint: `${GOOD}/authorize`,
+      token_endpoint: `${GOOD}/token`,
+      code_challenge_methods_supported: ['S256'],
+      registration_endpoint: `${GOOD}/register`,
+    }
+
+    const routes = withOverrides(goodTargetRoutes(), {
+      'GET /openapi.json': () => json(openapi),
+      'GET /.well-known/agents.json': () => json(agentsBody),
+      'GET /.well-known/agent-configuration': () => json({}),
+      'GET /mcp': () => ({
+        status: 401,
+        contentType: 'application/json',
+        body: '{}',
+        headers: { 'www-authenticate': `Bearer resource_metadata="${GOOD}/.well-known/oauth-protected-resource"` },
+      }),
+      'GET /.well-known/oauth-protected-resource': () => json(protectedResource),
+      'GET /.well-known/oauth-authorization-server': () => json(asMetadata),
+      ...over,
+    })
+
+    const { bundle, diff, checks } = await run(routes)
+
+    // The fixed high-value probes ran with priority — none starved to a null
+    // status by the unbounded declared surface.
+    for (const id of ['offers-402', ...MCP_CHECK_IDS]) {
+      const c = checks.find((cc) => cc.id === id)
+      expect(c, `check ${id} missing`).toBeDefined()
+      expect(c!.verdict, `${id}: ${c!.detail}`).toBe('pass')
+    }
+    expect(bundle.items.find((e) => e.role === ROLE.agentConfiguration)?.status).not.toBeNull()
+    expect(bundle.items.find((e) => e.role === ROLE.offer)?.status).toBe(402)
+    expect(bundle.items.find((e) => e.role === ROLE.mcpUnauth)?.status).toBe(401)
+
+    // Coverage is bounded (MAX_CONTRACT_PROBES), but the un-probed remainder is
+    // reported as unprobed — never as a false declared-but-absent/breaking verdict.
+    expect(diff.operationsDeclared).toBe(N)
+    expect(diff.operationsProbed).toBeLessThan(N)
+    expect(diff.breaking).toBe(0)
+    expect(diff.declaredButAbsent).toHaveLength(0)
+    const unprobedOps = diff.perOperation.filter((o) => !o.probed)
+    expect(unprobedOps.length).toBeGreaterThan(0)
+    expect(unprobedOps.every((o) => o.deviations.length === 0)).toBe(true)
+    expect(diffCheck(checks).verdict).not.toBe('fail')
+  })
+})
+
 describe('contract-diff — pinnable via kind:"check"', () => {
   it('a pinned contract binds contract-diff and PASSES a conformant target', async () => {
     const spec = JSON.stringify({

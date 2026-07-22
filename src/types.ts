@@ -233,9 +233,26 @@ export interface VerificationReport {
 // Pinned-spec mode (the X1 harness)
 // ---------------------------------------------------------------------------
 
+/** The JSON-Schema primitive type names MiniSchema understands. */
+export type MiniSchemaPrimitiveType = 'object' | 'array' | 'string' | 'number' | 'integer' | 'boolean' | 'null'
+
 /** Minimal structural schema — see schema.ts. */
 export interface MiniSchema {
-  type?: 'object' | 'array' | 'string' | 'number' | 'integer' | 'boolean' | 'null'
+  /**
+   * OpenAPI 3.0 uses a single scalar (`type: 'string'`). OpenAPI 3.1 /
+   * JSON-Schema-2020-12 expresses nullability as a TUPLE (`type: ['string',
+   * 'null']`) — validateSchema must accept either shape and treat an array as
+   * "any of these types is acceptable" (see the 3.1-nullable fix, contract-diff
+   * false-positive #1).
+   */
+  type?: MiniSchemaPrimitiveType | MiniSchemaPrimitiveType[]
+  /**
+   * OpenAPI 3.0 nullable idiom: `{ type: 'string', nullable: true }` accepts a
+   * live `null` in addition to the declared `type`. Pairs with the 3.1
+   * `type: [T, 'null']` array idiom above — both must fail OPEN on a
+   * conformant nullable field (contract-diff false-positive #2).
+   */
+  nullable?: boolean
   properties?: Record<string, MiniSchema>
   required?: string[]
   items?: MiniSchema
@@ -248,7 +265,12 @@ export interface MiniSchema {
    * object = extra fields are allowed but must match that subschema.
    */
   additionalProperties?: boolean | MiniSchema
-  /** One-level $ref into components.schemas, resolved by the contract enumerator. */
+  /**
+   * `$ref` into components.schemas. Resolved RECURSIVELY (every level —
+   * properties/items/additionalProperties, not just the top-level media-type
+   * schema) by the contract enumerator's `resolveSchema`, with a visited-set
+   * cycle guard.
+   */
   $ref?: string
 }
 

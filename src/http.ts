@@ -11,6 +11,16 @@ import type { Evidence } from './types.js'
 /** fetch-compatible seam. Tests and self-verification inject their own. */
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>
 
+/**
+ * The exact `Evidence.error` text recorded when a call to `Observer.observe`
+ * is refused because the per-run politeness budget is exhausted (the request
+ * is NEVER sent). Exported so a caller (e.g. the contract-diff judge) can
+ * distinguish "declared but never probed — budget ran out" from a genuine
+ * network failure (timeout, DNS, connection refused): the latter is evidence
+ * of a real dishonest/unreachable claim, the former is not a violation at all.
+ */
+export const BUDGET_EXHAUSTED_ERROR = 'blocked: politeness budget exhausted'
+
 export interface ObserverOpts {
   fetcher?: Fetcher
   /** Max requests per run. Default 24. */
@@ -95,7 +105,7 @@ export class Observer {
       return ev
     }
     if (this.used >= this.opts.budget) {
-      return this.record(role, url, method, init.accept, null, null, {}, null, 0, 'blocked: politeness budget exhausted')
+      return this.record(role, url, method, init.accept, null, null, {}, null, 0, BUDGET_EXHAUSTED_ERROR)
     }
     this.used += 1
     if (this.used > 1 && this.opts.delayMs > 0) {
