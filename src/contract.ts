@@ -115,14 +115,46 @@ function enumerateResponses(op: Record<string, unknown>, root: Record<string, un
 }
 
 /**
+ * Expansion-budget bound (HIGH — billion-laughs $ref DoS fix). The `visited`
+ * cycle guard below only catches a ref that repeats ALONG THE SAME PATH; it
+ * does NOT bound a non-cyclic fan-out $ref DAG — L0 has N properties each
+ * `$ref`-ing a DISTINCT L1 component, L1 has N properties each `$ref`-ing a
+ * DISTINCT L2, and so on. No ref repeats, so the cycle guard never trips, yet
+ * full expansion is O(fanoutᵈᵉᵖᵗʰ): a depth-24 fanout-2 DAG alone materializes
+ * tens of millions of nodes and OOMs. An unauthenticated `POST /mock` (and
+ * every serve — mock.ts) triggers this on request; a malicious TARGET's
+ * OpenAPI doc triggers it in contract-diff's own enumeration.
+ *
+ * `MAX_RESOLVE_NODES` caps the TOTAL schema nodes a single top-level
+ * `resolveSchema` call will materialize; `MAX_RESOLVE_DEPTH` independently
+ * caps recursion depth (protects the call stack against a long non-branching
+ * chain, where the node budget alone would still require thousands of stack
+ * frames). Once EITHER bound is hit, resolution STOPS at that node — it is
+ * returned exactly as it arrived (an unresolved `$ref`, or a nested schema
+ * with unresolved refs somewhere below it) rather than being expanded
+ * further. A caller sees a partially-resolved tree, never an OOM.
+ */
+const MAX_RESOLVE_NODES = 4000
+const MAX_RESOLVE_DEPTH = 60
+
+/** Mutable node counter threaded through one top-level `resolveSchema` call. */
+interface ResolveBudget {
+  count: number
+}
+
+/**
  * Resolve `$ref` into components.schemas RECURSIVELY — at the top level AND at
- * every nested schema position (`properties.*`, `items`, `additionalProperties`)
- * — so a component reference under a nested position is dereferenced exactly
- * like the top-level media-type schema. Before this fix, only the top-level
- * `$ref` was resolved: a nested `{ $ref }` node was left as-is, and
- * `validateSchema` treats an unrecognized node (no `type`/`properties`/`enum`/
- * `const`) as an EMPTY schema that accepts anything — so a violation under a
- * component reference (the normal real-spec shape) passed silently.
+ * every nested schema position (`properties.*`, `items`, `additionalProperties`,
+ * `oneOf`/`anyOf`/`allOf`) — so a component reference under a nested position
+ * is dereferenced exactly like the top-level media-type schema. Before this
+ * fix, only the top-level `$ref` was resolved: a nested `{ $ref }` node was
+ * left as-is, and `validateSchema` treats an unrecognized node (no
+ * `type`/`properties`/`enum`/`const`) as an EMPTY schema that accepts anything
+ * — so a violation under a component reference (the normal real-spec shape)
+ * passed silently. The `oneOf`/`anyOf`/`allOf` recursion additionally fixes a
+ * second HIGH defect: a `$ref` branch inside a composition keyword used to
+ * survive unresolved, so the mock generator (mock.ts) emitted a bare
+ * `{$ref}` object that matched no branch of its own schema.
  *
  * `visited` guards against a `$ref` cycle (a schema that (in)directly refers to
  * itself): each ref name is added to a COPY of the set before descending into
@@ -130,10 +162,24 @@ function enumerateResponses(op: Record<string, unknown>, root: Record<string, un
  * path is caught and resolution stops there (returning an empty — accept-
  * anything — schema at the cycle point) rather than recursing forever. Sibling
  * branches that reuse the same component (not a cycle) are unaffected, since
- * each branch gets its own copy of `visited`.
+ * each branch gets its own copy of `visited`. `depth`/`budget` are internal
+ * (callers use the 2-arg form; every recursive call threads them through).
  */
-function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: ReadonlySet<string> = new Set()): MiniSchema | undefined {
+export function resolveSchema(
+  schema: unknown,
+  root: Record<string, unknown>,
+  visited: ReadonlySet<string> = new Set(),
+  depth = 0,
+  budget: ResolveBudget = { count: 0 },
+): MiniSchema | undefined {
   if (!schema || typeof schema !== 'object') return undefined
+  budget.count++
+  if (budget.count > MAX_RESOLVE_NODES || depth > MAX_RESOLVE_DEPTH) {
+    // Expansion budget exhausted: stop resolving. Return the node exactly as
+    // it arrived rather than expanding it further (see the budget comment
+    // above) — never throw, never keep recursing.
+    return schema as MiniSchema
+  }
   const s = schema as Record<string, unknown>
   const ref = s.$ref
   if (typeof ref === 'string') {
@@ -144,7 +190,7 @@ function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: 
     if (m && schemas && m[1] && schemas[m[1]] && typeof schemas[m[1]] === 'object') {
       const nextVisited = new Set(visited)
       nextVisited.add(ref)
-      return resolveSchema(schemas[m[1]], root, nextVisited)
+      return resolveSchema(schemas[m[1]], root, nextVisited, depth + 1, budget)
     }
     return undefined
   }
@@ -154,18 +200,26 @@ function resolveSchema(schema: unknown, root: Record<string, unknown>, visited: 
   if (out.properties) {
     const props: Record<string, MiniSchema> = {}
     for (const [key, sub] of Object.entries(out.properties)) {
-      const resolved = resolveSchema(sub, root, visited)
+      const resolved = resolveSchema(sub, root, visited, depth + 1, budget)
       if (resolved) props[key] = resolved
     }
     out.properties = props
   }
   if (out.items) {
-    const resolved = resolveSchema(out.items, root, visited)
+    const resolved = resolveSchema(out.items, root, visited, depth + 1, budget)
     if (resolved) out.items = resolved
   }
   if (out.additionalProperties && typeof out.additionalProperties === 'object') {
-    const resolved = resolveSchema(out.additionalProperties, root, visited)
+    const resolved = resolveSchema(out.additionalProperties, root, visited, depth + 1, budget)
     if (resolved) out.additionalProperties = resolved
+  }
+  for (const key of ['oneOf', 'anyOf', 'allOf'] as const) {
+    const arr = out[key]
+    if (Array.isArray(arr)) {
+      out[key] = arr
+        .map((branch) => resolveSchema(branch, root, visited, depth + 1, budget))
+        .filter((b): b is MiniSchema => b !== undefined)
+    }
   }
   return out
 }

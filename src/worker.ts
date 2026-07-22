@@ -26,6 +26,13 @@ import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
 import { generateSigningKey, importSigningKeyPair, verdictDigest } from './attest.js'
 import { sha256Hex } from './digest.js'
+import {
+  serveMock,
+  enumerateMockOperations,
+  DEFAULT_MOCK_SEED,
+  MAX_MOCK_SPEC_BYTES,
+  DEFAULT_MAX_MOCK_SPECS,
+} from './mock.js'
 import type { Fetcher } from './http.js'
 import {
   ReportCache,
@@ -114,6 +121,10 @@ export interface Env {
   /** Idle-eviction TTL, in days: a monitor not run/refreshed this long is
    * treated as abandoned (excluded from listing/ticking, evictable). */
   MONITOR_TTL_DAYS?: string
+  /** Cap on DISTINCT registered mock specs — bounds the open, unauthenticated
+   * POST /mock abuse surface (mirrors MAX_MONITORS; real per-principal auth
+   * awaits bd ax-e6b.30, still 402-blocked). */
+  MAX_MOCK_SPECS?: string
   /** Time-series raw-point ring cap per series before rollup (bd ax-e6b.29.2). */
   TS_RAW_CAP?: string
   /** Time-series hourly rollup-bucket cap before oldest are evicted. */
@@ -270,6 +281,8 @@ export function createApp(
   const maxMonitors = env.MAX_MONITORS ? Number(env.MAX_MONITORS) : DEFAULT_MAX_MONITORS
   const monitorTtlMs =
     (env.MONITOR_TTL_DAYS ? Number(env.MONITOR_TTL_DAYS) : DEFAULT_MONITOR_TTL_DAYS) * 24 * 60 * 60 * 1000
+  // Same LOW abuse-surface bound, mirrored for the mock registry (MED fix).
+  const maxMockSpecs = env.MAX_MOCK_SPECS ? Number(env.MAX_MOCK_SPECS) : DEFAULT_MAX_MOCK_SPECS
 
   // Loopback: any verification of api.qa itself dispatches back into this
   // handler — the verifier discovers itself over its own protocols. Hoisted to
@@ -480,6 +493,115 @@ export function createApp(
       const path = url.pathname
 
       try {
+        // --- Mock server (ax-e6b.28.3) ---------------------------------------
+        // POST /mock                 {spec?|specText?} → register an OpenAPI doc
+        //                            by digest (content-addressed, like /suite)
+        // *    /mock/:digest/<path>  → serve the DETERMINISTIC, schema/example-
+        //                            conformant response for that declared
+        //                            (path, method, status, content-type). Any
+        //                            HTTP method the spec declares is served;
+        //                            an undeclared path/method → 404. PURE — the
+        //                            mock serves ONLY generated local responses
+        //                            (no outbound fetch, no SSRF surface).
+        if (request.method === 'POST' && path === '/mock') {
+          if (!cache) return json({ error: 'no mock registry configured' }, 501)
+          const body = (await request.json().catch(() => undefined)) as
+            | { spec?: unknown; specText?: string }
+            | undefined
+          const specText =
+            body?.specText ?? (body?.spec !== undefined ? JSON.stringify(body.spec) : undefined)
+          if (specText === undefined) {
+            return json({ error: 'body must include "spec" or "specText" (an OpenAPI 3.1 doc)' }, 400)
+          }
+          // MED fix: bound the registrable spec size before it is parsed or
+          // stored at all (mirrors the monitors registry's own abuse-surface
+          // discipline).
+          if (specText.length > MAX_MOCK_SPEC_BYTES) {
+            return json(
+              { error: `spec too large (${specText.length} bytes, max ${MAX_MOCK_SPEC_BYTES}) — refusing to register` },
+              413,
+            )
+          }
+          let doc: unknown
+          try {
+            doc = JSON.parse(specText)
+          } catch {
+            return json({ error: 'spec is not valid JSON' }, 400)
+          }
+          const ops = enumerateMockOperations(doc)
+          if (ops.length === 0) {
+            return json({ error: 'spec declares no operations (not a usable OpenAPI paths doc)' }, 400)
+          }
+          const digest = await sha256Hex(specText)
+          // MED fix: cap the DISTINCT-spec registry size, mirroring
+          // MAX_MONITORS — re-registering the SAME (already-stored) digest is
+          // idempotent and never counts against the cap; only genuinely new
+          // growth does.
+          const alreadyRegistered = (await cache.getMockSpec(digest)) !== null
+          if (!alreadyRegistered) {
+            const count = await cache.countMockSpecs()
+            if (count >= maxMockSpecs) {
+              return json(
+                {
+                  error: `mock spec registry full (${count}/${maxMockSpecs}) — refusing new registration`,
+                  detail:
+                    'per-principal quota + registration auth await ax-e6b.30 (402-blocked); MAX_MOCK_SPECS is a coarse interim cap, env-overridable',
+                },
+                429,
+              )
+            }
+          }
+          await cache.putMockSpec(digest, specText)
+          return json({
+            digest,
+            operations: ops.length,
+            mock: `${SELF_ORIGIN}/mock/${digest}`,
+            operationsList: ops.map((o) => `${o.method} ${o.path}`),
+          })
+        }
+
+        if (path.startsWith('/mock/')) {
+          if (!cache) return json({ error: 'no mock registry configured' }, 501)
+          const rest = path.slice('/mock/'.length)
+          const slash = rest.indexOf('/')
+          const digest = slash === -1 ? rest : rest.slice(0, slash)
+          const opPath = slash === -1 ? '/' : rest.slice(slash)
+          if (digest.length === 0) return json({ error: 'mock request must name a spec digest' }, 400)
+          const specText = await cache.getMockSpec(digest)
+          if (specText === null) return json({ error: `no registered mock spec for digest ${digest}` }, 404)
+          let doc: unknown
+          try {
+            doc = JSON.parse(specText)
+          } catch {
+            return json({ error: 'stored mock spec is not valid JSON' }, 500)
+          }
+          // Seed (deterministic generator) + explicit status selection are
+          // taken from the query string; the Accept header content-negotiates.
+          const seedRaw = url.searchParams.get('seed')
+          const seed = seedRaw !== null && Number.isFinite(Number(seedRaw)) ? Number(seedRaw) : DEFAULT_MOCK_SEED
+          const statusSel = url.searchParams.get('status') ?? preferCode(request.headers.get('prefer'))
+          const served = serveMock(doc, request.method, opPath, {
+            accept,
+            ...(statusSel ? { status: statusSel } : {}),
+            seed,
+          })
+          if (!served) {
+            return json(
+              { error: `mock declares no ${request.method} ${opPath}`, digest, see: `${SELF_ORIGIN}/mock/${digest}` },
+              404,
+            )
+          }
+          return new Response(request.method === 'HEAD' ? null : served.body, {
+            status: served.status,
+            headers: {
+              'content-type': served.contentType,
+              'access-control-allow-origin': '*',
+              'x-mock-server': 'api.qa',
+              'x-mock-seed': String(seed),
+            },
+          })
+        }
+
         if (request.method === 'GET' || request.method === 'HEAD') {
           if (path === '/') {
             return accept.includes('text/html')
@@ -978,6 +1100,13 @@ function parseWindowMs(raw: string | null): number | undefined {
     default:
       return undefined
   }
+}
+
+/** Parse a Postman-style `Prefer: code=NNN` mock-status selector, if present. */
+function preferCode(prefer: string | null): string | undefined {
+  if (!prefer) return undefined
+  const m = prefer.match(/(?:^|[,;\s])code=(\d{3})(?:$|[,;\s])/i)
+  return m ? m[1] : undefined
 }
 
 function text(body: string, status = 200, extra: Record<string, string> = {}): Response {

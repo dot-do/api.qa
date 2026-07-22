@@ -267,11 +267,36 @@ export interface MiniSchema {
   additionalProperties?: boolean | MiniSchema
   /**
    * `$ref` into components.schemas. Resolved RECURSIVELY (every level —
-   * properties/items/additionalProperties, not just the top-level media-type
-   * schema) by the contract enumerator's `resolveSchema`, with a visited-set
-   * cycle guard.
+   * properties/items/additionalProperties/oneOf/anyOf/allOf, not just the
+   * top-level media-type schema) by the contract enumerator's `resolveSchema`,
+   * with a visited-set cycle guard AND a total-node/depth expansion budget
+   * (a non-cyclic fan-out $ref DAG still expands exponentially without one).
    */
   $ref?: string
+  /**
+   * Composition keywords. Branches are fully resolved (no surviving `$ref`) by
+   * `resolveSchema`, same as any other nested position. `allOf` is evaluated
+   * conjunctively — mock generation deep-merges all branches into one value,
+   * and `validateSchema` requires the value satisfy EVERY branch (previously
+   * unread by both, so an `allOf` never actually constrained anything).
+   */
+  oneOf?: MiniSchema[]
+  anyOf?: MiniSchema[]
+  allOf?: MiniSchema[]
+  /** String length / pattern constraints (previously unread by generator + validator). */
+  minLength?: number
+  maxLength?: number
+  pattern?: string
+  /** Array constraints (previously unread by generator + validator). */
+  minItems?: number
+  maxItems?: number
+  uniqueItems?: boolean
+  /** Numeric constraints beyond minimum/maximum (previously unread). */
+  multipleOf?: number
+  exclusiveMinimum?: number
+  exclusiveMaximum?: number
+  /** Object constraint (previously unread). */
+  minProperties?: number
 }
 
 /**
