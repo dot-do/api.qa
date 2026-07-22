@@ -100,6 +100,33 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
             : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')))
   }
 
+  // ── API home is machine-legible for EVERY client (AXP Clause 3) ──────────
+  // APIs answer JSON/markdown regardless of the caller's Accept — HTML is a
+  // page concern, not an API concern (ax ADR-0018). No axItem: grade-neutral
+  // for generic targets; pinned standards opt in via kind:'check'.
+  {
+    if (!agents.probes) {
+      // A target not claiming the agent-first API contract (no probe manifest)
+      // may be a page surface, where a browser HTML face is legitimate. Skip:
+      // pinned `must:"pass"` fail-closes for standards that require this check.
+      checks.push(check('machine-legible-home', 'API home answers machine-legible (JSON/markdown) to every client, browsers included', undefined,
+        [ROLE.agentsJson],
+        { verdict: 'skip', detail: 'no probe manifest declared — target does not claim the agent-first API contract; page surfaces may serve HTML' }))
+    } else {
+      const asAgent = findEvidence(bundle, ROLE.rootAgent)
+      const asBrowser = findEvidence(bundle, ROLE.rootBrowser)
+      const agentLegible = ok(asAgent) && asAgent?.body != null && !looksLikeHtml(asAgent.body)
+      const browserLegible = ok(asBrowser) && asBrowser?.body != null && !looksLikeHtml(asBrowser.body)
+      checks.push(check('machine-legible-home', 'API home answers machine-legible (JSON/markdown) to every client, browsers included', undefined,
+        [ROLE.rootAgent, ROLE.rootBrowser],
+        agentLegible && browserLegible
+          ? pass('both Accept: */* and Accept: text/html received machine-legible non-HTML')
+          : fail(agentLegible ? asBrowser : asAgent, agentLegible
+              ? 'browser Accept received HTML (or nothing) — an API surface stays JSON/markdown for every client; HTML belongs to page surfaces'
+              : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')))
+    }
+  }
+
   // ── AX 5: OpenAPI contract ───────────────────────────────────────────────
   checks.push(check('openapi', 'machine-readable API contract (OpenAPI) is published', 5, [ROLE.openapi],
     ok(openapiEv) && openapi.valid
