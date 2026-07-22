@@ -37,16 +37,42 @@
   // Per-domain politeness Durable Object — one instance per domain
   // (idFromName(host)) enforces a global inter-probe interval across isolates,
   // so a fleet cannot probe-cannon a third party by fanning across the edge.
+  //
+  // MONITOR_SCHEDULER — the singleton scheduler DO (bd ax-e6b.29.1 MED fix).
+  // scheduled() routes the ENTIRE tick through idFromName('monitor-scheduler')
+  // on this namespace: exactly ONE such DO instance exists globally, so every
+  // isolate's cron-triggered tick runs against that one DO's memoized
+  // MonitorStore/claimChain — a cross-isolate-atomic claim (Workers KV alone
+  // has no CAS, so two isolates racing the same KV could otherwise both read
+  // nextDueAt before either writes it and double-run the same due slot). The
+  // DO calls back into the SAME createApp()/verifyTarget/verifySuite/
+  // cooldown/SSRF path a fetch-triggered run uses — no gate-skipping fork.
   "durable_objects": {
-    "bindings": [{ "name": "COOLDOWN", "class_name": "DomainCooldown" }]
+    "bindings": [
+      { "name": "COOLDOWN", "class_name": "DomainCooldown" },
+      { "name": "MONITOR_SCHEDULER", "class_name": "MonitorSchedulerDO" }
+    ]
+  },
+
+  // Scheduled monitoring (ax-e6b.29.1). The Worker's `scheduled()` handler
+  // walks the KV monitor registry each tick and re-verifies every DUE monitor
+  // (grade + optional stored suite), fully AFK — no human trigger. This trigger
+  // is CONFIG ONLY: it fires when Nathan deploys, never from this repo. Every
+  // scheduled run still goes through verifyTarget's SSRF gate + the per-domain
+  // DomainCooldown, so a monitor cannot probe-cannon or reach a private host.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
   },
 
   // Migrations. History: the worker name `api-qa` previously hosted the
   // 2022–2024 "Automated API Testing" worker (ScannerDurable/StatisticsDurable
   // DOs), deleted by tag `v2-verifier` with the 2026-07-19 supersede deploy.
   // Tag `v3-cooldown` introduces the new SQLite-backed DomainCooldown class.
+  // Tag `v4-monitor-scheduler` introduces the new SQLite-backed
+  // MonitorSchedulerDO class (bd ax-e6b.29.1 MED cross-isolate double-run fix).
   "migrations": [
     { "tag": "v2-verifier" },
-    { "tag": "v3-cooldown", "new_sqlite_classes": ["DomainCooldown"] }
+    { "tag": "v3-cooldown", "new_sqlite_classes": ["DomainCooldown"] },
+    { "tag": "v4-monitor-scheduler", "new_sqlite_classes": ["MonitorSchedulerDO"] }
   ]
 }

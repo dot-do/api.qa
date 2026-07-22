@@ -36,5 +36,14 @@ export { reportMarkdown, reportHtml, pinnedMarkdown, suiteMarkdown } from './ren
 export { Observer, normalizeTarget, type Fetcher, type ObserverOpts } from './http.js'
 export { canonicalJson, sha256Hex, seededRandom, sampleSeeded } from './digest.js'
 export { validateSchema, readPath } from './schema.js'
-export { createApp, type App, type Env } from './worker.js'
+export { createApp, type App, type Env, type TickSummary } from './worker.js'
+export {
+  MonitorStore,
+  parseIntervalSec,
+  monitorId,
+  DEFAULT_MAX_PER_TICK,
+  RUN_HISTORY_CAP,
+  type MonitorRecord,
+  type MonitorRunRecord,
+} from './monitors.js'
 export * from './self.js'
