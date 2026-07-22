@@ -31,6 +31,13 @@ export const ROLE = {
   icpJson: 'surface:icp.json',
   openapi: 'surface:openapi',
   keyless: (method: string, path: string) => `probe:endpoint:${method} ${path}`,
+  /**
+   * Contract-diff probe (ax-e6b.28.4): a declared GET-safe path fetched for the
+   * FULL OpenAPI<->live diff (every GET-safe path, not just the seeded keyless
+   * sample). A path the keyless sample already fetched is reused from its
+   * `probe:endpoint:` role instead of being probed again.
+   */
+  contract: (method: string, path: string) => `contract:${method} ${path}`,
   offer: 'probe:402-offer',
   // MCP OAuth conformance (RFC 9728 / 8414 / 7591 / 7636 / 8707). Recorded only
   // when agents.json declares an HTTP/SSE MCP interface (interfaces.mcp.url).
@@ -478,6 +485,29 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     const url = `${origin}${path}`
     if (!isPubliclyRoutableSameOrigin(url, origin)) continue
     await observer.observe(ROLE.keyless('GET', path), url, { accept: 'application/json' })
+  }
+
+  // 2b. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
+  //     fetch EVERY GET-safe candidate path once — not just the seeded keyless
+  //     sample above — so the diff enumerates every declared operation, not a
+  //     random three. A path the keyless sample ALREADY fetched is reused (the
+  //     contract judge falls back to its `probe:endpoint:` evidence), so the
+  //     observer never double-fetches it. Same SSRF posture as every other
+  //     card-derived probe: same-origin + publicly-routable, via the gated
+  //     Observer.observe (which also structurally refuses private/metadata
+  //     hosts and off-origin redirects). No new un-gated fetch surface. The
+  //     politeness budget bounds the total; determinism holds — the candidate
+  //     set is sorted and seed-independent.
+  const alreadyProbed = new Set(
+    observer.items
+      .filter((e) => e.role.startsWith('probe:endpoint:GET '))
+      .map((e) => e.role.slice('probe:endpoint:GET '.length)),
+  )
+  for (const path of candidatePaths) {
+    if (alreadyProbed.has(path)) continue
+    const url = `${origin}${path}`
+    if (!isPubliclyRoutableSameOrigin(url, origin)) continue
+    await observer.observe(ROLE.contract('GET', path), url, { accept: 'application/json' })
   }
 
   // 3. The 402 boundary probe, if the target declares one. Defense in depth:

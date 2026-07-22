@@ -116,6 +116,73 @@ export interface CheckResult {
   detail: string
   /** roles of the Evidence items this verdict was judged from. */
   evidence: string[]
+  /**
+   * Structured payload for the `contract-diff` check (ax-e6b.28.4): the full
+   * OpenAPI-3.1<->live diff report. Present only on that check; carried in the
+   * VerificationReport so the diff is a monitorable signal, not just a verdict.
+   */
+  contractDiff?: ContractDiffReport
+}
+
+// ---------------------------------------------------------------------------
+// Contract diff (ax-e6b.28.4) — the full OpenAPI 3.1 <-> live diff report
+// ---------------------------------------------------------------------------
+
+/** breaking = a declared thing the live API violates; additive = live has MORE. */
+export type DeviationClass = 'breaking' | 'additive'
+
+/**
+ * One classified deviation between the declared OpenAPI contract and the live
+ * response. `location` is the JSON path into the body ($.foo.bar) for a body
+ * deviation, or `(endpoint)` / `(status)` / `(content-type)` for an operation-
+ * level one. `expected`/`actual` carry the contract-vs-observed values.
+ */
+export interface ContractDeviation {
+  path: string
+  method: string
+  /** The declared status this deviation is judged under, or the live status. */
+  status?: string
+  location: string
+  kind: string
+  classification: DeviationClass
+  expected?: string
+  actual?: string
+  detail: string
+}
+
+/** Per (path, method) diff of the live response against the declared contract. */
+export interface ContractOperationDiff {
+  path: string
+  method: string
+  /** Whether this operation was live-probed (GET-safe) or declaration-only. */
+  probed: boolean
+  liveStatus: number | null
+  declaredStatuses: string[]
+  deviations: ContractDeviation[]
+}
+
+/**
+ * The full OpenAPI 3.1 <-> live contract diff (pure over an EvidenceBundle).
+ * Same bundle → same report, byte for byte.
+ */
+export interface ContractDiffReport {
+  $type: 'ContractDiffReport'
+  target: string
+  openapiValid: boolean
+  /** Total declared HTTP operations across all paths. */
+  operationsDeclared: number
+  /** GET-safe operations that were live-probed. */
+  operationsProbed: number
+  perOperation: ContractOperationDiff[]
+  /** Declared GET-safe operations that 404 or are unreachable (breaking). */
+  declaredButAbsent: ContractDeviation[]
+  /** Discovered endpoints answering 2xx that the contract never declares (additive). */
+  undeclaredButPresent: ContractDeviation[]
+  /** Every deviation, flattened, in a stable order. */
+  deviations: ContractDeviation[]
+  breaking: number
+  additive: number
+  clean: boolean
 }
 
 export interface AxScore {
@@ -174,6 +241,15 @@ export interface MiniSchema {
   items?: MiniSchema
   enum?: unknown[]
   const?: unknown
+  /**
+   * Closed-object flag (contract-diff, ax-e6b.28.4). Absent/`true` = the object
+   * may carry undeclared fields (extra fields are ADDITIVE); `false` = the
+   * contract promises these are ALL the fields (an extra field is BREAKING); an
+   * object = extra fields are allowed but must match that subschema.
+   */
+  additionalProperties?: boolean | MiniSchema
+  /** One-level $ref into components.schemas, resolved by the contract enumerator. */
+  $ref?: string
 }
 
 /**
