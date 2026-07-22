@@ -18,7 +18,8 @@
 import { readFileSync } from 'node:fs'
 import { verifyTarget, rejudge } from '../src/verify.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
-import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from '../src/render.js'
+import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
+import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from '../src/render.js'
 import { verifyAttestation } from '../src/attest.js'
 import { sha256Hex } from '../src/digest.js'
 import { runMcpServer } from '../src/mcp.js'
@@ -89,6 +90,27 @@ async function main(): Promise<number> {
     if (!suiteFile || !envName) return die('suite needs a suite file and --env <name>')
     const suiteText = readFileSync(suiteFile, 'utf8')
     const targetFlag = flags.get('target')
+
+    // Data-driven mode (Newman --iteration-data parity): run the suite once per
+    // dataset row, binding each row into the env scope, and print a per-
+    // iteration × per-probe matrix + overall verdict. Non-zero exit if any
+    // iteration fails (including an SSRF-refused row).
+    const dataFile = flags.get('iteration-data')
+    if (dataFile) {
+      const datasetText = readFileSync(dataFile, 'utf8')
+      const format = /\.json$/i.test(dataFile) ? 'json' : /\.csv$/i.test(dataFile) ? 'csv' : undefined
+      const rows = parseDataset(datasetText, format ? { format } : {})
+      const report = await verifySuiteDataDriven(suiteText, envName, rows, {
+        mode: 'local',
+        seed,
+        expectedDigest: flags.get('expect-digest'),
+        target: targetFlag,
+        delayMs: targetFlag && isLocalTarget(targetFlag) ? 0 : 150,
+      })
+      console.log(asJson ? JSON.stringify(report, null, 2) : dataDrivenMarkdown(report))
+      return report.passed ? 0 : 1
+    }
+
     const report = await verifySuite(suiteText, envName, {
       mode: 'local',
       seed,
@@ -123,6 +145,7 @@ function usage(): string {
   npx autonomous-qa verify <target> --spec <file>     pinned-spec mode
       [--expect-digest <sha256>] [--seed <n>]
   npx autonomous-qa suite <file> --env <name>         reusable suite/collection mode
+      [--iteration-data <dataset.csv|.json>]          run once per dataset row (data-driven)
       [--target <target>] [--expect-digest <sha256>] [--seed <n>]
       (target defaults to the selected environment's baseUrl var)
   npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite

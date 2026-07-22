@@ -578,6 +578,19 @@ export interface VerifySuiteOpts extends ObserverOpts {
    * environment → different target" work by environment selection alone.
    */
   target?: string
+  /**
+   * DATA-DRIVEN iteration bindings: one dataset row's fields, layered ON TOP of
+   * the selected environment's vars for THIS run only (row fields override /
+   * extend env vars). This is Newman's `--iteration-data`: the same ratified
+   * suite runs once per row, each row's `{fieldName: value}` map pre-seeding the
+   * binding scope so `{{field}}` interpolates into paths/bodies/headers. A row is
+   * AUTHOR-provided but UNTRUSTED for SSRF: if a row sets `baseUrl` it becomes
+   * this iteration's target and STILL re-passes `normalizeTarget`; interpolated
+   * probe URLs stay gated by `resolveEndpoint`. Iterations are independent — each
+   * call rebuilds bindings from env+row, so a capture in one row never leaks into
+   * the next.
+   */
+  rowBindings?: Record<string, unknown>
 }
 
 /**
@@ -648,8 +661,15 @@ export async function verifySuite(
     )
   }
   const env: SuiteEnvironment = suite.environments[envName]!
+  // Row fields (data-driven iteration) layer ON TOP of the environment's vars:
+  // a dataset row overrides / extends env vars for this iteration only. With no
+  // rowBindings this is exactly `{ ...env.vars }`, so a plain suite run is
+  // unchanged. A row-supplied `baseUrl` therefore becomes THIS iteration's
+  // target and is re-gated by normalizeTarget below (inside verifyPinnedSpec) —
+  // author-provided but never trusted to steer the request off-origin/private.
+  const vars: Record<string, unknown> = { ...env.vars, ...(opts.rowBindings ?? {}) }
   const target =
-    opts.target ?? (typeof env.vars.baseUrl === 'string' ? (env.vars.baseUrl as string) : undefined)
+    opts.target ?? (typeof vars.baseUrl === 'string' ? (vars.baseUrl as string) : undefined)
   if (target === undefined) {
     throw new Error(
       `environment "${envName}" supplies no string "baseUrl" var and no explicit target was given — ` +
@@ -670,10 +690,11 @@ export async function verifySuite(
     // The SUITE digest is the pin; it was checked above. Do NOT re-gate on the
     // inner spec's (different) digest.
     expectedDigest: undefined,
-    // The selected environment's vars pre-seed the capture scope. The SSRF
-    // gates (normalizeTarget on the baseUrl/target inside verifyPinnedSpec,
-    // resolveEndpoint's same-origin re-gate on interpolated URLs) still apply.
-    initialBindings: env.vars,
+    // The selected environment's vars (plus any data-driven row fields layered
+    // on top) pre-seed the capture scope. The SSRF gates (normalizeTarget on the
+    // baseUrl/target inside verifyPinnedSpec, resolveEndpoint's same-origin
+    // re-gate on interpolated URLs) still apply.
+    initialBindings: vars,
   })
 
   return {

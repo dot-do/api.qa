@@ -1,0 +1,5 @@
+[
+  { "scenario": "dealer-slice", "seed": 1 },
+  { "scenario": "fleet-slice", "seed": 2 },
+  { "scenario": "retail-slice", "seed": 3 }
+]
