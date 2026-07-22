@@ -41,6 +41,15 @@ import {
   type CooldownDecision,
   type DONamespaceLike,
 } from './cooldown.js'
+import {
+  MonitorStore,
+  parseIntervalSec,
+  monitorId,
+  DEFAULT_MAX_PER_TICK,
+  type MonitorRecord,
+  type MonitorRunRecord,
+} from './monitors.js'
+import { normalizeTarget } from './http.js'
 import type { VerificationReport } from './types.js'
 import {
   SELF_ORIGIN,
@@ -67,6 +76,22 @@ export interface Env {
   CACHE_TTL_SECONDS?: string
   /** Minimum inter-probe interval per domain across isolates, ms. */
   COOLDOWN_MIN_INTERVAL_MS?: string
+  /** Max monitors re-run per scheduled tick before carrying the rest over. */
+  MONITOR_MAX_PER_TICK?: string
+}
+
+/** Summary of one scheduled tick — returned for tests/observability. */
+export interface TickSummary {
+  tickedAt: number
+  /** Monitors whose nextDueAt had passed at tick time. */
+  due: number
+  /** Monitors actually re-verified this tick. */
+  ran: number
+  /** Due monitors skipped because their domain was in cooldown (retried next tick). */
+  skippedCooldown: number
+  /** Due monitors deferred to a later tick because the per-tick cap was hit. */
+  deferredOverCap: number
+  runs: MonitorRunRecord[]
 }
 
 const LINKSET =
@@ -76,6 +101,13 @@ const DOMAIN_ROUTE = /^\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)$/i
 
 export interface App {
   fetch(request: Request): Promise<Response>
+  /**
+   * Run one scheduled monitoring tick: re-verify every DUE registered monitor
+   * (respecting per-domain cooldown + the per-tick cap), attest exactly as a
+   * fetch-triggered run would, and append run-history records. Fully AFK — no
+   * human trigger. `nowMs` is the tick time (event.scheduledTime in prod).
+   */
+  scheduledTick(nowMs?: number): Promise<TickSummary>
 }
 
 export function createApp(
@@ -87,6 +119,10 @@ export function createApp(
     cache?: ReportCache
     /** Injected for tests; falls back to env.COOLDOWN when present. */
     cooldown?: Cooldown
+    /** Injected for tests; falls back to env.REPORTS when present. */
+    monitors?: MonitorStore
+    /** Override the per-tick monitor cap (else env / default). */
+    maxPerTick?: number
     /** Injectable clock so cache TTL / age is deterministic in tests. */
     now?: () => number
   } = {},
@@ -104,18 +140,23 @@ export function createApp(
   const cache = opts.cache ?? (env.REPORTS ? new ReportCache(env.REPORTS, ttlSeconds) : undefined)
   const cooldown =
     opts.cooldown ?? (env.COOLDOWN ? new DurableObjectCooldown(env.COOLDOWN, minIntervalMs) : undefined)
+  const monitors = opts.monitors ?? (env.REPORTS ? new MonitorStore(env.REPORTS) : undefined)
+  const maxPerTick =
+    opts.maxPerTick ?? (env.MONITOR_MAX_PER_TICK ? Number(env.MONITOR_MAX_PER_TICK) : DEFAULT_MAX_PER_TICK)
+
+  // Loopback: any verification of api.qa itself dispatches back into this
+  // handler — the verifier discovers itself over its own protocols. Hoisted to
+  // createApp scope so BOTH the fetch path and the scheduled tick reuse the
+  // same self-loopback / external-fetch routing (no bypass on either path).
+  const loopback: Fetcher = (u, init) => app.fetch(new Request(u, init))
+  const routed: Fetcher = (u, init) =>
+    u.startsWith(SELF_ORIGIN) ? loopback(u, init) : (opts.externalFetcher ?? fetch)(u, init)
 
   const app: App = {
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url)
       const accept = request.headers.get('accept') ?? ''
       const path = url.pathname
-
-      // Loopback: any verification of api.qa itself dispatches back into this
-      // handler — the verifier discovers itself over its own protocols.
-      const loopback: Fetcher = (u, init) => app.fetch(new Request(u, init))
-      const routed: Fetcher = (u, init) =>
-        u.startsWith(SELF_ORIGIN) ? loopback(u, init) : (opts.externalFetcher ?? fetch)(u, init)
 
       try {
         if (request.method === 'GET' || request.method === 'HEAD') {
@@ -306,6 +347,88 @@ export function createApp(
           return respondSuite(report, accept, { cache: bypass ? undefined : 'MISS' })
         }
 
+        // --- Monitor registry (turns api.qa into a MONITOR) -----------------
+        // POST /monitors {target, suiteDigest?, environment?, interval} → register
+        // GET  /monitors                                               → list
+        // DELETE /monitors/:id                                         → remove
+        if (path === '/monitors' && request.method === 'GET') {
+          if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
+          return json({ monitors: await monitors.list() })
+        }
+        if (path === '/monitors' && request.method === 'POST') {
+          if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
+          const body = (await request.json().catch(() => undefined)) as
+            | { target?: string; suiteDigest?: string; environment?: string; interval?: unknown }
+            | undefined
+          if (!body?.target) return json({ error: 'body must include "target"' }, 400)
+          if (body.interval === undefined) return json({ error: 'body must include "interval"' }, 400)
+
+          // SSRF belt: refuse a private / IP-literal / off-scheme target at
+          // REGISTRATION through the SAME gate /verify uses. A monitor must not
+          // be registrable for a private/metadata host — the verify-time gate
+          // (verifyTarget) is the suspenders; this is the belt.
+          const normalized = normalizeTarget(
+            body.target,
+            env.ALLOW_PRIVATE_TARGETS === 'true',
+          )
+          if ('error' in normalized) return json({ error: normalized.error }, 400)
+
+          let intervalSec: number
+          try {
+            intervalSec = parseIntervalSec(body.interval)
+          } catch (e) {
+            return json({ error: e instanceof Error ? e.message : String(e) }, 400)
+          }
+
+          // A suiteDigest must name a suite already in the registry; resolve the
+          // default environment from the stored suite when none was supplied.
+          let environment = body.environment
+          if (body.suiteDigest !== undefined) {
+            if (!cache) return json({ error: 'no suite registry configured for suiteDigest' }, 400)
+            const suiteText = await cache.getSuiteText(body.suiteDigest)
+            if (suiteText === null)
+              return json({ error: `no stored suite for digest ${body.suiteDigest}` }, 404)
+            const suite = parseSuite(suiteText)
+            const envNames = Object.keys(suite.environments)
+            if (environment === undefined) environment = envNames[0]
+            if (environment === undefined || !Object.hasOwn(suite.environments, environment)) {
+              return json(
+                { error: `suite has no environment "${environment}" (defines ${envNames.map((n) => `"${n}"`).join(', ') || 'none'})` },
+                400,
+              )
+            }
+          }
+
+          const id = monitorId(normalized.origin, body.suiteDigest, environment)
+          const record: MonitorRecord = {
+            id,
+            target: normalized.origin,
+            ...(body.suiteDigest !== undefined ? { suiteDigest: body.suiteDigest } : {}),
+            ...(environment !== undefined ? { environment } : {}),
+            intervalSec,
+            createdAt: now(),
+            lastRunAt: null,
+            // Due on the first tick after registration (nextDueAt <= now).
+            nextDueAt: now(),
+          }
+          await monitors.register(record)
+          return json({ monitor: record }, 201)
+        }
+        {
+          const m = /^\/monitors\/([A-Za-z0-9_.-]+)$/.exec(path)
+          if (m && request.method === 'DELETE') {
+            if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
+            const removed = await monitors.delete(m[1]!)
+            return json({ deleted: removed, id: m[1] }, removed ? 200 : 404)
+          }
+          if (m && request.method === 'GET') {
+            if (!monitors) return json({ error: 'no monitor registry configured' }, 501)
+            const rec = await monitors.get(m[1]!)
+            if (!rec) return json({ error: `no monitor ${m[1]}` }, 404)
+            return json({ monitor: rec, runs: await monitors.listRuns(m[1]!) })
+          }
+        }
+
         if (request.method === 'POST' && path === '/rejudge') {
           const report = (await request.json().catch(() => undefined)) as
             | Parameters<typeof rejudge>[0]
@@ -322,6 +445,86 @@ export function createApp(
           : 500
         return json({ error: message }, status)
       }
+    },
+
+    async scheduledTick(nowMs: number = now()): Promise<TickSummary> {
+      const summary: TickSummary = {
+        tickedAt: nowMs,
+        due: 0,
+        ran: 0,
+        skippedCooldown: 0,
+        deferredOverCap: 0,
+        runs: [],
+      }
+      if (!monitors) return summary
+
+      // Due = nextDueAt has passed. Run the MOST-overdue first so a cap does
+      // not perpetually starve one monitor (fair carry-over).
+      const all = await monitors.list()
+      const due = all.filter((mon) => mon.nextDueAt <= nowMs).sort((a, b) => a.nextDueAt - b.nextDueAt)
+      summary.due = due.length
+
+      for (const mon of due) {
+        if (summary.ran >= maxPerTick) {
+          // Cap hit: defer the rest to a later tick (they stay due, unchanged).
+          summary.deferredOverCap += 1
+          continue
+        }
+
+        // Cross-isolate politeness: a monitor whose domain is in cooldown is
+        // SKIPPED this tick (not forced) and retried next — we do NOT advance
+        // its nextDueAt, so it remains due. Self (loopback) never gates.
+        const isSelf = hostKey(mon.target) === 'api.qa'
+        if (!isSelf && cooldown) {
+          const decision = await cooldown.reserve(hostKey(mon.target))
+          if (!decision.allowed) {
+            summary.skippedCooldown += 1
+            continue
+          }
+        }
+
+        // Re-verify through the SAME attested verify path a fetch run uses.
+        const report = await verifyTarget(mon.target, {
+          mode: 'remote',
+          fetcher: routed,
+          delayMs: isSelf ? 0 : externalDelayMs,
+          signingKeys: await keys(),
+          allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+        })
+
+        let suiteVerdict: boolean | undefined
+        if (mon.suiteDigest && cache) {
+          const suiteText = await cache.getSuiteText(mon.suiteDigest)
+          if (suiteText !== null && mon.environment) {
+            const suiteReport = await verifySuite(suiteText, mon.environment, {
+              mode: 'remote',
+              fetcher: routed,
+              target: mon.target,
+              delayMs: isSelf ? 0 : externalDelayMs,
+              allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+            })
+            suiteVerdict = suiteReport.passed
+          }
+        }
+
+        const run: MonitorRunRecord = {
+          monitorId: mon.id,
+          at: nowMs,
+          grade: report.grade,
+          ...(suiteVerdict !== undefined ? { suiteVerdict } : {}),
+          digest: report.discovery.evidenceDigest,
+        }
+        await monitors.appendRun(run)
+        summary.runs.push(run)
+        summary.ran += 1
+
+        // Advance the schedule only for a monitor that actually ran.
+        mon.lastRunAt = nowMs
+        mon.nextDueAt = nowMs + mon.intervalSec * 1000
+        await monitors.update(mon)
+      }
+
+      return summary
     },
   }
   return app
@@ -396,9 +599,26 @@ function cooldownResponse(decision: CooldownDecision, domain: string): Response 
   )
 }
 
-// Cloudflare Workers module entry.
+/** Structural subset of Cloudflare's `ScheduledEvent`. */
+interface ScheduledEventLike {
+  scheduledTime: number
+  cron?: string
+}
+/** Structural subset of Cloudflare's `ExecutionContext`. */
+interface ExecutionContextLike {
+  waitUntil(promise: Promise<unknown>): void
+}
+
+// Cloudflare Workers module entry — fetch (on-demand grade) + scheduled (AFK
+// monitor). The cron trigger in wrangler.jsonc drives scheduled(); it fires
+// only once Nathan deploys (config-only here, nothing runs on its own).
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     return createApp(env).fetch(request)
+  },
+  async scheduled(event: ScheduledEventLike, env: Env, ctx: ExecutionContextLike): Promise<void> {
+    const tick = createApp(env).scheduledTick(event.scheduledTime)
+    ctx.waitUntil(tick)
+    await tick
   },
 }

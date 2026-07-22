@@ -41,6 +41,16 @@
     "bindings": [{ "name": "COOLDOWN", "class_name": "DomainCooldown" }]
   },
 
+  // Scheduled monitoring (ax-e6b.29.1). The Worker's `scheduled()` handler
+  // walks the KV monitor registry each tick and re-verifies every DUE monitor
+  // (grade + optional stored suite), fully AFK — no human trigger. This trigger
+  // is CONFIG ONLY: it fires when Nathan deploys, never from this repo. Every
+  // scheduled run still goes through verifyTarget's SSRF gate + the per-domain
+  // DomainCooldown, so a monitor cannot probe-cannon or reach a private host.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+
   // Migrations. History: the worker name `api-qa` previously hosted the
   // 2022–2024 "Automated API Testing" worker (ScannerDurable/StatisticsDurable
   // DOs), deleted by tag `v2-verifier` with the 2026-07-19 supersede deploy.
