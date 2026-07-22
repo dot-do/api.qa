@@ -158,6 +158,24 @@ describe('evaluateAlertRules', () => {
     expect(evaluateAlertRules({ gradeRegression: true, channels: [] }, { series, run: { ...run, grade: 'F' } }).length).toBe(0)
   })
 
+  it('an UNKNOWN grade on either side never reads as a regression (LOW fix — gradeRank(unknown) = -1, not < F)', () => {
+    // Without the >=0 guard, gradeRank('unknown') = -1 < gradeRank('F') = 0
+    // would misread an unrecognized CURRENT grade as a regression-from-F.
+    expect(
+      evaluateAlertRules(
+        { gradeRegression: true, channels: [] },
+        { series, run: { ...run, grade: 'unknown' }, prior: { ...prior, grade: 'F' } },
+      ).length,
+    ).toBe(0)
+    // Symmetric: an unrecognized PRIOR grade also never yields a regression.
+    expect(
+      evaluateAlertRules(
+        { gradeRegression: true, channels: [] },
+        { series, run: { ...run, grade: 'F' }, prior: { ...prior, grade: 'unknown' } },
+      ).length,
+    ).toBe(0)
+  })
+
   it('fires attestationChange only when the attested-verdict digest changed vs prior', () => {
     expect(
       evaluateAlertRules({ attestationChange: true, channels: [] }, { series, run: { ...run, verdictDigest: 'CHANGED' }, prior }).map((x) => x.rule),
@@ -191,7 +209,7 @@ describe('decideAlert — dedupe / debounce', () => {
   it('alerts on the transition into breach, then dedupes a persisting breach', () => {
     const d1 = decideAlert(true, initialAlertState(), 1000, rules)
     expect(d1.deliver).toBe('firing')
-    expect(d1.nextState).toEqual({ firing: true, lastNotifiedAt: 1000 })
+    expect(d1.nextState).toEqual({ firing: true, lastNotifiedAt: 1000, lastAlertedValue: null })
     // Still breached next tick → no re-alert.
     const d2 = decideAlert(true, d1.nextState, 2000, rules)
     expect(d2.deliver).toBeNull()
@@ -204,7 +222,7 @@ describe('decideAlert — dedupe / debounce', () => {
     // Resolve (no resolveNotify) — firing clears, lastNotifiedAt kept.
     const resolve = decideAlert(false, fire.nextState, 2000, rules)
     expect(resolve.deliver).toBeNull()
-    expect(resolve.nextState).toEqual({ firing: false, lastNotifiedAt: 1000 })
+    expect(resolve.nextState).toEqual({ firing: false, lastNotifiedAt: 1000, lastAlertedValue: null })
     // Re-breach shortly after → transition, but debounced → suppressed.
     const reBreach = decideAlert(true, resolve.nextState, 3000, rules)
     expect(reBreach.deliver).toBeNull()
@@ -229,6 +247,44 @@ describe('decideAlert — dedupe / debounce', () => {
     const resolve = decideAlert(false, fire.nextState, 1000, r)
     expect(resolve.deliver).toBe('resolved')
     expect(resolve.nextState.firing).toBe(false)
+  })
+
+  it('re-notifies a STILL-firing severity rule when the breach gets STRICTLY WORSE (MED fix — escalation)', () => {
+    const r: AlertRules = { channels: [], debounceMs: 0 }
+    const fire = decideAlert(true, initialAlertState(), 0, r, { rule: 'gradeRegression', condition: 'A+→B', actual: 'B', threshold: 'A+' })
+    expect(fire.deliver).toBe('firing')
+    expect(fire.nextState.lastAlertedValue).toBe('B')
+    // Still breached, but the SAME grade (steady) → no re-alert.
+    const steady = decideAlert(true, fire.nextState, 1000, r, { rule: 'gradeRegression', condition: 'A+→B', actual: 'B', threshold: 'A+' })
+    expect(steady.deliver).toBeNull()
+    // Still breached, STRICTLY WORSE (B → D) → re-alert (escalation).
+    const worse = decideAlert(true, steady.nextState, 2000, r, { rule: 'gradeRegression', condition: 'A+→D', actual: 'D', threshold: 'A+' })
+    expect(worse.deliver).toBe('firing')
+    expect(worse.nextState.lastAlertedValue).toBe('D')
+    // Partial recovery (D → C, still breached but BETTER than last-alerted D) → no re-alert.
+    const partial = decideAlert(true, worse.nextState, 3000, r, { rule: 'gradeRegression', condition: 'A+→C', actual: 'C', threshold: 'A+' })
+    expect(partial.deliver).toBeNull()
+    expect(partial.nextState.lastAlertedValue).toBe('D') // unchanged — no new notification happened
+  })
+
+  it('escalation is NOT applied to attestationChange (a binary change-event, not a severity scale)', () => {
+    const r: AlertRules = { channels: [], debounceMs: 0 }
+    const fire = decideAlert(true, initialAlertState(), 0, r, {
+      rule: 'attestationChange',
+      condition: 'changed',
+      actual: 'digestA',
+      threshold: 'digestB',
+    })
+    expect(fire.deliver).toBe('firing')
+    // Still "breached" (caller kept reporting true) with a different actual —
+    // attestationChange is excluded from isSeverityRule, so no escalation path.
+    const again = decideAlert(true, fire.nextState, 1000, r, {
+      rule: 'attestationChange',
+      condition: 'changed',
+      actual: 'digestC',
+      threshold: 'digestB',
+    })
+    expect(again.deliver).toBeNull()
   })
 })
 
@@ -417,6 +473,164 @@ describe('scheduledTick alerting — a flapping target is debounced', () => {
     await h.tick(183_000, true) // fire again (no debounce)
     expect(h.posts.length).toBeGreaterThanOrEqual(2)
   })
+})
+
+// ---------------------------------------------------------------------------
+// INTEGRATION — worsening breach re-alerts; steady/improving breach dedupes
+// (MED fix — bd ax-e6b.29.3): a breach that gets WORSE each tick must not go
+// silent after the first, mildest drop.
+// ---------------------------------------------------------------------------
+
+describe('AlertDispatcher — a worsening breach re-alerts; a steady or improving breach dedupes', () => {
+  function dispatcherHarness(rules: AlertRules, monitorId = 'mon_escalation') {
+    const { fetcher: channel, posts } = captureChannel()
+    const dispatcher = new AlertDispatcher(new AlertStateStore(new MemoryKV()), { fetcher: channel })
+    const monitor = { id: monitorId, target: GOOD, alerts: rules }
+    return { dispatcher, posts, monitor }
+  }
+
+  it('a grade that gets STRICTLY WORSE each tick (A+→B→C→D→F) fires MULTIPLE alerts — a later one names F', async () => {
+    const rules: AlertRules = { gradeRegression: true, debounceMs: 0, channels: [{ type: 'webhook', url: WEBHOOK }] }
+    const { dispatcher, posts, monitor } = dispatcherHarness(rules)
+
+    const steps = ['B', 'C', 'D', 'F'] // each strictly worse than the immediately-preceding run
+    let priorGrade = 'A+'
+    let t = 1000
+    for (const grade of steps) {
+      await dispatcher.dispatch({
+        monitor,
+        run: { at: t, grade, digest: `d${t}`, verdictDigest: `v${t}` },
+        prior: { grade: priorGrade, digest: `d${t - 1000}`, verdictDigest: `v${t - 1000}` },
+        now: t,
+      })
+      priorGrade = grade
+      t += 1000
+    }
+
+    // One alert PER worsening step — never silently stops after A+→B.
+    expect(posts).toHaveLength(4)
+    expect(posts.every((p) => (p.body as AlertPayload).rule === 'gradeRegression')).toBe(true)
+    // The operator IS told it cratered to F.
+    expect((posts.at(-1)!.body as AlertPayload).run.grade).toBe('F')
+  })
+
+  it('a STEADY breach (same offending grade vs the same baseline, repeated) fires only ONCE', async () => {
+    const rules: AlertRules = { gradeRegression: true, debounceMs: 0, channels: [{ type: 'webhook', url: WEBHOOK }] }
+    const { dispatcher, posts, monitor } = dispatcherHarness(rules, 'mon_steady')
+
+    for (let i = 0; i < 3; i++) {
+      await dispatcher.dispatch({
+        monitor,
+        run: { at: 1000 + i * 1000, grade: 'B', digest: `d${i}`, verdictDigest: `v${i}` },
+        prior: { grade: 'A+', digest: 'd0', verdictDigest: 'v0' },
+        now: 1000 + i * 1000,
+      })
+    }
+    expect(posts).toHaveLength(1)
+  })
+
+  it('a PARTIAL recovery (still breached, but better than the last-alerted value) does NOT re-alert', async () => {
+    const rules: AlertRules = { gradeRegression: true, debounceMs: 0, channels: [{ type: 'webhook', url: WEBHOOK }] }
+    const { dispatcher, posts, monitor } = dispatcherHarness(rules, 'mon_partial')
+
+    // Crater straight to F.
+    await dispatcher.dispatch({
+      monitor,
+      run: { at: 1000, grade: 'F', digest: 'd1', verdictDigest: 'v1' },
+      prior: { grade: 'A+', digest: 'd0', verdictDigest: 'v0' },
+      now: 1000,
+    })
+    expect(posts).toHaveLength(1)
+    // Partial recovery to C — still a breach vs the A+ baseline, but strictly
+    // BETTER than the last-alerted F → dedupe, no re-alert.
+    await dispatcher.dispatch({
+      monitor,
+      run: { at: 2000, grade: 'C', digest: 'd2', verdictDigest: 'v2' },
+      prior: { grade: 'A+', digest: 'd0', verdictDigest: 'v0' },
+      now: 2000,
+    })
+    expect(posts).toHaveLength(1)
+  })
+
+  it('escalation also applies to numeric rules (uptime getting WORSE re-alerts; unchanged does not)', async () => {
+    const rules: AlertRules = { uptimeBelowPct: 100, debounceMs: 0, channels: [{ type: 'webhook', url: WEBHOOK }] }
+    const { dispatcher, posts, monitor } = dispatcherHarness(rules, 'mon_uptime_escalation')
+    const run = { grade: 'A+', digest: 'd', verdictDigest: 'v' }
+
+    await dispatcher.dispatch({
+      monitor,
+      series: { uptimePct: 90, errorRate: 0, latencyP95: 100, count: 10 },
+      run: { ...run, at: 1000 },
+      now: 1000,
+    })
+    // Unchanged (still 90%) → dedupe.
+    await dispatcher.dispatch({
+      monitor,
+      series: { uptimePct: 90, errorRate: 0, latencyP95: 100, count: 10 },
+      run: { ...run, at: 2000 },
+      now: 2000,
+    })
+    // Strictly worse (drops to 40%) → re-alert.
+    await dispatcher.dispatch({
+      monitor,
+      series: { uptimePct: 40, errorRate: 0, latencyP95: 100, count: 10 },
+      run: { ...run, at: 3000 },
+      now: 3000,
+    })
+    expect(posts).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// INTEGRATION — deliver() refuses a redirect consistently across runtime
+// response shapes (LOW #3/#4): a channel that 3xx-redirects (explicit status
+// OR an opaque redirect) is reported as a refused redirect, and the redirect
+// TARGET is never fetched — the load-bearing SSRF property is that a public
+// webhook 302-ing to a private host can never smuggle the POST there.
+// ---------------------------------------------------------------------------
+
+describe('deliver — redirect refusal is reported consistently, and the redirect target is never fetched', () => {
+  const METADATA = 'http://169.254.169.254/latest/meta-data/'
+
+  function redirectFetcher(shape: 'status302' | 'opaqueredirect'): { fetcher: Fetcher; calls: string[] } {
+    const calls: string[] = []
+    const fetcher: Fetcher = async (url) => {
+      calls.push(url)
+      if (shape === 'status302') {
+        return new Response(null, { status: 302, headers: { location: METADATA } })
+      }
+      // Simulate an undici-style opaque redirect from `redirect: 'manual'`:
+      // status 0, type 'opaqueredirect' — NOT a 3xx status the explicit branch
+      // would catch. (Can't be built via `new Response()`: the spec forbids a
+      // constructed Response outside status 200..599; opaque-redirect
+      // responses are only ever produced internally by a real fetch.)
+      return { status: 0, type: 'opaqueredirect', ok: false } as unknown as Response
+    }
+    return { fetcher, calls }
+  }
+
+  it.each(['status302', 'opaqueredirect'] as const)(
+    'a channel response shaped as %s is refused as a redirect, and the metadata Location is NEVER fetched',
+    async (shape) => {
+      const { fetcher, calls } = redirectFetcher(shape)
+      const dispatcher = new AlertDispatcher(new AlertStateStore(new MemoryKV()), { fetcher })
+      const r = await dispatcher.dispatch({
+        monitor: { id: 'mon_redir', target: GOOD, alerts: { gradeRegression: true, channels: [{ type: 'webhook', url: WEBHOOK }] } },
+        run: { at: 1, grade: 'F', digest: 'd', verdictDigest: 'v2' },
+        prior: { grade: 'A+', digest: 'd0', verdictDigest: 'v1' },
+        now: 1,
+      })
+      expect(r.deliveries).toHaveLength(1)
+      const d = r.deliveries[0]!
+      expect(d.ok).toBe(false)
+      expect(d.refused).not.toBe(true) // refused at gate is a DIFFERENT reason path — this is a POST-time redirect refusal
+      expect(d.reason).toMatch(/redirect/i)
+      // The ONLY fetch made was to the configured webhook — the redirect
+      // Location (the metadata host) is NEVER hit.
+      expect(calls).toEqual([WEBHOOK])
+      expect(calls).not.toContain(METADATA)
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------

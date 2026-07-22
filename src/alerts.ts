@@ -188,7 +188,13 @@ export function evaluateAlertRules(rules: AlertRules, ctx: EvalContext): AlertBr
       threshold: rules.errorRateAbove,
     })
   }
-  if (rules.gradeRegression && ctx.prior && gradeRank(ctx.run.grade) < gradeRank(ctx.prior.grade)) {
+  if (
+    rules.gradeRegression &&
+    ctx.prior &&
+    gradeRank(ctx.run.grade) >= 0 &&
+    gradeRank(ctx.prior.grade) >= 0 &&
+    gradeRank(ctx.run.grade) < gradeRank(ctx.prior.grade)
+  ) {
     out.push({
       rule: 'gradeRegression',
       condition: `grade ${ctx.prior.grade} → ${ctx.run.grade} regressed`,
@@ -221,30 +227,81 @@ export interface AlertState {
   firing: boolean
   /** ms epoch of the last notification actually SENT (null = never). */
   lastNotifiedAt: number | null
+  /**
+   * The offending `AlertBreach.actual` AT the time of the last notification
+   * (null = never notified). Lets a STILL-firing severity/regression rule
+   * re-notify when the breach gets STRICTLY WORSE than what was last
+   * reported — a grade cratering A+→B→C→D→F must not go silent after the
+   * first (mildest) drop just because it never "resolves" in between.
+   */
+  lastAlertedValue?: number | string | null
 }
 
 export function initialAlertState(): AlertState {
-  return { firing: false, lastNotifiedAt: null }
+  return { firing: false, lastNotifiedAt: null, lastAlertedValue: null }
 }
 
 export type AlertDecision = { deliver: 'firing' | 'resolved' | null; nextState: AlertState }
+
+/**
+ * Rules whose `actual` has a meaningful "worse than before" ordering — the
+ * only rules eligible for worsening-breach re-notification. `attestationChange`
+ * is a binary change-event (not a severity scale) and is intentionally
+ * excluded: it already re-fires exactly when the verdict digest itself
+ * changes, via the normal transition path.
+ */
+function isSeverityRule(rule: AlertRuleId): boolean {
+  return rule === 'gradeRegression' || rule === 'uptimeBelowPct' || rule === 'latencyAboveMs' || rule === 'errorRateAbove'
+}
+
+/**
+ * Is `actual` STRICTLY WORSE than `lastAlertedValue` for this rule? Grade
+ * regressions compare by `gradeRank` (lower rank = worse); uptime breaches
+ * get worse as the actual % drops further below the threshold; latency/
+ * error-rate breaches get worse as the actual climbs further above it. A
+ * missing/unparseable `lastAlertedValue` is treated as "nothing to compare
+ * against yet" (never worse) — callers only reach here once already firing,
+ * so this is a defensive fallback, not the common path.
+ */
+function isWorseBreach(rule: AlertRuleId, actual: number | string, lastAlertedValue: number | string | null | undefined): boolean {
+  if (lastAlertedValue === null || lastAlertedValue === undefined) return false
+  if (rule === 'gradeRegression') {
+    const curRank = gradeRank(String(actual))
+    const lastRank = gradeRank(String(lastAlertedValue))
+    return curRank >= 0 && lastRank >= 0 && curRank < lastRank
+  }
+  const cur = Number(actual)
+  const last = Number(lastAlertedValue)
+  if (!Number.isFinite(cur) || !Number.isFinite(last)) return false
+  if (rule === 'uptimeBelowPct') return cur < last
+  // latencyAboveMs / errorRateAbove
+  return cur > last
+}
 
 /**
  * The PURE dedupe/debounce decision for ONE rule given whether it is breached
  * NOW and its stored state:
  *   - alert on the TRANSITION into breach (not every tick in breach — dedupe);
  *   - optionally re-alert a still-firing rule after `renotifyMs`;
+ *   - for severity/regression rules, ALSO re-alert when the breach gets
+ *     STRICTLY WORSE than the last-alerted value (escalation) — a steady or
+ *     improving breach stays deduped;
  *   - suppress any alert within `debounceMs` of the last one (debounce flapping);
  *   - optionally emit a `resolved` notification when a firing rule clears.
- * Every actual delivery advances `lastNotifiedAt`, so the debounce spacing holds
- * across resolve→re-breach cycles — a flapping target gets at most one alert per
- * debounce window.
+ * Every actual delivery advances `lastNotifiedAt` (and `lastAlertedValue`), so
+ * the debounce spacing holds across resolve→re-breach cycles — a flapping
+ * target gets at most one alert per debounce window.
+ *
+ * `breach` is optional (and omitted by pure state-machine tests that only
+ * exercise transition/renotify/debounce) — without it, escalation never
+ * triggers and behavior is exactly the prior transition-only dedupe.
  */
 export function decideAlert(
   breached: boolean,
   state: AlertState,
   now: number,
   rules: AlertRules,
+  breach?: AlertBreach,
 ): AlertDecision {
   const debounceMs = rules.debounceMs ?? DEFAULT_DEBOUNCE_MS
   const debounced = state.lastNotifiedAt !== null && now - state.lastNotifiedAt < debounceMs
@@ -255,19 +312,28 @@ export function decideAlert(
       rules.renotifyMs !== undefined &&
       state.lastNotifiedAt !== null &&
       now - state.lastNotifiedAt >= rules.renotifyMs
-    if ((transition || renotifyDue) && !debounced) {
-      return { deliver: 'firing', nextState: { firing: true, lastNotifiedAt: now } }
+    const worsening =
+      !transition &&
+      breach !== undefined &&
+      isSeverityRule(breach.rule) &&
+      isWorseBreach(breach.rule, breach.actual, state.lastAlertedValue)
+    if ((transition || renotifyDue || worsening) && !debounced) {
+      return {
+        deliver: 'firing',
+        nextState: { firing: true, lastNotifiedAt: now, lastAlertedValue: breach?.actual ?? state.lastAlertedValue ?? null },
+      }
     }
-    // Persisting breach (or debounced): stay firing, do NOT re-notify.
-    return { deliver: null, nextState: { firing: true, lastNotifiedAt: state.lastNotifiedAt } }
+    // Persisting (unchanged or improving-but-still-breached), or debounced:
+    // stay firing, do NOT re-notify, keep the last-alerted value as-is.
+    return { deliver: null, nextState: { firing: true, lastNotifiedAt: state.lastNotifiedAt, lastAlertedValue: state.lastAlertedValue ?? null } }
   }
 
   // Not breached now.
   if (state.firing) {
     if (rules.resolveNotify && !debounced) {
-      return { deliver: 'resolved', nextState: { firing: false, lastNotifiedAt: now } }
+      return { deliver: 'resolved', nextState: { firing: false, lastNotifiedAt: now, lastAlertedValue: state.lastAlertedValue ?? null } }
     }
-    return { deliver: null, nextState: { firing: false, lastNotifiedAt: state.lastNotifiedAt } }
+    return { deliver: null, nextState: { firing: false, lastNotifiedAt: state.lastNotifiedAt, lastAlertedValue: state.lastAlertedValue ?? null } }
   }
   return { deliver: null, nextState: state }
 }
@@ -292,6 +358,8 @@ export class AlertStateStore {
       return {
         firing: !!s.firing,
         lastNotifiedAt: typeof s.lastNotifiedAt === 'number' ? s.lastNotifiedAt : null,
+        lastAlertedValue:
+          typeof s.lastAlertedValue === 'number' || typeof s.lastAlertedValue === 'string' ? s.lastAlertedValue : null,
       }
     } catch {
       return initialAlertState()
@@ -521,7 +589,7 @@ export class AlertDispatcher {
     for (const ruleId of configuredRuleIds(rules)) {
       const breached = breachByRule.has(ruleId)
       const state = await this.store.get(input.monitor.id, ruleId)
-      const decision = decideAlert(breached, state, input.now, rules)
+      const decision = decideAlert(breached, state, input.now, rules, breachByRule.get(ruleId))
       await this.store.put(input.monitor.id, ruleId, decision.nextState)
       if (!decision.deliver) continue
 
@@ -587,12 +655,19 @@ export class AlertDispatcher {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (res.status >= 300 && res.status < 400) {
+      // A redirect is refused whether the runtime surfaces it as an explicit
+      // 3xx status (`res.status` 300..399) OR as an OPAQUE redirect — some
+      // runtimes (e.g. undici) resolve a `redirect: 'manual'` 3xx into a
+      // status-0 `type: 'opaqueredirect'` Response instead. Both shapes NEVER
+      // followed the hop; this only affects how the refusal is REPORTED, so
+      // reporting is consistent (and testable) across runtimes.
+      const isRedirect = (res.status >= 300 && res.status < 400) || res.type === 'opaqueredirect' || res.status === 0
+      if (isRedirect) {
         return {
           channel: channel.type,
           target: safe.url,
           ok: false,
-          reason: `refusing to follow redirect on alert POST (status ${res.status})`,
+          reason: `refusing to follow redirect on alert POST (status ${res.status}${res.type === 'opaqueredirect' ? ', opaqueredirect' : ''})`,
         }
       }
       return { channel: channel.type, target: safe.url, ok: res.ok, status: res.status }
