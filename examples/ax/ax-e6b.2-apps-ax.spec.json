@@ -1,0 +1,31 @@
+{
+  "$type": "PinnedSpec",
+  "name": "ax-e6b.2-apps-ax-generator",
+  "version": "1",
+  "description": "Acceptance contract for ax-e6b.2, minted BEFORE implementation (ADR-0008/0010). Proves the apps.ax generator: ONE App Definition (a typed `Listing` noun, the apis.directory dogfood) renders EVERY face from live state with zero per-face authoring (Projection Law, ADR-0006) — the faceted HTML directory (human register), the markdown-of-live-state twin (agent register, the net-new piece), the JSON API face, and CRUD create — with facets DERIVED from the Listing type's enum/relation fields (not hand-configured) and search. Screen law (ADR-0001) holds: same live state, two byte-consistent registers, one URL. Verified at the Worker HTTP seam against a local dev server; run: (start the apps.ax dev worker on 127.0.0.1:8790) then npx autonomous-qa verify http://127.0.0.1:8790 --spec docs/acceptance/ax-e6b.2.spec.json --expect-digest <pin>. Seed data (>=3 listings across >=2 categories) is loaded by the dev-server bootstrap so facets/search have something to bind. Rich UI polish + the full multi-tenant interpreter are out of scope (child issues).",
+  "requirements": [
+    { "id": "llms-txt-published", "kind": "surface", "surface": "llms.txt", "must": "present" },
+    { "id": "create-listing", "kind": "endpoint", "method": "POST", "path": "/listings",
+      "body": { "name": "Acme Weather API", "category": "weather", "provider": "acme", "summary": "Forecasts by lat/lon" },
+      "expect": { "status": [200, 201], "contentTypeIncludes": "application/json",
+        "schema": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } } } },
+    { "id": "api-face-json", "kind": "endpoint", "method": "GET", "path": "/api/listings",
+      "expect": { "status": 200, "contentTypeIncludes": "application/json",
+        "schema": { "type": "object", "required": ["listings", "facets"],
+          "properties": { "listings": { "type": "array" }, "facets": { "type": "array" } } },
+        "paths": [ { "path": "facets", "exists": true } ] } },
+    { "id": "facets-derived-from-type", "kind": "endpoint", "method": "GET", "path": "/api/listings",
+      "expect": { "status": 200,
+        "paths": [ { "path": "facets.0.field", "exists": true }, { "path": "facets.0.options", "exists": true } ] } },
+    { "id": "search-filters-live-state", "kind": "endpoint", "method": "GET", "path": "/api/listings?q=weather",
+      "expect": { "status": 200, "paths": [ { "path": "listings", "exists": true }, { "path": "query", "equals": "weather" } ] } },
+    { "id": "facet-filter", "kind": "endpoint", "method": "GET", "path": "/api/listings?category=weather",
+      "expect": { "status": 200, "paths": [ { "path": "listings", "exists": true } ] } },
+    { "id": "directory-html-face", "kind": "endpoint", "method": "GET", "path": "/directory?format=html",
+      "expect": { "status": 200, "contentTypeIncludes": "text/html" } },
+    { "id": "directory-markdown-twin", "kind": "endpoint", "method": "GET", "path": "/directory?format=md",
+      "expect": { "status": 200, "contentTypeIncludes": "text/markdown" } },
+    { "id": "detail-json", "kind": "endpoint", "method": "GET", "path": "/api/listings",
+      "expect": { "status": 200, "paths": [ { "path": "listings.0.id", "exists": true } ] } }
+  ]
+}

@@ -1,0 +1,71 @@
+name: AX estate gate
+
+# The REAL gate (ax-laf) — not the copy-me placeholder. Runs api.qa's pinned
+# gate across the .ax estate and turns the whole set into ONE pass/fail + a
+# scoreboard. This job goes RED when a REQUIRED surface fails its pinned spec
+# (or errors), and that is the point: a failing surface fails the job. Today
+# apis.ax is at the AX floor and FAILS its ratified AXP contract, so this gate
+# is honestly red until apis.ax climbs — that is the measured hill, not a
+# rubber stamp.
+#
+# WHAT MAKES THIS A GATE (not a rubber stamp):
+#   - `gate --estate examples/ax-estate.json` runs `gradePinned()` per surface
+#     (the same verdict the deployed api.qa returns for a pinned contract) and
+#     exits NON-ZERO iff any REQUIRED surface's pinned spec did not pass. The
+#     apis.ax entry is pinned to its ratified AXP digest (`expectDigest`), so a
+#     silently-edited spec can never make the gate pass (anti-Goodhart).
+#   - The step inherits that exit code — a regression turns the check RED.
+#
+# DEPLOYED vs PRE-DEPLOY:
+#   - This job grades the DEPLOYED surfaces by URL: apis.ax (required, live) and
+#     api.qa (advisory self-grade). Those are publicly reachable from CI.
+#   - page.ax (522) and apps.ax (403) are NOT publicly gradable, so they are
+#     graded PRE-DEPLOY — in-process against their Worker `{ fetch }` handler
+#     (programmatic runEstateGate() / the `toConform` vitest matcher), or against
+#     a local `wrangler dev` server with the per-entry `allowPrivate` opt-in
+#     (examples/ax-estate.local.json). That local grading belongs in each
+#     package's own pre-deploy pipeline, where the dev server is reachable — it
+#     cannot run from this repo's CI against a public URL. See docs/ci.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Re-measure the estate daily so the climb (or a regression) is visible.
+    - cron: '17 7 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate the .ax estate (pinned)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run the AX estate gate (fails the check if a required surface fails)
+        run: |
+          mkdir -p reports
+          node dist/cli/index.js gate --estate examples/ax-estate.json | tee reports/ax-estate-scoreboard.md
+
+      - name: Upload the scoreboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax-estate-scoreboard
+          path: reports/
+          if-no-files-found: warn

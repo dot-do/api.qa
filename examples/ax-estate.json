@@ -1,0 +1,19 @@
+{
+  "$comment": "The AX estate gate (ax-laf) — one scoreboard, one pass/fail for the .ax surfaces. Run: node dist/cli/index.js gate --estate examples/ax-estate.json (or `npx autonomous-qa gate --estate ...`). REQUIRED surfaces must pass their pinned spec or the gate exits non-zero (a failing surface fails the job — honest by design). apis.ax is pinned to its ratified AXP digest so the gate is Goodhart-resistant. api.qa self-grades advisory (no pinned spec). page.ax and apps.ax are 522/403 deployed and are graded PRE-DEPLOY, in-process/local, not from CI against a public URL — see the local-estate examples + the vitest toConform path in docs/ci.md.",
+  "entries": [
+    {
+      "surface": "apis.ax",
+      "target": "https://apis.ax",
+      "spec": "ax/apis-ax-standard.spec.json",
+      "expectDigest": "e16fec2473422b2de825a369e7f18451ce450e607a086c7e2d1e1f6792962eff",
+      "required": true,
+      "note": "live deployed AXP standard gate (apis.ax/axp)"
+    },
+    {
+      "surface": "api.qa",
+      "target": "https://api.qa",
+      "required": false,
+      "note": "self-surface advisory re-grade (no pinned spec)"
+    }
+  ]
+}

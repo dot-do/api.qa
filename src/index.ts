@@ -34,6 +34,13 @@ export { runChecks } from './checks.js'
 export { contractDiff, enumerateOperations } from './contract.js'
 export { axScoreOf, gradeOf } from './grade.js'
 export {
+  runEstateGate,
+  formatScoreboard,
+  type GateEntry,
+  type GateRow,
+  type GateResult,
+} from './gate.js'
+export {
   attestReport,
   verifyAttestation,
   generateSigningKey,

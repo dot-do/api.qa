@@ -88,6 +88,64 @@ Set two repository/environment variables:
   npx autonomous-qa spec-digest examples/golden-scenario.suite.json
   ```
 
+## The estate gate — one scoreboard for a SET of surfaces
+
+`autonomous-qa gate --estate <config.json>` runs the pinned gate across a whole
+**estate** of surfaces and turns the set into **one** pass/fail plus a
+scoreboard (`surface | target | grade | score | pinned spec | required`). It
+reuses `gradePinned()` per entry — the same verdict the deployed api.qa returns
+for a pinned contract — and **exits non-zero iff any REQUIRED surface fails its
+pinned spec or errors**. Non-required entries are advisory-only and never change
+the exit code; an entry with no `spec` reports its AX letter grade but cannot
+fail the gate.
+
+```jsonc
+// examples/ax-estate.json
+{
+  "entries": [
+    { "surface": "apis.ax", "target": "https://apis.ax",
+      "spec": "ax/apis-ax-standard.spec.json",
+      "expectDigest": "<sha256>", "required": true },
+    { "surface": "api.qa", "target": "https://api.qa", "required": false }
+  ]
+}
+```
+
+```sh
+node dist/cli/index.js gate --estate examples/ax-estate.json   # exits 1 if any required surface fails
+```
+
+`expectDigest` pins the spec text (anti-Goodhart): a silently-edited spec can
+never make the gate pass. A shipped GitHub Actions workflow that runs exactly
+this lives at
+[`.github/workflows/ax-estate-gate.yml`](../.github/workflows/ax-estate-gate.yml).
+
+### Pre-deploy (surfaces you can't reach by public URL)
+
+A surface that is not publicly gradable (page.ax is `522`, apps.ax is `403`) is
+graded **before deploy** — never faked. Two equivalent plug-ins:
+
+- **In-process**, no server at all — grade the Worker's `{ fetch }` handler in
+  memory with the `toConform` vitest matcher or `runEstateGate()` programmatically
+  (each probe is dispatched to the handler in memory; `allowPrivate` stays false):
+
+  ```ts
+  import worker from '../src/worker.js'
+  import spec from '../../examples/ax/ax-hi2-page-ax.spec.json?raw'
+  it('page.ax conforms pre-deploy', async () => {
+    await expect(worker).toConform(spec)
+  })
+  ```
+
+- **Local dev server** — stand up `wrangler dev`, then gate the localhost URL
+  with the per-entry `allowPrivate` opt-in (local-only; a remote target can never
+  flip it on — the SSRF invariant):
+
+  ```sh
+  # page.ax: wrangler dev --port 8787 --var STRIPE_STUB:1  (then, from api.qa:)
+  node dist/cli/index.js gate --estate examples/ax-estate.local.json
+  ```
+
 ## GitLab CI
 
 The same shape works on GitLab — the exit code fails the job, and the JUnit XML

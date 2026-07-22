@@ -39,6 +39,7 @@ import { verifyTarget, rejudge } from '../src/verify.js'
 import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/local.js'
 import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
+import { runEstateGate, formatScoreboard, type GateEntry } from '../src/gate.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown, contractDiffMarkdown } from '../src/render.js'
 import { runContractDiff } from '../src/contract-cli.js'
@@ -322,6 +323,49 @@ async function main(): Promise<number> {
     return emit(report, reportMarkdown(report), flags)
   }
 
+  if (cmd === 'gate') {
+    // gate --estate <config.json> (ax-laf): run the pinned gate across a SET of
+    // surfaces and turn the whole estate into ONE pass/fail + a scoreboard. The
+    // exit code is NON-ZERO iff any REQUIRED surface failed its pinned spec or
+    // errored — the estate-wide silent-green guard. Reuses gradePinned() /
+    // grade() per entry (src/gate.ts); grading is never reimplemented here.
+    const configFile = flags.get('estate') ?? rest[0]
+    if (!configFile) return die('gate needs an estate config: --estate <config.json>')
+    let config: { entries?: unknown }
+    try {
+      config = JSON.parse(readFileSync(configFile, 'utf8')) as { entries?: unknown }
+    } catch (err) {
+      return die(`gate: could not read estate config "${configFile}": ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!Array.isArray(config.entries) || config.entries.length === 0) {
+      return die(`gate: estate config "${configFile}" has no entries[]`)
+    }
+    // Spec paths in the config are resolved relative to the config file's dir.
+    const baseDir = dirname(resolve(configFile))
+    const entries: GateEntry[] = config.entries.map((raw, i) => {
+      const e = raw as Record<string, unknown>
+      const surface = typeof e.surface === 'string' ? e.surface : `entry-${i}`
+      const target = e.target
+      if (typeof target !== 'string') {
+        throw new Error(`gate: entry ${surface} has no string "target" (a URL; in-process handlers use the programmatic runEstateGate())`)
+      }
+      const specText = typeof e.spec === 'string' ? readFileSync(resolve(baseDir, e.spec), 'utf8') : undefined
+      return {
+        surface,
+        target,
+        specText,
+        required: e.required !== false,
+        allowPrivate: e.allowPrivate === true || (isUrl(target) && isPrivateUrlHost(target)),
+        expectedDigest: typeof e.expectDigest === 'string' ? e.expectDigest : undefined,
+        seed,
+        note: typeof e.note === 'string' ? e.note : undefined,
+      }
+    })
+    const result = await runEstateGate(entries)
+    console.log(formatScoreboard(result))
+    return result.exitCode
+  }
+
   // Default: grade a target (advisory). exitCodeFor() only fails on grade F,
   // so a bare `autonomous-qa <target>` is silent-green for grades A-D even
   // with failing checks — a footgun if a CI pipeline gates on it. Warn every
@@ -390,6 +434,8 @@ function usage(): string {
       (spec is the published OpenAPI file; target is fetched live, SSRF-gated)
   npx autonomous-qa mock <spec> --port <n>            local deterministic mock server from an OpenAPI spec
       [--seed <n>]                                    serves declared operations; undeclared paths 404
+  npx autonomous-qa gate --estate <config.json>       run the pinned gate across a SET of surfaces
+      [--seed <n>] [--reporter ...]                   ONE scoreboard; EXITS NON-ZERO if any required surface fails
   npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite
   npx autonomous-qa rejudge                           re-judge a JSON report from stdin
   npx autonomous-qa mcp                               MCP server (stdio)
