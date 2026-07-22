@@ -662,6 +662,7 @@ export function createApp(
                 spec?: unknown
                 specText?: string
                 expectedDigest?: string
+                attested?: boolean
                 seed?: number
               }
             | undefined
@@ -672,6 +673,21 @@ export function createApp(
           const specText =
             body.specText ?? (body.spec !== undefined ? JSON.stringify(body.spec) : undefined)
           if (specText !== undefined) {
+            // Attested admission (ax-7x3) must fail closed BEFORE any cache
+            // read: an attested request that omits the out-of-band pin has to
+            // REFUSE, never serve a cached pass keyed only on specDigest. The
+            // verifier guard (pinned.ts) fires too late here — a warm cache hit
+            // returns before verifyPinnedSpec is ever called — so the HTTP
+            // boundary must enforce it first.
+            if (body.attested && !body.expectedDigest) {
+              return json(
+                {
+                  error:
+                    'attested verification refuses to run without an externally-supplied expectedDigest',
+                },
+                400,
+              )
+            }
             const specDigest = await sha256Hex(specText)
             // The anti-Goodhart gate must fire on a bad pin BEFORE any cache
             // hit: a mismatched expectedDigest has to 400, never serve a
@@ -687,6 +703,9 @@ export function createApp(
               fetcher: routed,
               seed: body.seed,
               expectedDigest: body.expectedDigest,
+              // Attested admission (ax-7x3): fail closed unless the pin is
+              // supplied out-of-band in the request body.
+              attested: body.attested,
               delayMs: bypass ? 0 : externalDelayMs,
               allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
             })
@@ -733,6 +752,7 @@ export function createApp(
                 suiteDigest?: string
                 environment?: string
                 expectedDigest?: string
+                attested?: boolean
                 seed?: number
               }
             | undefined
@@ -755,6 +775,19 @@ export function createApp(
           }
           if (suiteText === undefined) {
             return json({ error: 'body must include "suite"/"suiteText" or a stored "suiteDigest"' }, 400)
+          }
+
+          // Attested admission (ax-7x3) must fail closed BEFORE any cache read
+          // (same reasoning as /verify): a warm suite-cache hit would otherwise
+          // serve a cached pass for an attested request that omitted the pin.
+          if (body.attested && !body.expectedDigest) {
+            return json(
+              {
+                error:
+                  'attested suite verification refuses to run without an externally-supplied expectedDigest',
+              },
+              400,
+            )
           }
 
           const suiteDigest = await sha256Hex(suiteText)
@@ -781,6 +814,9 @@ export function createApp(
             fetcher: routed,
             seed: body.seed,
             expectedDigest: body.expectedDigest,
+            // Attested admission (ax-7x3): fail closed unless the pin is
+            // supplied out-of-band in the request body.
+            attested: body.attested,
             target: body.target,
             delayMs: bypass ? 0 : externalDelayMs,
             allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',

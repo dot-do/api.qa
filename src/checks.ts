@@ -117,13 +117,35 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       const asBrowser = findEvidence(bundle, ROLE.rootBrowser)
       const agentLegible = ok(asAgent) && asAgent?.body != null && !looksLikeHtml(asAgent.body)
       const browserLegible = ok(asBrowser) && asBrowser?.body != null && !looksLikeHtml(asBrowser.body)
-      checks.push(check('machine-legible-home', 'API home answers machine-legible (JSON/markdown) to every client, browsers included', undefined,
-        [ROLE.rootAgent, ROLE.rootBrowser],
-        agentLegible && browserLegible
-          ? pass('both Accept: */* and Accept: text/html received machine-legible non-HTML')
-          : fail(agentLegible ? asBrowser : asAgent, agentLegible
-              ? 'browser Accept received HTML (or nothing) — an API surface stays JSON/markdown for every client; HTML belongs to page surfaces'
-              : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')))
+      const homeLegible = agentLegible && browserLegible
+      // Clause 3 beyond the root (ax-fsg): every SAMPLED typed body must also be
+      // machine-legible non-HTML under BOTH Accept: */* and Accept: text/html.
+      // A card with a manifest but no non-templated typed paths samples nothing
+      // → treat "no typed bodies sampled" as neutral (home-only), never a fail.
+      const typedAgent = bundle.items.filter((e) => e.role.startsWith('probe:typed-body-agent '))
+      const typedBrowser = bundle.items.filter((e) => e.role.startsWith('probe:typed-body-browser '))
+      const htmlTyped: string[] = []
+      for (const ev of [...typedAgent, ...typedBrowser]) {
+        if (ok(ev) && ev.body != null && looksLikeHtml(ev.body)) {
+          const isBrowser = ev.role.startsWith('probe:typed-body-browser ')
+          const path = ev.role.slice(ev.role.indexOf(' ') + 1)
+          htmlTyped.push(`${path} served HTML under ${isBrowser ? 'Accept: text/html' : 'Accept: */*'}`)
+        }
+      }
+      const typedLegible = htmlTyped.length === 0
+      const evidenceRoles = [
+        ROLE.rootAgent, ROLE.rootBrowser,
+        ...typedAgent.map((e) => e.role), ...typedBrowser.map((e) => e.role),
+      ]
+      checks.push(check('machine-legible-home', 'API home and typed bodies answer machine-legible (JSON/markdown) to every client, browsers included', undefined,
+        evidenceRoles,
+        homeLegible && typedLegible
+          ? pass(`both Accept: */* and Accept: text/html received machine-legible non-HTML on the home${typedAgent.length ? ` and ${typedAgent.length} sampled typed body(ies)` : ''}`)
+          : !homeLegible
+            ? fail(agentLegible ? asBrowser : asAgent, agentLegible
+                ? 'browser Accept received HTML (or nothing) — an API surface stays JSON/markdown for every client; HTML belongs to page surfaces'
+                : 'agent Accept received HTML (or nothing) — curl gets a wall of markup')
+            : { verdict: 'fail', detail: `a sampled typed body served HTML — an API path stays machine-legible for every client: ${htmlTyped.slice(0, 4).join('; ')}` }))
     }
   }
 
@@ -582,6 +604,54 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         problems.length === 0
           ? pass('probe manifest declares every required channel; all entries same-origin GET on contract-declared paths')
           : { verdict: 'fail', detail: problems.slice(0, 8).join('; ') }))
+    }
+  }
+
+  // ── Clause 6 interfaces + sibling cross-links (ax-kxa) ────────────────────
+  //    The capability card must name HOW to call the surface (a non-empty
+  //    interfaces.http and/or interfaces.mcp) AND cross-link its sibling machine
+  //    surfaces (llms.txt <-> agents.json <-> openapi). Dedicated grade-neutral
+  //    check (axItem undefined), skip-when-no-manifest exactly like
+  //    machine-legible-home / probe-manifest — so generic targets are untouched
+  //    and a pinned `must:'pass'` turns the skip into a fail-closed gate for
+  //    AXP targets. The checkable cross-link graph (a genuine judgment call, see
+  //    PROTOCOL Clause 6): card->openapi via openapiUrl; card->llms via a
+  //    top-level `llms` or `surfaces.llms` string; llms->{agents.json,openapi}
+  //    via the served llms.txt body string-referencing both.
+  {
+    if (!agents.probes) {
+      checks.push(check('card-interfaces-linked',
+        'capability card names its interfaces and cross-links its sibling surfaces', undefined,
+        [ROLE.agentsJson],
+        { verdict: 'skip', detail: 'no probe manifest — target does not claim the agent-first API contract' }))
+    } else {
+      const problems: string[] = []
+      // (1) interfaces present + non-empty
+      const httpNonEmpty = agents.endpoints.length > 0
+      const mcpNonEmpty = !!agents.mcp && ((agents.mcp.tools?.length ?? 0) > 0 || !!agents.mcp.url || !!agents.mcp.command)
+      if (!httpNonEmpty && !mcpNonEmpty) {
+        problems.push('capability card declares no non-empty interfaces.http or interfaces.mcp — the surface names no way to call it')
+      }
+      // (2) sibling cross-links
+      const raw = (agentsDoc && typeof agentsDoc === 'object') ? agentsDoc as Record<string, unknown> : {}
+      const surfaces = (raw.surfaces && typeof raw.surfaces === 'object') ? raw.surfaces as Record<string, unknown> : {}
+      const cardNamesLlms = typeof raw.llms === 'string' || typeof surfaces.llms === 'string'
+      if (agents.openapiUrl === undefined) {
+        problems.push('card does not reference its OpenAPI contract (openapi/openapiUrl/surfaces.openapi) — siblings are not cross-linked')
+      }
+      if (!cardNamesLlms) {
+        problems.push('card does not reference its llms.txt (surfaces.llms or a top-level llms) — siblings are not cross-linked')
+      }
+      const llmsBody = findEvidence(bundle, ROLE.llmsTxt)?.body ?? ''
+      if (!(llmsBody.includes('agents.json') && llmsBody.includes('openapi'))) {
+        problems.push('llms.txt does not reference both agents.json and the openapi contract — siblings are not cross-linked')
+      }
+      checks.push(check('card-interfaces-linked',
+        'capability card names its interfaces and cross-links its sibling surfaces', undefined,
+        [ROLE.agentsJson, ROLE.llmsTxt],
+        problems.length === 0
+          ? pass('card names interfaces (http/mcp) and cross-links llms.txt <-> agents.json <-> openapi')
+          : { verdict: 'fail', detail: problems.slice(0, 6).join('; ') }))
     }
   }
 

@@ -146,6 +146,60 @@ describe('worker: KV report cache', () => {
     expect(bad.status).toBe(400)
     expect(((await bad.json()) as { error: string }).error).toMatch(/digest mismatch/)
   })
+
+  it('attested POST /verify without an out-of-band pin REFUSES even with a warm cache present (ax-7x3)', async () => {
+    const cache = new ReportCache(new MemoryKV(), 300)
+    const app = createApp(
+      {},
+      { externalFetcher: makeFetcher(goodTargetRoutes()), externalDelayMs: 0, cache, now: () => 0 },
+    )
+    const spec = {
+      $type: 'PinnedSpec', name: 'mini', version: '1',
+      requirements: [{ id: 'status-ok', kind: 'endpoint', method: 'GET', path: '/api/status', expect: { status: 200 } }],
+    }
+    // Warm the cache with a legitimate (non-attested) pass so a cache HIT is
+    // available for this target+specDigest+seed.
+    const warm = await app.fetch(req('/verify', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: GOOD, spec, seed: 1 }),
+    }))
+    expect(warm.headers.get('x-cache')).toBe('MISS')
+    // Attested admission with the pin OMITTED must fail closed BEFORE the cache
+    // read — a warm cache must NOT let the guard be bypassed.
+    const attestedNoPin = await app.fetch(req('/verify', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: GOOD, spec, seed: 1, attested: true }),
+    }))
+    expect(attestedNoPin.status).toBe(400)
+    expect(((await attestedNoPin.json()) as { error: string }).error).toMatch(/externally-supplied expectedDigest/)
+    expect(attestedNoPin.headers.get('x-cache')).not.toBe('HIT')
+  })
+
+  it('attested POST /suite without an out-of-band pin REFUSES even with a warm cache present (ax-7x3)', async () => {
+    const cache = new ReportCache(new MemoryKV(), 300)
+    const app = createApp(
+      {},
+      { externalFetcher: makeFetcher(goodTargetRoutes()), externalDelayMs: 0, cache, now: () => 0 },
+    )
+    const suite = {
+      $type: 'Suite', name: 'mini-suite', version: '1',
+      environments: { prod: { vars: { baseUrl: GOOD } } },
+      requirements: [{ id: 'status-ok', kind: 'endpoint', method: 'GET', path: '/api/status', expect: { status: 200 } }],
+    }
+    // Warm the suite cache with a legitimate (non-attested) pass.
+    const warm = await app.fetch(req('/suite', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: GOOD, suite, environment: 'prod', seed: 1 }),
+    }))
+    expect(warm.headers.get('x-cache')).toBe('MISS')
+    const attestedNoPin = await app.fetch(req('/suite', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: GOOD, suite, environment: 'prod', seed: 1, attested: true }),
+    }))
+    expect(attestedNoPin.status).toBe(400)
+    expect(((await attestedNoPin.json()) as { error: string }).error).toMatch(/externally-supplied expectedDigest/)
+    expect(attestedNoPin.headers.get('x-cache')).not.toBe('HIT')
+  })
 })
 
 describe('worker: per-domain cooldown', () => {

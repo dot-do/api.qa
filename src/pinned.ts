@@ -28,7 +28,7 @@ import {
 import { observeTarget, ROLE, parseAgentsJson, parseJsonBody, parseOpenapi } from './discovery.js'
 import { runChecks } from './checks.js'
 import { axScoreOf } from './grade.js'
-import { sha256Hex } from './digest.js'
+import { sha256Hex, seededRandom } from './digest.js'
 import { validateSchema, readPath } from './schema.js'
 import { VERIFIER_VERSION } from './verify.js'
 import type {
@@ -63,6 +63,17 @@ export interface VerifyPinnedOpts extends ObserverOpts {
   seed?: number
   /** The pin. When present, spec text MUST hash to this or nothing runs. */
   expectedDigest?: string
+  /**
+   * Attested (production/catalog admission) verification. When true, the
+   * verifier REFUSES to run without an externally-supplied `expectedDigest`:
+   * the pinned contract must be pinned by a digest held OUTSIDE the building
+   * fleet's write access, never read from the target repo. This makes verifier
+   * independence an ENFORCED property, not an assertion — a spec silently
+   * weakened in-tree cannot be re-ratified into a passing verdict because the
+   * fleet does not hold the digest the attested verifier checks against.
+   * Local/hermetic runs may omit it (default false).
+   */
+  attested?: boolean
   allowPrivateTargets?: boolean
   /**
    * Bindings pre-seeded into the capture scope BEFORE the first requirement
@@ -231,6 +242,17 @@ export async function verifyPinnedSpec(
   opts: VerifyPinnedOpts = {},
 ): Promise<PinnedReport> {
   const mode = opts.mode ?? 'remote'
+  // Verifier independence, enforced (ax-7x3): attested admission refuses to run
+  // unless the pin is supplied from OUTSIDE the building fleet's write access.
+  // Gate on the explicit `attested` flag, NOT on mode — default (non-attested)
+  // callers, including every hermetic/local run, keep the in-tree convenience.
+  if (opts.attested && !opts.expectedDigest) {
+    throw new Error(
+      'attested verification refuses to run without an externally-supplied expectedDigest: ' +
+        'the pinned contract must be pinned by a digest held outside the building fleet, ' +
+        'not read from the target repo. (Local/hermetic runs may omit it.)',
+    )
+  }
   const digest = await sha256Hex(specText)
 
   if (opts.expectedDigest && opts.expectedDigest !== digest) {
@@ -253,7 +275,12 @@ export async function verifyPinnedSpec(
     ...opts,
     allowWrites: true,
     allowPrivate: opts.allowPrivateTargets ?? mode === 'local',
-    budget: opts.budget ?? 48,
+    // Headroom (ax-fsg/ax-0v2): the Clause-3 typed-body sampling and the
+    // Clause-4 query-flip probes add a handful of fetches on top of the surface
+    // + keyless + contract-diff plan; keep the budget above the worst case so a
+    // budget-exhausted (status:null) observation never silently fails a
+    // compliant target.
+    budget: opts.budget ?? 64,
   })
   const bundle = await observeTarget(origin, observer, seed)
 
@@ -353,7 +380,7 @@ export async function verifyPinnedSpec(
         if (typeof req.paramValue === 'number') {
           amount = req.paramValue
         } else {
-          const { fromProbe, path, multiply } = req.paramValue
+          const { fromProbe, path, multiply, multiplyRange } = req.paramValue
           const srcReq = phase1.find((r) => r.probe === fromProbe)
           const srcEv = srcReq
             ? observer.items.find((e) => e.role === `pinned:${srcReq.id}:0`)
@@ -365,7 +392,19 @@ export async function verifyPinnedSpec(
             plan.unresolved = `probes.${fromProbe} yielded no numeric ${path} — cannot derive amount, failing closed`
             break
           }
-          amount = r.value * (multiply ?? 1)
+          // Seed-randomized factor (ax-0v2): the multiplier is derived from the
+          // run seed (recorded in the report → replayable), NOT Math.random, so
+          // the over-ceiling amount is unpredictable before the run yet
+          // reproducible after it — a target cannot precompute the exact amount
+          // from the declared hardCeiling. A fixed `multiply` stays fixed.
+          let mult: number
+          if (multiplyRange) {
+            const [lo, hi] = multiplyRange
+            mult = lo + seededRandom(seed)() * (hi - lo)
+          } else {
+            mult = multiply ?? 1
+          }
+          amount = r.value * mult
         }
         if (typeof entry.param !== 'string' || entry.param.length === 0) {
           plan.unresolved =
@@ -390,6 +429,18 @@ export async function verifyPinnedSpec(
       }
       plan.finalUrls.set(i, url)
       await observer.observe(`pinned:${req.id}:${i}`, url, { accept: 'application/json' })
+      // Query-flip branch proof (ax-0v2): the SAME pathname with its
+      // discriminating query removed must serve 200 OK, proving the path
+      // branches on its query — kills co-located decoys and the
+      // pathMustServeOk pathname-granularity gap. Judge-side over already-
+      // fetched evidence; the flip URL is same-origin gated here at observe.
+      if (req.pathMustServeOk === true) {
+        const flip = new URL(entry.url)
+        flip.search = ''
+        if (isPubliclyRoutableSameOrigin(flip.toString(), origin)) {
+          await observer.observe(`pinned:${req.id}:${i}:flip`, flip.toString(), { accept: 'application/json' })
+        }
+      }
     }
   }
   const fullBundle: EvidenceBundle = { ...bundle, items: observer.items, bindings }
@@ -548,6 +599,14 @@ export async function verifyPinnedSpec(
             if (pathname === undefined || !okPathnamesOf(fullBundle).has(pathname)) {
               ps.push(`pathname ${pathname ?? finalUrl} was never observed answering 200 with an "OK" envelope in this run — the probe path does not demonstrably branch on its query (decoy endpoint)`)
             }
+            // Query-flip branch proof (ax-0v2): the same path with its query
+            // STRIPPED must answer 200 OK — a path that returns the same
+            // EMPTY/BLOCKED with no query does not branch on its query.
+            const flipEv = fullBundle.items.find((e) => e.role === `pinned:${req.id}:${i}:flip`)
+            const flipProblems = judgeExpect(flipEv, { status: 200, paths: [{ path: 'type', equals: 'OK' }] })
+            if (flipProblems.length > 0) {
+              ps.push(`query-flip: the same path without its query did not answer 200 OK (${flipProblems.join('; ')}) — the probe path does not branch on its query`)
+            }
           }
           if (ps.length > 0) problems.push(`#${i} ${plan.finalUrls.get(i) ?? entry.url}: ${ps.join('; ')}`)
         })
@@ -613,6 +672,12 @@ export interface VerifySuiteOpts extends ObserverOpts {
   seed?: number
   /** The pin. When present, SUITE text MUST hash to this or nothing runs. */
   expectedDigest?: string
+  /**
+   * Attested (production/catalog admission) verification — same enforced
+   * independence as VerifyPinnedOpts.attested: refuse to run without an
+   * externally-supplied `expectedDigest` (ax-7x3). Default false.
+   */
+  attested?: boolean
   allowPrivateTargets?: boolean
   /**
    * Explicit target override. When omitted, the selected environment's string
@@ -683,6 +748,14 @@ export async function verifySuite(
   opts: VerifySuiteOpts = {},
 ): Promise<SuiteReport> {
   const mode = opts.mode ?? 'remote'
+  // Attested independence (ax-7x3): refuse to run without an out-of-band pin.
+  if (opts.attested && !opts.expectedDigest) {
+    throw new Error(
+      'attested suite verification refuses to run without an externally-supplied expectedDigest: ' +
+        'the pinned suite must be pinned by a digest held outside the building fleet, ' +
+        'not read from the target repo. (Local/hermetic runs may omit it.)',
+    )
+  }
   const digest = await sha256Hex(suiteText)
 
   // Anti-Goodhart gate: content-address the SUITE and refuse before parsing or
@@ -729,9 +802,13 @@ export async function verifySuite(
   const report = await verifyPinnedSpec(target, specText, {
     ...opts,
     mode,
-    // The SUITE digest is the pin; it was checked above. Do NOT re-gate on the
-    // inner spec's (different) digest.
+    // The SUITE digest is the pin; it was checked above (including the attested
+    // out-of-band requirement). The re-expressed inner PinnedSpec has a
+    // DIFFERENT digest, so do NOT re-gate on it — clear both the expected digest
+    // and the attested flag so the inner call does not refuse the (intentionally
+    // absent) inner pin.
     expectedDigest: undefined,
+    attested: false,
     // The selected environment's vars (plus any data-driven row fields layered
     // on top) pre-seed the capture scope. The SSRF gates (normalizeTarget on the
     // baseUrl/target inside verifyPinnedSpec, resolveEndpoint's same-origin
