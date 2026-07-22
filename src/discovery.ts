@@ -597,14 +597,18 @@ function mcpToolsListRequest(): unknown {
  * share of the shared politeness budget (same ordering rationale as the
  * 402-offer + MCP-OAuth probes).
  *
- * SSRF: every fetch is gated. The server.json + ownership well-known are
- * same-origin (default well-known paths, or a card-declared server.json url
- * re-gated same-origin). The MCP remote url (from server.json remotes[0]) may
- * legitimately be hosted off-origin, so it uses the NARROW public-https off-
- * origin allowance (https, public host, no private/metadata IP) exactly like
- * the RFC 9728 authorization server — and observeMcp never follows a redirect.
- * The DoH resolver + registry base are FIXED trusted public hosts, still gated
- * public-https. Nothing here introduces an un-gated fetch.
+ * SSRF: every fetch is gated. server.json is same-origin (default well-known
+ * path, or a card-declared server.json url re-gated same-origin). The
+ * domain-ownership well-known and the DNS-TXT proof are DELIBERATELY fetched/
+ * resolved at the reversed NAMESPACE DOMAIN, not the scanned origin (see the
+ * comment at call site 3, below) — that domain is frequently off-origin from
+ * the target, so both use the same NARROW public-https off-origin allowance
+ * (https, public host, no private/metadata IP) as the RFC 9728 authorization
+ * server. The MCP remote url (from server.json remotes[0]) may also
+ * legitimately be hosted off-origin, using the same allowance — and
+ * observeMcp never follows a redirect. The DoH resolver + registry base are
+ * FIXED trusted public hosts, still gated public-https. Nothing here
+ * introduces an un-gated fetch.
  */
 async function observeMcpRegistry(origin: string, observer: Observer): Promise<void> {
   // Re-parse the card from the already-recorded agents.json evidence (no refetch).
@@ -647,22 +651,42 @@ async function observeMcpRegistry(origin: string, observer: Observer): Promise<v
     }
   }
 
-  // 3. Domain-ownership provability — the HTTPS well-known (v=MCPv1) at the
-  //    target origin, and (for a custom-domain namespace) a DNS-TXT proof via
-  //    the fixed public DoH resolver. Either proves the domain can publish under
-  //    its reverse-DNS namespace.
-  const authWellKnownUrl = `${origin}${REGISTRY_AUTH_WELL_KNOWN_PATH}`
-  if (isPubliclyRoutableSameOrigin(authWellKnownUrl, origin)) {
-    await observer.observe(ROLE.mcpRegistryAuthWellKnown, authWellKnownUrl, { accept: 'text/plain' })
-  }
-  // DNS-TXT proof only for a custom-domain namespace (github namespaces are
-  // GitHub-account-backed, not DNS-provable by a third party — judged separately).
+  // 3. Domain-ownership provability — for a CUSTOM-DOMAIN namespace
+  //    (com.example/server ⇒ domain example.com), both proofs MUST be bound to
+  //    the reversed NAMESPACE DOMAIN, never to the scanned target's own origin.
+  //    Fetching (or resolving) at the target's own origin would let ANY target
+  //    forge ownership of ANY namespace it can merely spell in server.json —
+  //    the origin is exactly what's under adversarial control. So:
+  //      - DNS-TXT is resolved for the namespace domain (already correct: DoH
+  //        `name=` is the domain, not the origin's host);
+  //      - the HTTPS well-known is now fetched at
+  //        `https://<namespaceDomain>/.well-known/mcp-registry-auth` — via the
+  //        narrow public-https OFF-ORIGIN allowance (the same one the RFC 9728
+  //        authorization server and the DoH/registry lookups use) — NOT at
+  //        `${origin}/.well-known/...`. When the namespace domain happens to
+  //        equal the scanned origin's own host (the common self-hosting case),
+  //        this resolves to the identical URL the origin fetch used to hit, so
+  //        the honest case is unaffected; a target whose origin is NOT the
+  //        namespace domain can no longer self-serve a proof for a domain it
+  //        does not control (the judge additionally re-checks the fetched URL's
+  //        hostname against the namespace domain — belt and suspenders).
+  //
+  //    The GitHub-account-backed `io.github.<owner>` namespace has no DNS-
+  //    provable domain — a third party cannot mint a domain proof for it, and
+  //    manifest-internal consistency (name vs. repository.url) is NOT an
+  //    ownership proof (both are target-authored). Its ownership is graded
+  //    ONLY from out-of-band registry presence (step 4, below) — nothing is
+  //    fetched here for it.
   if (!isGithubNamespace(server.name)) {
     const domain = namespaceDomain(server.name)
     if (domain && /^[a-z0-9.-]+\.[a-z0-9-]+$/i.test(domain)) {
       const dohUrl = `${DOH_RESOLVER}?name=${encodeURIComponent(domain)}&type=TXT`
       if (isPublicHttpsOffOriginAllowed(dohUrl)) {
         await observer.observe(ROLE.mcpRegistryDnsTxt, dohUrl, { accept: 'application/dns-json' })
+      }
+      const authWellKnownUrl = `https://${domain}${REGISTRY_AUTH_WELL_KNOWN_PATH}`
+      if (isPublicHttpsOffOriginAllowed(authWellKnownUrl)) {
+        await observer.observe(ROLE.mcpRegistryAuthWellKnown, authWellKnownUrl, { accept: 'text/plain' })
       }
     }
   }

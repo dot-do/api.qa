@@ -375,17 +375,120 @@ describe('domain-ownership provability gates namespace publish', () => {
     expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/well-known/)
   })
 
-  it('a github namespace proven by a matching github.com repository → passes (no DNS needed)', async () => {
+  // -------------------------------------------------------------------------
+  // io.github namespace: manifest-internal consistency (name <-> repository.
+  // url) is target-authored on BOTH sides, so it is NEVER an ownership proof
+  // on its own — the ONLY out-of-band binding is registry presence under the
+  // EXACT name (the registry mints io.github names only after GitHub OIDC).
+  // -------------------------------------------------------------------------
+
+  function presenceUrlFor(name: string): string {
+    return `https://registry.modelcontextprotocol.io/v0/servers?search=${encodeURIComponent(name)}`
+  }
+
+  it('a github namespace with a matching repository.url but NO registry presence → UNPROVEN (fails, caps)', async () => {
     const gh = validServerJson({ name: 'io.github.acme/widget', repository: { url: 'https://github.com/acme/widget', source: 'github' } })
-    const { checks } = await judge({ serverJson: gh, authWellKnown: null, doh: null })
-    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('pass')
-    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/GitHub-account-backed/)
+    // `judge()`'s default `registry` stub only answers the top-level NAME's
+    // presence url, not io.github.acme/widget's — so this genuinely leaves the
+    // exact-name presence lookup unstubbed (404), simulating "not listed".
+    const { checks, grade } = await judge({ serverJson: gh, authWellKnown: null, doh: null })
+    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('fail')
+    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/proves nothing|target-authored/)
+    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/not present|UNPROVEN/i)
+    expect(['C', 'D', 'F']).toContain(grade)
   })
 
-  it('a github namespace whose repository owner does NOT match → fails', async () => {
+  it('a github namespace with a matching repository.url AND genuine registry presence under the exact name → passes', async () => {
+    const name = 'io.github.acme/widget'
+    const gh = validServerJson({ name, repository: { url: 'https://github.com/acme/widget', source: 'github' } })
+    const table = buildRoutes({ serverJson: gh, authWellKnown: null, doh: null, registry: null })
+    table[`GET ${presenceUrlFor(name)}`] = () => jsonOut({ servers: [{ name, version: '1.2.3' }] })
+    const observer = new Observer({ fetcher: multiFetcher(table).fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    const checks = runChecks(bundle)
+    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('pass')
+    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/registry|OIDC/i)
+  })
+
+  it('a github namespace whose repository owner does NOT match, and no registry presence → fails', async () => {
     const gh = validServerJson({ name: 'io.github.acme/widget', repository: { url: 'https://github.com/someone-else/widget', source: 'github' } })
     const { checks } = await judge({ serverJson: gh, authWellKnown: null, doh: null })
     expect(verdictOf(checks, 'mcp-registry-ownership')).toBe('fail')
+  })
+
+  it('a github namespace whose repository owner does NOT match, but IS genuinely registry-present → still passes (presence is the real proof, not the repo url)', async () => {
+    const name = 'io.github.acme/widget'
+    const gh = validServerJson({ name, repository: { url: 'https://github.com/someone-else/widget', source: 'github' } })
+    const table = buildRoutes({ serverJson: gh, authWellKnown: null, doh: null, registry: null })
+    table[`GET ${presenceUrlFor(name)}`] = () => jsonOut({ servers: [{ name, version: '1.2.3' }] })
+    const observer = new Observer({ fetcher: multiFetcher(table).fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    const checks = runChecks(bundle)
+    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('pass')
+  })
+
+  // -------------------------------------------------------------------------
+  // Custom-domain namespace: the ownership proof must be BOUND to the
+  // reversed namespace domain, never to the scanned target's own origin — a
+  // target must not be able to forge ownership of a namespace/domain it does
+  // not control merely by serving a well-known on its OWN origin.
+  // -------------------------------------------------------------------------
+
+  it('a FOREIGN custom-domain namespace: a well-known self-served at the scanned origin is REJECTED (not proof)', async () => {
+    // The target (good.example) claims the com.stripe namespace (domain
+    // stripe.com) — a domain it plainly does not control — and, as an
+    // attacker would, serves a "proof" well-known at ITS OWN origin. Nothing
+    // is stubbed at https://stripe.com/... (DNS-TXT or well-known), so the
+    // real, domain-bound fetch 404s.
+    const foreign = validServerJson({ name: 'com.stripe/widget' })
+    const table = buildRoutes({ serverJson: foreign, authWellKnown: null, doh: null })
+    // Self-served forgery: the well-known at the SCANNED ORIGIN claims MCPv1.
+    table[`GET ${AUTH_WK_URL}`] = () => ({ status: 200, contentType: 'text/plain', body: 'v=MCPv1; k=ed25519; p=AAAA' })
+    const { fetcher, calls } = multiFetcher(table)
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    const checks = runChecks(bundle)
+    // The forged, self-served well-known at the scanned origin is never even
+    // fetched by the ownership dimension — proving discovery no longer looks
+    // there for a foreign namespace's proof.
+    expect(calls).not.toContain(AUTH_WK_URL)
+    expect(calls).toContain('https://stripe.com/.well-known/mcp-registry-auth')
+    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('fail')
+    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/cannot prove ownership/)
+  })
+
+  it('a FOREIGN custom-domain namespace CAPS the grade instead of A+ (spoofed ownership no longer inflates)', async () => {
+    const foreign = validServerJson({ name: 'com.stripe/widget' })
+    const table = buildRoutes({ serverJson: foreign, authWellKnown: null, doh: null })
+    table[`GET ${AUTH_WK_URL}`] = () => ({ status: 200, contentType: 'text/plain', body: 'v=MCPv1; k=ed25519; p=AAAA' })
+    const observer = new Observer({ fetcher: multiFetcher(table).fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    const checks = runChecks(bundle)
+    const score = axScoreOf(checks)
+    const { grade, notes } = gradeOf(score, checks)
+    expect(verdictOf(checks, 'mcp-registry-ownership')).toBe('fail')
+    expect(grade).not.toBe('A+')
+    expect(['C', 'D', 'F']).toContain(grade)
+    expect(notes.join(' ')).toMatch(/mcp-registry-ownership/)
+  })
+
+  it('a GENUINELY domain-bound well-known — served at the namespace domain, off the scanned origin — DOES prove ownership', async () => {
+    // The target's own origin is still good.example, but it legitimately
+    // claims a DIFFERENT custom domain's namespace, and that domain genuinely
+    // serves the proof AT ITSELF (off-origin from the scanned target) — the
+    // real, non-forged case the domain-binding fix must still allow.
+    const claimedDomain = 'other-domain.example.net'
+    const genuine = validServerJson({ name: 'net.example.other-domain/widget' })
+    const table = buildRoutes({ serverJson: genuine, authWellKnown: null, doh: null })
+    table[`GET https://${claimedDomain}/.well-known/mcp-registry-auth`] = () =>
+      ({ status: 200, contentType: 'text/plain', body: 'v=MCPv1; k=ed25519; p=AAAA' })
+    const { fetcher, calls } = multiFetcher(table)
+    const observer = new Observer({ fetcher, delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    const checks = runChecks(bundle)
+    expect(calls).toContain(`https://${claimedDomain}/.well-known/mcp-registry-auth`)
+    expect(verdictOf(checks, 'mcp-registry-ownership'), detailOf(checks, 'mcp-registry-ownership')).toBe('pass')
+    expect(detailOf(checks, 'mcp-registry-ownership')).toMatch(/namespace domain/)
   })
 })
 

@@ -273,10 +273,82 @@ export class Observer {
     }
   }
 
+  /**
+   * Read a response body up to `maxBodyBytes`, WITHOUT ever buffering more
+   * than that many bytes in memory — regardless of how large the target's
+   * response actually is (a shared-code memory-DoS fix: `await res.text()`
+   * used to buffer the ENTIRE body before slicing, so a malicious target
+   * streaming a huge/unbounded body could exhaust memory on every single
+   * api.qa fetch call site, since every role's evidence goes through here).
+   *
+   * Two layers, neither trusting the other:
+   *   1. A declared `Content-Length` that ALREADY exceeds the cap is rejected
+   *      before reading a single byte of the body (the fast, cheap path — no
+   *      point starting a read we know must be truncated).
+   *   2. Regardless of what `Content-Length` says (absent, wrong, or a
+   *      chunked transfer with no length at all), the body is read via a
+   *      STREAMING reader that accumulates chunks only up to the cap, then
+   *      cancels the underlying stream — so peak memory is bounded by
+   *      `maxBodyBytes` no matter how much data the target tries to send.
+   *
+   * Normal (non-oversized) bodies are read in full and decoded as UTF-8,
+   * preserving prior behavior for every legitimate target.
+   */
   private async readCapped(res: Response): Promise<string> {
-    const text = await res.text()
-    if (text.length <= this.opts.maxBodyBytes) return text
-    return text.slice(0, this.opts.maxBodyBytes)
+    const maxBytes = this.opts.maxBodyBytes
+    const declaredLength = res.headers.get('content-length')
+    if (declaredLength !== null) {
+      const declared = Number(declaredLength)
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        try { await res.body?.cancel() } catch { /* best-effort — connection may already be closed */ }
+        return ''
+      }
+    }
+
+    const body = res.body
+    if (!body || typeof (body as { getReader?: unknown }).getReader !== 'function') {
+      // No streamable body on this Response implementation (some test/mock
+      // Response constructions) — fall back to a single bounded read.
+      const text = await res.text()
+      return text.length <= maxBytes ? text : text.slice(0, maxBytes)
+    }
+
+    const reader = body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    let truncated = false
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value || value.byteLength === 0) continue
+        const remaining = maxBytes - total
+        if (value.byteLength >= remaining) {
+          if (remaining > 0) {
+            chunks.push(value.subarray(0, remaining))
+            total += remaining
+          }
+          truncated = true
+          break
+        }
+        chunks.push(value)
+        total += value.byteLength
+      }
+      if (truncated) {
+        // Stop pulling the rest of the stream — never drain a body past the cap.
+        try { await reader.cancel() } catch { /* best-effort */ }
+      }
+    } finally {
+      try { reader.releaseLock() } catch { /* already released by cancel() in some runtimes */ }
+    }
+
+    const buf = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      buf.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return new TextDecoder('utf-8').decode(buf)
   }
 
   private record(

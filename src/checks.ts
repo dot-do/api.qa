@@ -499,18 +499,21 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       [ROLE.mcpServerJson, ROLE.mcpRemoteInit, ROLE.mcpRemoteToolsList],
       judgeMcpRemoteLive(sjEv, server, initEv, toolsEv)))
 
-    // (c) DNS-challenge / well-known ownership provability.
+    // (c) DNS-challenge / well-known ownership provability, and (d)
+    //     registry-presence — presence is needed by BOTH (c), as the sole
+    //     out-of-band proof for a GitHub-account-backed io.github namespace,
+    //     and (d)'s own informational report, so resolve it once, first.
     const authEv = findEvidence(bundle, ROLE.mcpRegistryAuthWellKnown)
     const dnsEv = findEvidence(bundle, ROLE.mcpRegistryDnsTxt)
+    const presenceEv = findEvidence(bundle, ROLE.mcpRegistryPresence)
     checks.push(check('mcp-registry-ownership',
-      'domain can prove ownership to publish under its reverse-DNS namespace (DNS-TXT or /.well-known)', undefined,
-      [ROLE.mcpServerJson, ROLE.mcpRegistryAuthWellKnown, ROLE.mcpRegistryDnsTxt],
-      judgeRegistryOwnership(sjEv, server, authEv, dnsEv)))
+      'domain/account can prove ownership to publish under its reverse-DNS namespace', undefined,
+      [ROLE.mcpServerJson, ROLE.mcpRegistryAuthWellKnown, ROLE.mcpRegistryDnsTxt, ROLE.mcpRegistryPresence],
+      judgeRegistryOwnership(sjEv, server, authEv, dnsEv, presenceEv)))
 
     // (d) OPTIONAL/informational — actual presence in the official registry.
     //     NEVER fails (pass when found, skip otherwise) — it does not gate the
     //     grade: publishability is graded from the target's own surfaces.
-    const presenceEv = findEvidence(bundle, ROLE.mcpRegistryPresence)
     checks.push(check('mcp-registry-presence',
       'server is present in the official MCP registry (informational)', undefined,
       [ROLE.mcpServerJson, ROLE.mcpRegistryPresence],
@@ -987,27 +990,64 @@ function judgeMcpRemoteLive(
   return pass(`live remote ${remote.url} resolved: initialize ok, tools/list advertises ${tools.length} tool(s) [${tools.slice(0, 8).join(', ')}]`)
 }
 
-/** The origin host (lowercased) of a repository url, plus its first path segment. */
-function repoOwnerHost(repoUrl: string | undefined): { host: string; owner: string } | undefined {
-  if (typeof repoUrl !== 'string' || repoUrl.length === 0) return undefined
-  let u: URL
-  try { u = new URL(repoUrl) } catch { return undefined }
-  const seg = u.pathname.split('/').filter((s) => s.length > 0)
-  return { host: u.hostname.toLowerCase(), owner: (seg[0] ?? '').toLowerCase() }
-}
-
 /** True when a DoH TXT response or a well-known body carries the MCPv1 proof. */
 function carriesMcpv1Proof(body: string | null | undefined): boolean {
   return typeof body === 'string' && /v=MCPv1/i.test(body)
 }
 
+/** The lowercased hostname a piece of Evidence was actually fetched from, or undefined. */
+function evidenceHostname(ev: Evidence | undefined): string | undefined {
+  if (!ev) return undefined
+  try { return new URL(ev.url).hostname.toLowerCase() } catch { return undefined }
+}
+
 /**
- * (c) Ownership provability. ABSENT server.json => SKIP. When active, the domain
- * must be able to prove it can publish under its reverse-DNS namespace, via ANY
- * of: an HTTPS /.well-known/mcp-registry-auth carrying `v=MCPv1`; a DNS-TXT proof
- * (v=MCPv1) resolved over DoH for a custom-domain namespace; or — for the
- * GitHub-account-backed `io.github.<owner>` namespace — a repository url on
- * github.com under that same owner (the self-consistent GitHub-namespace proof).
+ * True when the exact server.json `name` appears in a parsed official-registry
+ * response — the ONE out-of-band binding this verifier can check for the
+ * GitHub-account-backed `io.github.<owner>` namespace (the registry mints those
+ * names only after a GitHub OIDC exchange, so registry PRESENCE under the exact
+ * name is a real third-party attestation, unlike anything the target's own
+ * manifest can assert about itself).
+ */
+function provenByRegistryPresence(server: ServerJsonClaims, presenceEv: Evidence | undefined): boolean {
+  if (!ok(presenceEv) || presenceEv?.body == null || typeof server.name !== 'string') return false
+  try {
+    return registryDocMentions(JSON.parse(presenceEv.body), server.name)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * (c) Ownership provability. ABSENT server.json => SKIP. A proof must VERIFY
+ * THE THING IT CLAIMS TO PROVE, bound to the right principal — never a
+ * self-asserted claim, never the wrong domain:
+ *
+ *   - Custom-domain namespace (com.example/server ⇒ domain example.com): the
+ *     proof MUST be bound to `example.com` — a DNS-TXT (v=MCPv1) resolved via
+ *     the fixed DoH resolver for that domain, OR a /.well-known/mcp-registry-
+ *     auth HTTPS proof FETCHED AT that domain (discovery.ts fetches it there,
+ *     never at the scanned origin — see observeMcpRegistry). This function
+ *     additionally re-checks the fetched well-known's own URL hostname against
+ *     the namespace domain as defense in depth: even if a future call site
+ *     regressed to fetching off-domain, a mismatched hostname is NEVER honored
+ *     here. Neither proof carries a defined signature CHALLENGE to verify
+ *     cryptographically (the `k=`/`p=` fields are informational metadata, not
+ *     a signature over any nonce this verifier issues) — so the security
+ *     boundary is DOMAIN-BINDING itself (control of DNS / HTTPS hosting at the
+ *     claimed domain, the same trust model as an ACME HTTP-01 / DNS-01
+ *     challenge), not a signature match. This is stated here explicitly rather
+ *     than silently assumed.
+ *   - GitHub-account-backed `io.github.<owner>` namespace: manifest-internal
+ *     consistency (name vs. repository.url) is NEVER an ownership proof —
+ *     BOTH fields are target-authored, so agreement between them proves
+ *     nothing about who actually controls the `owner` GitHub account. The
+ *     ONLY out-of-band binding available is registry PRESENCE: the registry
+ *     grants `io.github.<owner>` names solely after a GitHub OIDC exchange, so
+ *     the server being listed under that EXACT name in
+ *     registry.modelcontextprotocol.io is real third-party evidence. No
+ *     registry presence => ownership UNPROVEN (capped), never passed.
+ *
  * Unprovable => FAIL (capped): a server cannot publish under a namespace it
  * cannot prove it owns.
  */
@@ -1016,6 +1056,7 @@ function judgeRegistryOwnership(
   server: ServerJsonClaims | undefined,
   authEv: Evidence | undefined,
   dnsEv: Evidence | undefined,
+  presenceEv: Evidence | undefined,
 ): { verdict: Verdict; detail: string } {
   if (!ok(sjEv) || !server) {
     return { verdict: 'skip', detail: 'no server.json manifest — no namespace ownership to prove' }
@@ -1027,30 +1068,36 @@ function judgeRegistryOwnership(
     return { verdict: 'skip', detail: 'server.json name is not a valid reverse-DNS namespace — ownership is not assessable (see mcp-server-json)' }
   }
 
-  // Well-known HTTPS proof at the origin (v=MCPv1; k=…; p=…).
-  const wellKnownProof = ok(authEv) && carriesMcpv1Proof(authEv?.body)
-
   if (isGithubNamespace(server.name)) {
     const owner = githubNamespaceOwner(server.name)
-    const repo = repoOwnerHost(server.repository?.url)
-    const githubProof = !!owner && !!repo && repo.host === 'github.com' && repo.owner === owner
-    if (githubProof) {
-      return pass(`io.github.${owner} namespace is provable: repository url is github.com/${owner}/… (GitHub-account-backed ownership)`)
+    if (provenByRegistryPresence(server, presenceEv)) {
+      return pass(`io.github.${owner} namespace is provable: "${server.name}" is present in the official MCP registry — the registry grants io.github names only after GitHub OIDC, so listing under this exact name is out-of-band, third-party evidence of account ownership`)
     }
-    if (wellKnownProof) {
-      return pass(`ownership provable via ${authEv!.url} (v=MCPv1 well-known proof)`)
+    return {
+      verdict: 'fail',
+      detail: `cannot prove ownership of GitHub namespace "${server.name}": server.json repository.url agreeing with the name proves nothing (both are target-authored), and the server is not present under this exact name in the official MCP registry (the only out-of-band binding for io.github.* names) — ownership is UNPROVEN, not passed`,
     }
-    return { verdict: 'fail', detail: `cannot prove ownership of GitHub namespace "${server.name}": repository url ${server.repository?.url ?? '(none)'} is not github.com/${owner}/… and no /.well-known/mcp-registry-auth (v=MCPv1) is served — the server cannot publish under a namespace it cannot prove` }
   }
 
-  // Custom-domain namespace: DNS-TXT (via DoH) OR the well-known HTTPS proof.
+  // Custom-domain namespace: DNS-TXT (via DoH) OR the well-known HTTPS proof —
+  // BOTH must be bound to the reversed namespace domain, never the scanned
+  // origin. The well-known's fetched URL hostname is re-checked here against
+  // the namespace domain (belt-and-suspenders on top of discovery.ts fetching
+  // it at the domain in the first place) — an origin-served well-known whose
+  // hostname does not match the namespace domain is NEVER honored: that is
+  // precisely the forgery this check exists to close.
   const domain = namespaceDomain(server.name)
   const dnsProof = ok(dnsEv) && dnsTxtCarriesProof(dnsEv)
   if (dnsProof) {
-    return pass(`ownership provable via DNS-TXT (v=MCPv1) for ${domain} — the domain can publish under com.-namespace ${parsed.namespace}`)
+    return pass(`ownership provable via DNS-TXT (v=MCPv1) for ${domain} — the domain can publish under namespace ${parsed.namespace}`)
   }
+  const authHostname = evidenceHostname(authEv)
+  const wellKnownProof = ok(authEv) && carriesMcpv1Proof(authEv?.body) && !!domain && authHostname === domain
   if (wellKnownProof) {
-    return pass(`ownership provable via ${authEv!.url} (v=MCPv1 well-known proof) for ${domain}`)
+    return pass(`ownership provable via ${authEv!.url} (v=MCPv1 well-known proof fetched AT the namespace domain ${domain})`)
+  }
+  if (ok(authEv) && carriesMcpv1Proof(authEv?.body) && domain && authHostname !== domain) {
+    return { verdict: 'fail', detail: `a /.well-known/mcp-registry-auth proof was served at ${authHostname ?? '(unknown host)'}, NOT the namespace domain ${domain} — a proof not bound to the claimed domain proves nothing (this is the self-served-forgery case) — the server cannot publish under a namespace it cannot prove` }
   }
   return { verdict: 'fail', detail: `cannot prove ownership of namespace "${server.name}" (domain ${domain ?? '?'}): no DNS-TXT (v=MCPv1) proof and no /.well-known/mcp-registry-auth (v=MCPv1) — the server cannot publish under a namespace it cannot prove` }
 }
