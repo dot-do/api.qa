@@ -729,17 +729,24 @@ async function observeMcpRegistry(origin: string, observer: Observer): Promise<v
  */
 export const MCP_APP_MIME = 'text/html;profile=mcp-app'
 
-/** True when `mime` is a recognized MCP-UI / MCP-Apps UIResource content type. */
+/**
+ * True when `mime` is a recognized MCP-UI / MCP-Apps UIResource content type.
+ *
+ * Requires the MCP-Apps PROFILE (`text/html;profile=mcp-app`) or an EXPLICIT
+ * MCP-UI content type (`text/uri-list` for externalUrl, `application/vnd.mcp-ui.*`
+ * for rawHtml/remote-dom). It deliberately does NOT accept a BARE `text/html`
+ * (or `text/html;charset=…`): a plain HTML body is what every ordinary web page
+ * serves, so accepting it would let a non-UIResource pose as a rendered widget.
+ * The host only sandboxes what it recognizes as a UIResource, so the profile is
+ * the actual boundary.
+ */
 export function isMcpUiMime(mime: string | undefined | null): boolean {
   if (typeof mime !== 'string') return false
-  const m = mime.toLowerCase().replace(/\s+/g, '')
-  // MCP Apps profile, MCP-UI rawHtml, externalUrl (uri-list), remote-dom.
+  const m = mime.toLowerCase().replace(/\s+/g, '').replace(/"/g, '')
   return (
     m.startsWith('text/html;profile=mcp-app') ||
-    m === 'text/html' ||
-    m.startsWith('text/html;') ||
     m.startsWith('text/uri-list') ||
-    m.startsWith('application/vnd.mcp-ui.remote-dom')
+    m.startsWith('application/vnd.mcp-ui.')
   )
 }
 
@@ -807,8 +814,12 @@ export function resourceUriOfResult(result: Record<string, unknown> | undefined)
 }
 
 /**
- * The first UIResource content entry from a `resources/read` result whose uri
- * matches `wantUri` (or the first content when no uri is echoed). Returns the
+ * The UIResource content entry from a `resources/read` result whose uri EXACTLY
+ * matches `wantUri`. When `wantUri` is set (the normal case) a match is REQUIRED
+ * — a server that returns a resource under a DIFFERENT uri than the one the tool
+ * linked does not satisfy linkage (it could substitute an unrelated / attacker
+ * resource), so there is NO `entries[0]` fallback. Only when `wantUri` is empty
+ * (nothing to match against) do we fall back to the first content. Returns the
  * `{ mimeType, text }` the judge inspects for MIME + srcDoc + externalUrl.
  */
 export function resourceContentOf(
@@ -820,7 +831,7 @@ export function resourceContentOf(
   const contents = (result as Record<string, unknown>).contents
   if (!Array.isArray(contents)) return undefined
   const entries = contents.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
-  const matched = entries.find((c) => c.uri === wantUri) ?? entries[0]
+  const matched = wantUri ? entries.find((c) => c.uri === wantUri) : entries[0]
   if (!matched) return undefined
   return {
     mimeType: typeof matched.mimeType === 'string' ? matched.mimeType : undefined,
@@ -928,11 +939,18 @@ async function observeMcpUi(origin: string, observer: Observer): Promise<void> {
   const content = resourceContentOf(parseJsonRpcMessage(readEv), resourceUri)
   const ext = externalUrlOf(content)
   if (ext) {
-    // The ONE attacker-influenced http(s) target — gate it EXACTLY like every
-    // other off-origin target url. A private/non-https externalUrl is refused
-    // here without a byte leaving; the judge re-derives the refusal from the
-    // recorded uri-list so it still grades the claim DOWN.
-    if (isPublicHttpsOffOriginAllowed(ext)) {
+    // The externalUrl is the ONE attacker-CHOSEN http(s) target. We do NOT make
+    // api.qa a one-shot GET proxy to an arbitrary public URL (egress / reflection
+    // abuse): an OFF-origin externalUrl is NEVER fetched — its DECLARED shape
+    // (https, public, uri-list MIME) is validated by the linkage judge WITHOUT a
+    // byte leaving. We fetch ONLY when the externalUrl is SAME-ORIGIN as the
+    // verification target or the MCP remote we already handshook (a first-party
+    // widget page, already within the surface we are gated for). Same-origin +
+    // publicly-routable + https is enforced; a private/loopback/metadata host is
+    // refused even same-origin.
+    const sameAsTarget = isPubliclyRoutableSameOrigin(ext, origin)
+    const sameAsRemote = isPubliclyRoutableSameOrigin(ext, remoteUrl)
+    if (sameAsTarget || sameAsRemote) {
       await observer.observe(ROLE.mcpUiExternalUrl, ext, { accept: 'text/html,application/xhtml+xml' })
     }
   }

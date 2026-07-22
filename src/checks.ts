@@ -1337,21 +1337,132 @@ function judgeMcpUiLinkage(ui: McpUiContext): { verdict: Verdict; detail: string
   return pass(`tool result links ${ui.linkedUri}, resolved with MCP-UI MIME ${ui.resource.mimeType}`)
 }
 
-/** The set of external http(s) references a srcDoc pulls — the supply-chain surface. */
+/**
+ * A remote-loading reference: an absolute http(s) URL, a protocol-relative
+ * `//host`, or a ws(s) URL. Relative paths, `#fragments`, `data:`/`blob:`,
+ * `mailto:`, and `javascript:` are NOT remote loads.
+ */
+function isRemoteRef(raw: string): boolean {
+  const s = raw.trim()
+  return /^(?:https?:)?\/\//i.test(s) || /^wss?:\/\//i.test(s)
+}
+
+/** Attributes that trigger an AUTOMATIC network load on ANY element. */
+const LOADING_ATTRS = ['src', 'srcset', 'data', 'poster', 'formaction', 'action', 'background', 'ping', 'xlink:href']
+/** `href` is a network load only on these elements (a plain <a href> is navigation). */
+const HREF_LOAD_ELEMENTS = new Set(['link', 'base', 'use', 'image', 'track'])
+/** Elements whose text content is CDATA/raw — `<` inside does not open a tag. */
+const RAW_TEXT_ELEMENTS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'noscript', 'noframes'])
+
+/** Parse `key="v"` / `key='v'` / `key=v` / `key` pairs out of a start-tag body. */
+function parseAttrs(tagBody: string): Record<string, string> {
+  const attrs: Record<string, string> = {}
+  const re = /([^\s/=]+)(?:\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(tagBody))) {
+    const name = (m[1] ?? '').toLowerCase()
+    if (!name) continue
+    const value = m[3] ?? m[4] ?? m[5] ?? ''
+    attrs[name] = value
+  }
+  return attrs
+}
+
+/** Remote refs in a `<style>`/`@import`/`url(...)` CSS body. */
+function cssRemoteRefs(css: string): string[] {
+  const out: string[] = []
+  const re = /(?:@import\s+(?:url\()?|url\(\s*)["']?((?:https?:)?\/\/[^"')\s]+)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(css))) if (m[1] && isRemoteRef(m[1])) out.push(m[1])
+  return out
+}
+
+/** Remote-URL string literals in an executable `<script>` body (the exfil surface). */
+function scriptRemoteRefs(js: string): string[] {
+  const out: string[] = []
+  // Single-, double-, and backtick-quoted string literals.
+  const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|`((?:\\.|[^`\\])*)`/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(js))) {
+    const lit = m[1] ?? m[2] ?? m[3] ?? ''
+    if (isRemoteRef(lit)) out.push(lit)
+  }
+  return out
+}
+
+/**
+ * Executable external references a srcDoc actually PULLS — the supply-chain +
+ * exfil surface. Unlike a raw-string regex, this walks the HTML: it flags only
+ * (a) network-loading ATTRIBUTES on real elements (src/href/srcset/data/…,
+ * including protocol-relative `//host`), and (b) remote-URL string literals in
+ * executable `<script>` / `<style>` bodies (covering `fetch`, backtick
+ * `fetch(\`…\`)`, `sendBeacon`, `XMLHttpRequest.open`, `new Image().src`,
+ * `new WebSocket/EventSource`, dynamic `import()`). It IGNORES text nodes,
+ * `<pre>`/`<code>` sample text, and escaped markup — a widget that merely
+ * DISPLAYS a URL is self-contained. This is a best-effort secondary signal, not
+ * a proof of inertness; the closed-CSP requirement is the real boundary.
+ */
 function externalRefsInSrcDoc(html: string): string[] {
   const refs = new Set<string>()
-  const patterns: RegExp[] = [
-    /<script\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
-    /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
-    /<img\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
-    /@import\s+(?:url\()?["']?(https?:\/\/[^"'\s)]+)/gi,
-    /\b(?:fetch|import)\s*\(\s*["'](https?:\/\/[^"']+)/gi,
-    /\bnew\s+(?:WebSocket|EventSource)\s*\(\s*["']((?:https?|wss?):\/\/[^"']+)/gi,
-    /<iframe\b[^>]*\bsrc\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi,
-  ]
-  for (const re of patterns) {
-    let m: RegExpExecArray | null
-    while ((m = re.exec(html))) if (m[1]) refs.add(m[1])
+  let i = 0
+  const n = html.length
+  while (i < n) {
+    const lt = html.indexOf('<', i)
+    if (lt < 0) break
+    // Comments / doctype / CDATA — skip without treating `<` as a tag.
+    if (html.startsWith('<!--', lt)) {
+      const end = html.indexOf('-->', lt + 4)
+      i = end < 0 ? n : end + 3
+      continue
+    }
+    if (html[lt + 1] === '!' || html[lt + 1] === '?') {
+      const end = html.indexOf('>', lt + 1)
+      i = end < 0 ? n : end + 1
+      continue
+    }
+    const gt = html.indexOf('>', lt + 1)
+    if (gt < 0) break
+    const rawTag = html.slice(lt + 1, gt)
+    i = gt + 1
+    if (rawTag.startsWith('/')) continue // end tag
+    const nameMatch = /^([a-zA-Z][a-zA-Z0-9:-]*)/.exec(rawTag)
+    if (!nameMatch || !nameMatch[1]) continue
+    const name = nameMatch[1].toLowerCase()
+    const attrBody = rawTag.slice(nameMatch[1].length)
+    const attrs = parseAttrs(attrBody)
+
+    // (a) network-loading attributes on this element.
+    for (const a of LOADING_ATTRS) {
+      const v = attrs[a]
+      if (v === undefined) continue
+      if (a === 'srcset') {
+        for (const part of v.split(',')) {
+          const url = part.trim().split(/\s+/)[0]
+          if (url && isRemoteRef(url)) refs.add(url)
+        }
+      } else if (isRemoteRef(v)) refs.add(v)
+    }
+    if (attrs.href !== undefined && HREF_LOAD_ELEMENTS.has(name) && isRemoteRef(attrs.href)) {
+      refs.add(attrs.href)
+    }
+    // <meta http-equiv="refresh" content="0;url=https://evil"> — a redirect load.
+    if (name === 'meta' && (attrs['http-equiv'] ?? '').toLowerCase() === 'refresh' && attrs.content) {
+      const um = /url\s*=\s*([^;,\s]+)/i.exec(attrs.content)
+      if (um && um[1] && isRemoteRef(um[1])) refs.add(um[1])
+    }
+
+    // (b) raw-text elements: consume the body up to the matching close tag and,
+    // for script/style, scan it for remote refs. Text is NEVER treated as tags.
+    if (RAW_TEXT_ELEMENTS.has(name) && !rawTag.endsWith('/')) {
+      const closeRe = new RegExp(`</${name}\\b`, 'i')
+      const rest = html.slice(i)
+      const cm = closeRe.exec(rest)
+      const body = cm ? rest.slice(0, cm.index) : rest
+      i = cm ? i + cm.index : n
+      if (name === 'script') for (const r of scriptRemoteRefs(body)) refs.add(r)
+      else if (name === 'style') for (const r of cssRemoteRefs(body)) refs.add(r)
+      // textarea/title/xmp/noscript bodies are inert display text — not scanned.
+    }
   }
   return [...refs]
 }
@@ -1372,54 +1483,179 @@ function cspAdmitsRemote(csp: Record<string, unknown>): string[] {
 }
 
 /**
- * (2) srcDoc self-containment + closed CSP. The `ui://` srcDoc HTML must be
- * self-contained — no external http(s) `<script>`/`<link>`/`<img>`/`<iframe>`,
- * `@import`, or `fetch`/WebSocket to a remote host — because a widget that pulls
- * remote code is a host-sandbox + supply-chain risk. Any `_meta.ui.csp` must be
- * CLOSED (no wildcard / remote origin in a script/connect directive).
+ * A CSP is CLOSED when it (a) admits no wildcard / remote origin (see
+ * `cspAdmitsRemote`), AND (b) actually CONSTRAINS both the script-execution and
+ * the network-connection surface — either via a non-empty `default-src`
+ * fallback, or via explicit non-empty `script-src` and `connect-src`. An absent
+ * or empty CSP (`undefined` / `{}`) is NOT closed: it declares no boundary for
+ * the host sandbox to enforce, so the widget cannot be proven inert.
+ */
+function cspIsClosed(csp: Record<string, unknown> | undefined): boolean {
+  if (!csp) return false
+  if (cspAdmitsRemote(csp).length > 0) return false
+  const nonEmpty = (dir: string): boolean => {
+    for (const [k, raw] of Object.entries(csp)) {
+      if (k.toLowerCase() !== dir) continue
+      const v = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join(' ') : ''
+      if (v.trim().length > 0) return true
+    }
+    return false
+  }
+  const hasDefault = nonEmpty('default-src')
+  const scriptCovered = hasDefault || nonEmpty('script-src')
+  const connectCovered = hasDefault || nonEmpty('connect-src')
+  return scriptCovered && connectCovered
+}
+
+/**
+ * (2) srcDoc self-containment. A widget is provably safe ONLY behind a CLOSED
+ * `_meta.ui.csp` that the host sandbox can enforce. A deny-list of exfil sinks
+ * is unwinnable (protocol-relative `//host`, `sendBeacon`, `XMLHttpRequest`,
+ * `new Image().src`, dynamic `import()`, backtick `fetch`), so the PRIMARY
+ * signal is ENFORCEMENT-based:
+ *   - the widget MUST declare a closed CSP (default-src / no remote origin in
+ *     script-src / connect-src / img-src). An un-CSP'd widget is NOT provably
+ *     inert ⇒ FAIL — there is nothing for the host to enforce.
+ * As a SECONDARY signal, the srcDoc is PARSED (not regexed) and any actual
+ * EXECUTABLE external reference is flagged — network-loading element attributes
+ * plus remote-URL literals in `<script>`/`<style>` bodies, covering
+ * protocol-relative, backtick, sendBeacon/XHR/Image/WebSocket/EventSource/
+ * dynamic-import. A URL merely DISPLAYED in text / `<pre>`/`<code>` / escaped
+ * markup is NOT a reference and does not fail. This is best-effort, not a proof
+ * of inertness; the closed CSP is the real boundary.
  * No claim ⇒ SKIP. An externalUrl widget is graded on the fetched page (or, when
- * unfetchable, on the linkage check, not here).
+ * not fetched, on the linkage check, not here).
  */
 function judgeMcpUiSelfContained(ui: McpUiContext): { verdict: Verdict; detail: string } {
   if (!ui.claims) return { verdict: 'skip', detail: NOT_READY }
-  // The HTML under scrutiny: the inline srcDoc, or a fetched externalUrl page.
-  const html = ui.extEv?.body ?? ui.resource?.text
+  // The HTML under scrutiny: the inline srcDoc, or (only when SAME-ORIGIN and
+  // thus fetched) an externalUrl page. An off-origin externalUrl is never
+  // fetched — self-containment is judged via linkage, not here.
+  const html = ui.externalUrl ? ui.extEv?.body : ui.resource?.text
   if (typeof html !== 'string' || html.length === 0) {
-    // externalUrl refused by the SSRF gate (never fetched) — the linkage check
-    // already FAILs it; here we cannot inspect self-containment, so SKIP so as
-    // not to double-count the same defect.
-    if (ui.externalUrl) return { verdict: 'skip', detail: `externalUrl UIResource ${ui.externalUrl} not inlined — self-containment judged on the linked page (see resource-linkage)` }
+    if (ui.externalUrl) return { verdict: 'skip', detail: `externalUrl UIResource ${ui.externalUrl} not fetched (off-origin, not proxied) — self-containment judged on the declared shape (see resource-linkage)` }
     return { verdict: 'fail', detail: `UIResource ${ui.linkedUri ?? '?'} carries no srcDoc HTML to render — an empty widget is not render-ready` }
   }
-  const refs = externalRefsInSrcDoc(html)
   const meta = ui.result?._meta
   const uiMeta = meta && typeof meta === 'object' ? ((meta as Record<string, unknown>).ui as Record<string, unknown> | undefined) : undefined
   const csp = uiMeta && typeof uiMeta.csp === 'object' && uiMeta.csp !== null ? (uiMeta.csp as Record<string, unknown>) : undefined
+  // PRIMARY: a closed CSP is REQUIRED. An open (remote-admitting) CSP is the
+  // worst case; a missing/empty CSP still fails — an un-CSP'd widget cannot be
+  // proven inert.
   const cspOffenders = csp ? cspAdmitsRemote(csp) : []
-  if (refs.length > 0) {
-    return { verdict: 'fail', detail: `ui:// srcDoc pulls remote code/assets: ${refs.slice(0, 4).join(', ')} — a widget that loads remote resources is a host-sandbox + supply-chain risk; the srcDoc must be self-contained (inline/precompiled, no external http(s) refs)` }
-  }
   if (cspOffenders.length > 0) {
     return { verdict: 'fail', detail: `_meta.ui.csp is not closed: ${cspOffenders.slice(0, 3).join('; ')} — a widget CSP that admits a wildcard or remote origin defeats the host sandbox` }
   }
-  return pass(`srcDoc is self-contained (no external http(s) refs)${csp ? ' with a closed CSP' : ''}`)
+  if (!cspIsClosed(csp)) {
+    return { verdict: 'fail', detail: `the widget declares no closed _meta.ui.csp (need e.g. default-src 'none' with script-src/connect-src restricted to 'self') — an un-CSP'd widget cannot be proven self-contained; the host sandbox has no policy to enforce` }
+  }
+  // SECONDARY: parse the srcDoc for actual executable external references.
+  const refs = externalRefsInSrcDoc(html)
+  if (refs.length > 0) {
+    return { verdict: 'fail', detail: `ui:// srcDoc has executable external references: ${refs.slice(0, 4).join(', ')} — an element that loads or a script that beacons to a remote origin is a host-sandbox + supply-chain + exfil risk; the srcDoc must be self-contained (inline/precompiled, no remote refs)` }
+  }
+  return pass('srcDoc is self-contained (no executable external refs) behind a closed CSP')
 }
 
-/** Model-visible strings that look like leaked secrets — targeted, low-false-positive. */
+/** Minimum length of a credential-named field's string value before it counts as a leak. */
+const MIN_CRED_LEN = 8
+
+/**
+ * A field NAME that denotes a credential. A brand deny-list (sk-/ghp_/…) misses
+ * generically-named secrets (refresh_token, session_token, auth, credential), so
+ * this is a NAME-shaped ALLOW-list: any field whose (camelCase-normalized) name
+ * ends in a credential word — token / secret / key / password / credential /
+ * authorization / auth / session / cookie / private-key (and the *_token /
+ * *_secret / *_key variants). Anchored at the END so `count`, `keyboard`,
+ * `monkey`, `session_id` do NOT match.
+ */
+function nameLooksCredential(key: string): boolean {
+  const norm = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+  return /(^|[_-])(tokens?|secrets?|keys?|password|passwd|pwd|credentials?|authorization|auth|session|cookie|private[_-]?key)$/.test(norm)
+}
+
+/** VALUE-shape heuristics — a string that LOOKS like a credential regardless of its field name. */
+const VALUE_SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/AIza[0-9A-Za-z_-]{20,}/, 'Google API key (AIza…)'],
+  [/\bsk-[A-Za-z0-9]{16,}/, 'OpenAI-style secret key (sk-…)'],
+  [/\bAKIA[0-9A-Z]{16}\b/, 'AWS access key id (AKIA…)'],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/, 'GitHub token (gh?_…)'],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}/, 'Slack token (xox…)'],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'PEM private key'],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, 'JWT (three-segment)'],
+  [/\bBearer\s+[A-Za-z0-9._-]{16,}/, 'inline Bearer token'],
+]
+
+/** A UUID — a benign identifier shape that must NOT be mistaken for a credential. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * A single WHITESPACE-delimited token that looks like an opaque credential: a
+ * long base64/hex/opaque string, mixed character classes, with a long
+ * CONTIGUOUS run (so dotted/hyphenated identifiers and UUIDs — benign IDs — do
+ * NOT trip it).
+ */
+function looksHighEntropy(raw: string): boolean {
+  const s = raw.trim()
+  if (s.length < 32) return false
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(s)) return false
+  if (UUID_RE.test(s)) return false
+  const longestRun = Math.max(...s.split(/[_\-+/=]+/).map((r) => r.length))
+  if (longestRun < 24) return false // a UUID's longest hex run is 12 → excluded
+  const classes = (/[a-z]/.test(s) ? 1 : 0) + (/[A-Z]/.test(s) ? 1 : 0) + (/[0-9]/.test(s) ? 1 : 0)
+  return classes >= 2
+}
+
+/**
+ * A credential label if `s` — or any whitespace-delimited token WITHIN it —
+ * matches a value-shape heuristic, else undefined. Tokenizing catches a
+ * credential embedded in narration text (e.g. `content[].text`), not only a
+ * value that IS the credential.
+ */
+function valueSecretLabel(s: string): string | undefined {
+  for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(s)) return label
+  for (const tok of s.split(/[\s"'`<>(){}\[\],;]+/)) {
+    if (looksHighEntropy(tok)) return 'high-entropy credential-like string'
+  }
+  return undefined
+}
+
+/** A credential-named field is a leak once it actually carries a non-trivial string value. */
+function credentialValuePresent(v: unknown): boolean {
+  if (typeof v === 'string') return v.trim().length >= MIN_CRED_LEN
+  return false
+}
+
+function walkForSecrets(value: unknown, path: string, hits: string[]): void {
+  if (typeof value === 'string') {
+    const label = valueSecretLabel(value)
+    if (label) hits.push(`${label}${path ? ` at ${path}` : ''}`)
+    return
+  }
+  if (Array.isArray(value)) {
+    value.forEach((el, idx) => walkForSecrets(el, `${path}[${idx}]`, hits))
+    return
+  }
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const child = path ? `${path}.${k}` : k
+      if (nameLooksCredential(k) && credentialValuePresent(v)) hits.push(`credential-named field \`${k}\``)
+      walkForSecrets(v, child, hits)
+    }
+  }
+}
+
+/**
+ * Model-visible values that carry a leaked credential. Credential-SHAPED: it
+ * flags (a) any field whose NAME denotes a credential and carries a real value,
+ * and (b) any VALUE that matches a credential shape (AIza…/sk-/AKIA/gh?_/xox/
+ * PEM/JWT/Bearer/high-entropy). Recurses through objects AND arrays, so a
+ * `structuredContent` object is scanned as JSON and each `content[].text` string
+ * is scanned as text.
+ */
 function secretsIn(value: unknown): string[] {
   const hits: string[] = []
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '')
-  const patterns: Array<[RegExp, string]> = [
-    [/\bsk-[A-Za-z0-9]{16,}\b/, 'OpenAI-style secret key (sk-…)'],
-    [/\bAKIA[0-9A-Z]{16}\b/, 'AWS access key id (AKIA…)'],
-    [/\bghp_[A-Za-z0-9]{20,}\b/, 'GitHub token (ghp_…)'],
-    [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, 'Slack token (xox…)'],
-    [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'PEM private key'],
-    [/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, 'JWT (three-segment)'],
-    [/\bBearer\s+[A-Za-z0-9._-]{16,}/, 'inline Bearer token'],
-    [/"(?:api[_-]?key|secret|password|access[_-]?token|client[_-]?secret)"\s*:\s*"[^"]{8,}"/i, 'secret-named field with a value'],
-  ]
-  for (const [re, label] of patterns) if (re.test(text)) hits.push(label)
+  walkForSecrets(value, '', hits)
   return hits
 }
 
