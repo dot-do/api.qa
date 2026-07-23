@@ -648,6 +648,52 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       uiEvidence, judgeMcpUiHostRender(ui)))
   }
 
+  // ── AI SDK 5 UI-message-stream readiness (ax-rx1) ─────────────────────────
+  //    The analog of the mcp-ui-* dimension for the streaming (SSE) face: an
+  //    agent host consumes the target's AI SDK 5 UI-message-stream over
+  //    text/event-stream, and a malformed / mis-shaped / secret-leaking /
+  //    register-divergent stream renders WRONG (or exfiltrates a credential)
+  //    inside that host. ENFORCEMENT-FIRST + TARGET-DECLARED: a target that
+  //    exposes NO UI-message-stream face (no `interfaces.uiMessageStream`, so no
+  //    stream evidence was recorded) informationally SKIPs every sub-check and
+  //    is NEVER over-blocked. A target that DECLARES the face but violates a
+  //    sub-signal — bad/missing header, broken SSE framing, a wrong part shape,
+  //    a secret in a part, or a projection-parity divergence — FAILs (an honesty
+  //    cap: a broken/leaky stream is worse than none). Every sub-check axItem is
+  //    undefined (additive readiness dimension). DERIVED entirely from the
+  //    observed stream body + declared JSON twin.
+  {
+    const streamEv = findEvidence(bundle, ROLE.uiMessageStream)
+    const twinEv = findEvidence(bundle, ROLE.uiStreamTwin)
+    const us = buildUiStreamContext(streamEv, twinEv)
+    const streamEvidence = [ROLE.uiMessageStream, ROLE.uiStreamTwin]
+
+    // (1) transport: x-vercel-ai-ui-message-stream: v1 + content-type text/event-stream
+    checks.push(check('ui-stream-transport',
+      'UI-message-stream is served with the v1 stream header and an SSE content-type', undefined,
+      streamEvidence, judgeUiStreamTransport(us)))
+
+    // (2) SSE framing: data:{json}\n\n chunks, a bare data:[DONE] terminal, each payload JSON+type
+    checks.push(check('ui-stream-framing',
+      'SSE framing is valid — data:{json} chunks, a bare [DONE] terminal, each payload a typed JSON part', undefined,
+      streamEvidence, judgeUiStreamFraming(us)))
+
+    // (3) part shapes: every part spec-correct per AI SDK 5 (known type + required fields)
+    checks.push(check('ui-stream-part-shapes',
+      'every UI-message-stream part is spec-correct (known type, required fields present)', undefined,
+      streamEvidence, judgeUiStreamPartShapes(us)))
+
+    // (4) envelope hygiene: no secret leaks into any part (reuses the shared detector)
+    checks.push(check('ui-stream-envelope-hygiene',
+      'no secret leaks into any UI-message-stream part (token/key in a part → FAIL)', undefined,
+      streamEvidence, judgeUiStreamEnvelopeHygiene(us)))
+
+    // (5) projection-parity: tool-output-available output is consistent with the JSON/MCP twin
+    checks.push(check('ui-stream-parity',
+      "tool-output-available `output` is byte/JSON-consistent with the JSON twin (no divergence)", undefined,
+      streamEvidence, judgeUiStreamParity(us)))
+  }
+
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
   {
     // The manifest is ADVERSARIAL input: a pinned standard that resolves its
@@ -1970,19 +2016,22 @@ const VALUE_SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'PEM private key'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, 'JWT (three-segment)'],
   [/\bBearer\s+[A-Za-z0-9._-]{16,}/, 'inline Bearer token'],
+  // Dotted/opaque OAuth tokens the whole-string entropy scan cannot see (the `.`
+  // breaks the contiguous-run test): a `ya29.` Google access token and a `1//`
+  // Google refresh token, keyed on their high-confidence prefixes.
+  [/\bya29\.[A-Za-z0-9_-]{20,}/, 'Google OAuth access token (ya29.…)'],
+  [/\b1\/\/[0-9A-Za-z_-]{20,}/, 'Google OAuth refresh token (1//…)'],
 ]
 
 /** A UUID — a benign identifier shape that must NOT be mistaken for a credential. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
- * A single WHITESPACE-delimited token that looks like an opaque credential: a
- * long base64/hex/opaque string, mixed character classes, with a long
- * CONTIGUOUS run (so dotted/hyphenated identifiers and UUIDs — benign IDs — do
- * NOT trip it).
+ * An opaque (dot-free) string that looks like a credential: ≥32 chars of
+ * base64/hex/opaque bytes, mixed character classes, with a long CONTIGUOUS run
+ * (so hyphenated identifiers and UUIDs — benign IDs — do NOT trip it).
  */
-function looksHighEntropy(raw: string): boolean {
-  const s = raw.trim()
+function isOpaqueHighEntropy(s: string): boolean {
   if (s.length < 32) return false
   if (!/^[A-Za-z0-9+/=_-]+$/.test(s)) return false
   if (UUID_RE.test(s)) return false
@@ -1990,6 +2039,37 @@ function looksHighEntropy(raw: string): boolean {
   if (longestRun < 24) return false // a UUID's longest hex run is 12 → excluded
   const classes = (/[a-z]/.test(s) ? 1 : 0) + (/[A-Z]/.test(s) ? 1 : 0) + (/[0-9]/.test(s) ? 1 : 0)
   return classes >= 2
+}
+
+/**
+ * Benign DOTTED shapes that must never read as a credential even if a segment
+ * were long: a hostname/domain (`foo.example.com`), a version string
+ * (`1.2.3`, `v1.2.3-beta.4`). A real opaque OAuth token body carries digits and
+ * so never matches an all-letters TLD or an all-numeric version.
+ */
+function looksBenignDotted(s: string): boolean {
+  if (/^v?\d+(?:\.\d+)+(?:[.-][0-9A-Za-z-]+)*$/.test(s)) return true // version
+  if (/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(s)) return true // hostname/domain
+  return false
+}
+
+/**
+ * A single WHITESPACE-delimited token that looks like an opaque credential.
+ * Whole-string first; then DOT-AWARE — a benign dotted string (domain, version,
+ * short-segment field path) is left alone, but a long opaque MIXED-alnum segment
+ * (e.g. the body after a `ya29.`/`1//` prefix) is still caught. The per-segment
+ * bar requires BOTH a digit and a letter so a dotted field path (`a.b.c`), a
+ * reverse-DNS/package path, or a CamelCase class name does NOT trip it.
+ */
+function looksHighEntropy(raw: string): boolean {
+  const s = raw.trim()
+  if (isOpaqueHighEntropy(s)) return true
+  if (s.includes('.') && !looksBenignDotted(s)) {
+    for (const seg of s.split('.')) {
+      if (isOpaqueHighEntropy(seg) && /[0-9]/.test(seg) && /[A-Za-z]/.test(seg)) return true
+    }
+  }
+  return false
 }
 
 /**
@@ -2144,6 +2224,290 @@ function judgeMcpUiHostRender(ui: McpUiContext): { verdict: Verdict; detail: str
     return { verdict: 'fail', detail: 'the UI tool declares no description, widgetDescription, or annotations — the host has no affordance text to present the widget trustworthily' }
   }
   return pass(`first-render tolerant (no required inputs) with ${widgetDescription ? 'widgetDescription' : hasDescription ? 'a description' : 'annotations'} for the host`)
+}
+
+// ---------------------------------------------------------------------------
+// AI SDK 5 UI-message-stream readiness (ax-rx1) — the streaming (SSE) analog of
+// the mcp-ui-* dimension. PURE over the observed stream body + declared JSON
+// twin. Enforcement-first: a declared-but-broken stream FAILs; a target with no
+// stream evidence (no declared face) SKIPs every sub-check.
+// ---------------------------------------------------------------------------
+
+const NOT_READY_STREAM =
+  'no UI-message-stream face declared (no interfaces.uiMessageStream) — informational not-ready, not a failure'
+
+interface UiStreamContext {
+  /** The target declared a UI-message-stream face ⇒ stream evidence was recorded. */
+  declared: boolean
+  /** The stream endpoint actually returned a body to inspect. */
+  streamOk: boolean
+  /** The stream response carried a 2xx status — an AI SDK host checks `response.ok`. */
+  statusOk: boolean
+  status: number | null
+  /** The `x-vercel-ai-ui-message-stream` response header value (expected `v1`). */
+  header?: string
+  contentType?: string | null
+  /** Structural SSE-framing problems (non-`data:` line, bad [DONE], parse/type errors). */
+  framingErrors: string[]
+  /** A bare `data: [DONE]` was the final event. */
+  doneTerminal: boolean
+  /** Parsed parts that carry a string `type` discriminator, in stream order. */
+  parts: Record<string, unknown>[]
+  /** A usable (JSON-parseable) twin projection is observable for parity. */
+  twinPresent: boolean
+  twin?: unknown
+}
+
+/** content-type is an SSE stream (text/event-stream, charset-tolerant). */
+function isEventStream(ct: string | null | undefined): boolean {
+  return typeof ct === 'string' && /text\/event-stream/i.test(ct)
+}
+
+function buildUiStreamContext(
+  streamEv: Evidence | undefined,
+  twinEv: Evidence | undefined,
+): UiStreamContext {
+  if (!streamEv) {
+    return { declared: false, streamOk: false, statusOk: false, status: null, framingErrors: [], doneTerminal: false, parts: [], twinPresent: false }
+  }
+  const status = streamEv.status
+  const body = streamEv.body
+  const streamOk = status !== null && body !== null
+  const statusOk = status !== null && status >= 200 && status < 300
+  const header = streamEv.headers['x-vercel-ai-ui-message-stream']
+  const contentType = streamEv.contentType
+  const framingErrors: string[] = []
+  const parts: Record<string, unknown>[] = []
+  let doneTerminal = false
+
+  if (streamOk) {
+    // SSE events are separated by a blank line. Each AI SDK 5 UI-message-stream
+    // event is exactly `data: {json}\n\n`, with a bare `data: [DONE]\n\n` terminal.
+    const seq: Array<'part' | 'done'> = []
+    // Strip a leading UTF-8 BOM (a valid SSE stream prelude) before splitting.
+    for (const raw of (body as string).replace(/^\uFEFF/, '').split(/\r?\n\r?\n/)) {
+      const evText = raw.replace(/\r/g, '').replace(/^\uFEFF/, '')
+      if (evText.trim() === '') continue
+      const dataLines: string[] = []
+      let lineBad = false
+      for (const line of evText.split('\n')) {
+        if (line === '' || line.startsWith(':')) continue // blank / SSE comment (keep-alive)
+        if (line.startsWith('data:')) { dataLines.push(line.slice('data:'.length).replace(/^ /, '')); continue }
+        // The other STANDARD SSE line fields — event:, id:, retry:. They are not
+        // part of the UI-message-stream payload, so they are ignored for grading
+        // (non-fatal), not treated as malformed framing.
+        if (/^(event|id|retry):/.test(line)) continue
+        framingErrors.push(`SSE event carries a non-\`data:\` line (${JSON.stringify(line.slice(0, 40))}) — each chunk must be \`data: {json}\\n\\n\``)
+        lineBad = true
+      }
+      if (lineBad || dataLines.length === 0) continue
+      const payload = dataLines.join('\n')
+      if (payload === '[DONE]') { seq.push('done'); continue }
+      if (/^["'`]\[DONE\]["'`]$/.test(payload)) {
+        framingErrors.push('the stream terminal is quoted (`data: "[DONE]"`) — the [DONE] sentinel must be a BARE `data: [DONE]`, not a JSON/quoted string')
+        continue
+      }
+      let parsed: unknown
+      try { parsed = JSON.parse(payload) } catch {
+        framingErrors.push(`a data payload is not valid JSON: ${JSON.stringify(payload.slice(0, 60))}`)
+        continue
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        framingErrors.push(`a data payload is not a JSON object part: ${JSON.stringify(payload.slice(0, 60))}`)
+        continue
+      }
+      const type = (parsed as Record<string, unknown>).type
+      if (typeof type !== 'string' || type.length === 0) {
+        framingErrors.push(`a data payload has no string \`type\` discriminator: ${JSON.stringify(payload.slice(0, 60))}`)
+        continue
+      }
+      seq.push('part')
+      parts.push(parsed as Record<string, unknown>)
+    }
+    const doneCount = seq.filter((s) => s === 'done').length
+    if (doneCount === 0) {
+      framingErrors.push('the stream has no `data: [DONE]` terminal — an AI SDK 5 UI message stream must close with a bare [DONE]')
+    } else {
+      if (seq[seq.length - 1] !== 'done') framingErrors.push('the `data: [DONE]` terminal is not the final event — [DONE] must be the last frame')
+      if (doneCount > 1) framingErrors.push('the stream carries more than one `data: [DONE]` terminal')
+    }
+    doneTerminal = doneCount >= 1 && seq[seq.length - 1] === 'done'
+  }
+
+  let twin: unknown
+  if (twinEv && twinEv.status !== null && twinEv.body !== null) {
+    try { twin = JSON.parse(twinEv.body) } catch { /* invalid twin JSON ⇒ no usable twin ⇒ parity SKIPs */ }
+  }
+  return { declared: true, streamOk, statusOk, status, header, contentType, framingErrors, doneTerminal, parts, twinPresent: twin !== undefined, twin }
+}
+
+/** typeof === 'string' && non-empty. */
+function isNonEmptyStr(o: Record<string, unknown>, field: string): boolean {
+  return typeof o[field] === 'string' && (o[field] as string).length > 0
+}
+/** The key is present with a defined value. */
+function fieldPresent(o: Record<string, unknown>, field: string): boolean {
+  return field in o && o[field] !== undefined
+}
+
+/**
+ * Validate one UI-message-stream part against its AI SDK 5 shape. Returns an
+ * error message when the type is unknown or a required field is wrong/missing
+ * (flagging the classic renames: `textDelta`→`delta`, `args`→`input`,
+ * `result`→`output`, `argsTextDelta`→`inputTextDelta`), else undefined.
+ */
+function uiStreamPartShapeError(p: Record<string, unknown>): string | undefined {
+  const type = p.type as string
+  switch (type) {
+    case 'start':
+    case 'start-step':
+    case 'finish-step':
+    case 'finish':
+    case 'abort':
+      return undefined // lifecycle markers — no required payload fields
+    case 'error':
+      return isNonEmptyStr(p, 'errorText') ? undefined : 'error part is missing a string `errorText`'
+    case 'text-start':
+      return isNonEmptyStr(p, 'id') ? undefined : 'text-start is missing a string `id`'
+    case 'text-delta':
+      if (!isNonEmptyStr(p, 'id')) return 'text-delta is missing a string `id`'
+      if (fieldPresent(p, 'textDelta') && !fieldPresent(p, 'delta')) return 'text-delta uses `textDelta` — an AI SDK 5 UI-message-stream text-delta carries `delta`'
+      return typeof p.delta === 'string' ? undefined : 'text-delta is missing a string `delta`'
+    case 'text-end':
+      return isNonEmptyStr(p, 'id') ? undefined : 'text-end is missing a string `id`'
+    case 'tool-input-start':
+      if (!isNonEmptyStr(p, 'toolCallId')) return 'tool-input-start is missing a string `toolCallId`'
+      return isNonEmptyStr(p, 'toolName') ? undefined : 'tool-input-start is missing a string `toolName`'
+    case 'tool-input-delta':
+      if (!isNonEmptyStr(p, 'toolCallId')) return 'tool-input-delta is missing a string `toolCallId`'
+      if (fieldPresent(p, 'argsTextDelta') && !fieldPresent(p, 'inputTextDelta')) return 'tool-input-delta uses `argsTextDelta` — an AI SDK 5 tool-input-delta carries `inputTextDelta`'
+      return typeof p.inputTextDelta === 'string' ? undefined : 'tool-input-delta is missing a string `inputTextDelta`'
+    case 'tool-input-available':
+      if (!isNonEmptyStr(p, 'toolCallId')) return 'tool-input-available is missing a string `toolCallId`'
+      if (!isNonEmptyStr(p, 'toolName')) return 'tool-input-available is missing a string `toolName`'
+      if (fieldPresent(p, 'args') && !fieldPresent(p, 'input')) return 'tool-input-available uses `args` — an AI SDK 5 tool-input-available carries `input`'
+      return fieldPresent(p, 'input') ? undefined : 'tool-input-available is missing `input`'
+    case 'tool-output-available':
+      if (!isNonEmptyStr(p, 'toolCallId')) return 'tool-output-available is missing a string `toolCallId`'
+      if (fieldPresent(p, 'result') && !fieldPresent(p, 'output')) return 'tool-output-available uses `result` — an AI SDK 5 tool-output-available carries `output`'
+      return fieldPresent(p, 'output') ? undefined : 'tool-output-available is missing `output`'
+    default:
+      if (type.startsWith('data-')) {
+        return fieldPresent(p, 'data') ? undefined : `data part \`${type}\` is missing its \`data\` field`
+      }
+      return `unknown part type \`${type}\` — not an AI SDK 5 UI-message-stream part shape`
+  }
+}
+
+/** Recursive key-sorted canonical stringify for order-independent JSON equality. */
+function canonicalPartJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null'
+  if (Array.isArray(v)) return `[${v.map(canonicalPartJson).join(',')}]`
+  const o = v as Record<string, unknown>
+  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalPartJson(o[k])}`).join(',')}}`
+}
+
+/**
+ * Canonical JSON forms a stream `output` may legitimately equal to be at parity
+ * with `twin`: the whole twin, OR a SINGLE-LEVEL unwrap of a common projection
+ * envelope — `twin.data` / `twin.result`, or (when the twin wraps exactly one
+ * object/array value) that sole value. This lets an enveloped twin
+ * `{ ok: true, data: WIDGETS }` match a stream that emits the `WIDGETS` slice,
+ * while a GENUINE divergence (different values/shape) still matches nothing.
+ */
+function parityAcceptedForms(twin: unknown): string[] {
+  const forms = [canonicalPartJson(twin)]
+  if (twin && typeof twin === 'object' && !Array.isArray(twin)) {
+    const o = twin as Record<string, unknown>
+    for (const key of ['data', 'result']) {
+      if (o[key] !== undefined) forms.push(canonicalPartJson(o[key]))
+    }
+    const values = Object.values(o)
+    if (values.length === 1 && values[0] !== null && typeof values[0] === 'object') {
+      forms.push(canonicalPartJson(values[0]))
+    }
+  }
+  return forms
+}
+
+/** (1) transport: the v1 stream header + a text/event-stream content-type. */
+function judgeUiStreamTransport(us: UiStreamContext): { verdict: Verdict; detail: string } {
+  if (!us.declared) return { verdict: 'skip', detail: NOT_READY_STREAM }
+  if (!us.streamOk) return { verdict: 'fail', detail: `declares a UI-message-stream face but the endpoint returned no stream body (status ${us.status ?? 'fetch-failed'}) — nothing to consume as an SSE stream` }
+  if (!us.statusOk) return { verdict: 'fail', detail: `the UI-message-stream endpoint returned HTTP ${us.status} — an AI SDK host checks \`response.ok\` and throws on a non-2xx status, so a non-2xx stream is not consumable regardless of its header/framing` }
+  if (us.header !== 'v1') {
+    return { verdict: 'fail', detail: `the \`x-vercel-ai-ui-message-stream\` response header is ${us.header ? `\`${us.header}\`` : 'absent'} — an AI SDK 5 UI message stream must send \`x-vercel-ai-ui-message-stream: v1\`` }
+  }
+  if (!isEventStream(us.contentType)) {
+    return { verdict: 'fail', detail: `content-type is ${us.contentType ? `\`${us.contentType}\`` : 'absent'} — a UI message stream must be served as \`text/event-stream\`` }
+  }
+  return pass('served with `x-vercel-ai-ui-message-stream: v1` and a `text/event-stream` content-type')
+}
+
+/** (2) framing: data:{json} chunks, a bare [DONE] terminal, each payload typed JSON. */
+function judgeUiStreamFraming(us: UiStreamContext): { verdict: Verdict; detail: string } {
+  if (!us.declared) return { verdict: 'skip', detail: NOT_READY_STREAM }
+  if (!us.streamOk) return { verdict: 'fail', detail: `declares a UI-message-stream face but returned no stream body (status ${us.status ?? 'fetch-failed'}) — no SSE frames to validate` }
+  if (!us.statusOk) return { verdict: 'skip', detail: `stream returned a non-2xx status (${us.status}) — not consumable; see ui-stream-transport` }
+  if (us.framingErrors.length > 0) return { verdict: 'fail', detail: us.framingErrors[0]! }
+  if (us.parts.length === 0) return { verdict: 'fail', detail: 'the stream carries no typed data parts (only a [DONE] terminal or empty) — nothing an agent host could render' }
+  return pass(`valid SSE framing — ${us.parts.length} typed \`data: {json}\` part(s) closed by a bare \`data: [DONE]\` terminal`)
+}
+
+/** (3) part shapes: every part spec-correct per AI SDK 5. */
+function judgeUiStreamPartShapes(us: UiStreamContext): { verdict: Verdict; detail: string } {
+  if (!us.declared) return { verdict: 'skip', detail: NOT_READY_STREAM }
+  if (!us.streamOk) return { verdict: 'skip', detail: 'no stream body observed — see ui-stream-transport / ui-stream-framing' }
+  if (!us.statusOk) return { verdict: 'skip', detail: 'stream returned a non-2xx status — see ui-stream-transport' }
+  if (us.parts.length === 0) return { verdict: 'skip', detail: 'no typed parts to shape-check — see ui-stream-framing' }
+  for (const p of us.parts) {
+    const err = uiStreamPartShapeError(p)
+    if (err) return { verdict: 'fail', detail: `${err} — the agent host cannot correctly render/consume the stream` }
+  }
+  return pass(`all ${us.parts.length} part(s) match an AI SDK 5 UI-message-stream shape`)
+}
+
+/** (4) envelope hygiene: no secret in any part (reuses the shared detector). */
+function judgeUiStreamEnvelopeHygiene(us: UiStreamContext): { verdict: Verdict; detail: string } {
+  if (!us.declared) return { verdict: 'skip', detail: NOT_READY_STREAM }
+  if (!us.streamOk) return { verdict: 'skip', detail: 'no stream body observed — nothing to scan for secrets' }
+  if (!us.statusOk) return { verdict: 'skip', detail: 'stream returned a non-2xx status — see ui-stream-transport' }
+  if (us.parts.length === 0) return { verdict: 'skip', detail: 'no parts to scan for secrets — see ui-stream-framing' }
+  for (const p of us.parts) {
+    const hits = secretsIn(p)
+    if (hits.length > 0) {
+      return { verdict: 'fail', detail: `a secret (${hits[0]}) leaks into a \`${String(p.type)}\` UI-message-stream part — every stream part is model/agent-visible; credentials must never ride the stream` }
+    }
+  }
+  return pass('no secret detected in any UI-message-stream part')
+}
+
+/** (5) projection-parity: tool-output-available `output` is consistent with the JSON twin. */
+function judgeUiStreamParity(us: UiStreamContext): { verdict: Verdict; detail: string } {
+  if (!us.declared) return { verdict: 'skip', detail: NOT_READY_STREAM }
+  if (!us.streamOk) return { verdict: 'skip', detail: 'no stream body observed — nothing to diff against a twin' }
+  if (!us.statusOk) return { verdict: 'skip', detail: 'stream returned a non-2xx status — see ui-stream-transport' }
+  if (!us.twinPresent) {
+    return { verdict: 'skip', detail: 'no JSON/MCP twin is observable for this target — projection-parity is not applicable (not fabricated as a pass)' }
+  }
+  const outputs = us.parts
+    .filter((p) => p.type === 'tool-output-available' && fieldPresent(p, 'output'))
+    .map((p) => p.output)
+  if (outputs.length === 0) {
+    return { verdict: 'skip', detail: 'a JSON twin is observable but the stream emits no tool-output-available part to diff against it' }
+  }
+  // Accept the whole twin OR a single-level unwrap of a common projection
+  // envelope: a stream that emits the WIDGETS slice while the twin serves
+  // `{ ok: true, data: WIDGETS }` is a projection wrapper, not a divergence.
+  const accepted = new Set(parityAcceptedForms(us.twin))
+  for (const out of outputs) {
+    if (!accepted.has(canonicalPartJson(out))) {
+      const conflicts = conflictingKeys(out, us.twin)
+      const why = conflicts.length > 0 ? conflicts.slice(0, 4).join('; ') : 'the output and twin are not JSON-equal (differing keys/shape)'
+      return { verdict: 'fail', detail: `a tool-output-available \`output\` diverges from the JSON twin — the stream must project the SAME data the json/MCP twin serves (register divergence): ${why}` }
+    }
+  }
+  return pass('tool-output-available `output` is byte/JSON-consistent with the JSON twin (or a single-level projection-envelope unwrap of it)')
 }
 
 function looksLikeHtml(body: string): boolean {
