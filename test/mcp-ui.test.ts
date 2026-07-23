@@ -704,6 +704,94 @@ describe('envelope hygiene flags credential-shaped leaks in ANY model-visible ch
 })
 
 // ---------------------------------------------------------------------------
+// (f2) DATA: URI EXEMPTION (ax-17j) — a well-formed data: URI is inline CONTENT
+//   (an embedded image/font/SVG), not a credential-by-entropy. Its base64 payload
+//   must not false-flag as a high-entropy secret and FAIL hygiene; but a data: URI
+//   that CARRIES a recognizable credential (raw or base64-decoded) still FAILs.
+// ---------------------------------------------------------------------------
+
+describe('data: URI hygiene (ax-17j): inline content PASSes, smuggled credentials still FAIL', () => {
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+  const WOFF_B64 = 'dGhpcyBpcyBhIGZha2UgZm9udCBibG9iIGZvciB0ZXN0aW5nIHB1cnBvc2VzIG9ubHkgMTIzNDU='
+  // base64 of 'sk-live0deadbeefdeadbeef01234567' — a key smuggled inside a data: URI.
+  const SK_KEY_B64 = 'c2stbGl2ZTBkZWFkYmVlZmRlYWRiZWVmMDEyMzQ1Njc='
+  // An OPAQUE 43-char high-entropy secret with NO known prefix — what the entropy heuristic
+  // exists to catch. Must FAIL bare AND when laundered inside a text/json/tiny-binary data:
+  // URI (the ax-17j evasion, gate af8cb0ca).
+  const OPAQUE_SECRET = 'Xk7Qm2Zp9Rf4Vb8Nc1Ld6Wg0Ht3Jy5Uq7Es2Ao4Ti'
+  // A REALISTIC ≥512-byte inline 16×16 PNG (671 decoded bytes) — legit high-entropy media.
+  const PNG_LARGE_B64 = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACZklEQVR4nA3MkYI0OxCA0cYfg4vBxeBgcDA4WNhY2FjYWNgYHAwOBgeDi8GLeYPv9nmAs23bRtj+EbdA2n7IW6Rsv8iW0O2BbRnfntSt0LYXfRPGtjM3ZW0H2xb+EUIghh9SiOTwSwkJCQ80ZCw88VCo4UULQg87IygzHKxgdxADIf4QYyTFX3JMlPhAYkbjE4sFjy9qFFrc6VEZ8WBGY8XzDtIPIUVi+iWlRE4PSspIeqKpYOmFJ6GmnZaUng5GMmY6WcnvIEdC/iXmRMoPcs6U/ERyQfMLy4LnnZqVlg96NkY+mdlZ+bqD8ksoiVgepJLJ5UkpBSkvtAhWdrwotRy0YvRyMoozy8Uq9Q4kEeRBlEySJ1kKRV6ICCo7JorLQRWjyUkXZ8jFlMqS9x3og6CZqE+SFrK+KCqI7qgqpgeuRtWTpk7Xi6GVqW+WtjuwTLAn0QrJXmQTiu2IKWoHZobbSTWn2UW3yrA30xrLPnfgT4IXor9ILmTfKa6IH6gb5ifuTvWL5pXub4Y3pn9Y3u+gFkJ9EauQ6k6uSqkHUg2tJ1Ydrxe1Vlp902tj1A+zdlb93kF7EZoQ205qSm4HpRnSTrQ51i68VWp701qjtw+jdWb7stq4gy6EvhO7kvpB7kbpJ9Id7RfWK97f1N5o/UPvndG/zD5Y/e8Oxk4YShwHaRh5nJThyLjQUbHxxkejjg9tdPr4MsZgjj/WmHcwlTAP4jTSPMnTKfNCZkXnG5sNnx/q7LT5pc/BmH/MOVnzvztYB2EZcZ2k5eR1UVZF1htdDVsffHXq+tLWoK8/xprM9R9rLf4HPKlnH95EcQMAAAAASUVORK5CYII='
+  // A ≥512-byte binary font-ish blob (600 decoded bytes) — legit high-entropy media.
+  const FONT_LARGE_B64 = 'KYrrTK0Ob9Awk/JVtBd22TuY+V6/HH3iQqEAZ8YlhOtNrg9oySqL9FS3FnHQM5L9X7wdets4mQZmxSSD4kGgD2HCI4TlRqcYeNs6nfxfvhFz0DGW91S1KorpSK8ObcwjheZHoAFiwzyc/165GHvaNZf0VbITcNFOrg1syyqJ6Ee5GnvcPZ7/QKADYsUkh+ZJqwhpzi+M7XLSMZD3VrUUe90+n/hZuhtkxCeG4UCjAm3PLI3qS6gJlvZVtBNy0TCf8VKzFHXWN4joS6oNbM8ugeNAoQZnxCW6GnnYP579XLMVdtcwkfJTrAxvzimI60qlB2TFIoPgQd4+nfxbuhl41wmqy2yNLk/wELPSdZQ3VvkbuNl+nzxdwmKBIEfmBaTLbY4vSOkKq9R0lzZR8BOy3X+cPVr7GLkmRuUEo8JhgC9B4gOkxWaHOFj7Gr3cf54xU/ARttd0lQqqyWiPLk3sA6XGZ4AhQuMcvN9+mThb+hW31HWSM1Dxbo4tTOsKqchnmTpb/B2+32CAI0LlBKfGaYsoSe4PrM1S8hGw13aVNFv9Hr/YeZo7ROQHpsFggyJN7wytymuIKbbWdZQzUvEQv9FykzRV9heoyGuKLUzvDqHDYIEmR+QFmjpZ+B++3XyTNVb3ELHSc4wsT+4JqMtqhSdE5QKjwGH+Hr3ce5o5WPdpyqsM7U4vkHDTshX0VzaZe9i5Hv9cPaIC4UAnhmXEqw3uTyiJasu0FPdWMZBz0r0f/F06m3jZRiaFZMOiAeBPIYJjxKUG51g4m3rdvB/+UTOQcda3FPVq'
+  const b64of = (s: string) => Buffer.from(s, 'latin1').toString('base64')
+
+  it('(a) a data:image/png;base64 blob in structuredContent → envelope-hygiene PASSes', async () => {
+    const structured = { count: 3, preview: `data:image/png;base64,${PNG_B64}` }
+    const { checks, grade } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+    expect(grade).toBe('A+')
+  })
+
+  it('(a) an inline data:image/svg+xml and a data:font/woff2;base64 blob → envelope-hygiene PASSes', async () => {
+    const structured = {
+      count: 3,
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8"/></svg>',
+      font: `data:font/woff2;base64,${WOFF_B64}`,
+    }
+    const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(a) a data:image/png in content[].text (narration is the whole value) → envelope-hygiene PASSes', async () => {
+    const content = [{ type: 'text', text: `data:image/png;base64,${PNG_B64}` }]
+    const { checks } = await judge({ toolCallResult: defaultResult({ content }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(b) a data:text/plain;base64 that DECODES to an sk- key → envelope-hygiene still FAILs (and caps the grade)', async () => {
+    const structured = { count: 3, blob: `data:text/plain;base64,${SK_KEY_B64}` }
+    const { checks, grade } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('fail')
+    expect(detailOf(checks, 'mcp-ui-envelope-hygiene')).toMatch(/sk-|secret|credential|model-visible/i)
+    expect(['C', 'D', 'F']).toContain(grade)
+  })
+
+  it('(b) a data: URI whose RAW text carries a ya29. token or an AKIA key → envelope-hygiene still FAILs', async () => {
+    for (const raw of ['data:text/plain,ya29.a0AfB_longopaqueaccesstokenbody1234567890', 'data:text/plain,AKIAIOSFODNN7EXAMPLE']) {
+      const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: { count: 3, note: raw } }) })
+      expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), `${raw}: ${detailOf(checks, 'mcp-ui-envelope-hygiene')}`).toBe('fail')
+    }
+  })
+
+  it('(c) NO REGRESSION: the SAME base64 blob bare (not a data: URI) still FAILs as high-entropy', async () => {
+    const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: { count: 3, opaque: WOFF_B64 } }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('fail')
+  })
+
+  // (d) EVASION CLOSED (gate af8cb0ca): an OPAQUE high-entropy secret laundered inside a
+  //   TEXT-ish or tiny-binary data: URI is NOT exempted — the entropy heuristic still catches
+  //   it. The exemption is scoped to a media/binary MIME of plausible-media size.
+  it('(d) an OPAQUE secret laundered in the four data: URI wrappers → envelope-hygiene still FAILs', async () => {
+    const wrappers = [
+      `data:text/plain;base64,${b64of(OPAQUE_SECRET)}`,
+      `data:text/plain,${OPAQUE_SECRET}`,
+      `data:application/json;base64,${b64of(JSON.stringify({ token: OPAQUE_SECRET }))}`,
+      `data:application/octet-stream;base64,${b64of(OPAQUE_SECRET)}`,
+    ]
+    for (const blob of wrappers) {
+      const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: { count: 3, blob } }) })
+      expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), `${blob}: ${detailOf(checks, 'mcp-ui-envelope-hygiene')}`).toBe('fail')
+    }
+  })
+
+  it('(d) NO OVER-BLOCK: a REALISTIC ≥512-byte data:image/png and data:font/woff2 blob → envelope-hygiene PASSes', async () => {
+    const structured = { count: 3, img: `data:image/png;base64,${PNG_LARGE_B64}`, font: `data:font/woff2;base64,${FONT_LARGE_B64}` }
+    const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // (g) HARDENED linkage — a wrong-uri resource does NOT satisfy linkage.
 // ---------------------------------------------------------------------------
 
