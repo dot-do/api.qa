@@ -704,6 +704,63 @@ describe('envelope hygiene flags credential-shaped leaks in ANY model-visible ch
 })
 
 // ---------------------------------------------------------------------------
+// (f2) DATA: URI EXEMPTION (ax-17j) — a well-formed data: URI is inline CONTENT
+//   (an embedded image/font/SVG), not a credential-by-entropy. Its base64 payload
+//   must not false-flag as a high-entropy secret and FAIL hygiene; but a data: URI
+//   that CARRIES a recognizable credential (raw or base64-decoded) still FAILs.
+// ---------------------------------------------------------------------------
+
+describe('data: URI hygiene (ax-17j): inline content PASSes, smuggled credentials still FAIL', () => {
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+  const WOFF_B64 = 'dGhpcyBpcyBhIGZha2UgZm9udCBibG9iIGZvciB0ZXN0aW5nIHB1cnBvc2VzIG9ubHkgMTIzNDU='
+  // base64 of 'sk-live0deadbeefdeadbeef01234567' — a key smuggled inside a data: URI.
+  const SK_KEY_B64 = 'c2stbGl2ZTBkZWFkYmVlZmRlYWRiZWVmMDEyMzQ1Njc='
+
+  it('(a) a data:image/png;base64 blob in structuredContent → envelope-hygiene PASSes', async () => {
+    const structured = { count: 3, preview: `data:image/png;base64,${PNG_B64}` }
+    const { checks, grade } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+    expect(grade).toBe('A+')
+  })
+
+  it('(a) an inline data:image/svg+xml and a data:font/woff2;base64 blob → envelope-hygiene PASSes', async () => {
+    const structured = {
+      count: 3,
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8"/></svg>',
+      font: `data:font/woff2;base64,${WOFF_B64}`,
+    }
+    const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(a) a data:image/png in content[].text (narration is the whole value) → envelope-hygiene PASSes', async () => {
+    const content = [{ type: 'text', text: `data:image/png;base64,${PNG_B64}` }]
+    const { checks } = await judge({ toolCallResult: defaultResult({ content }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(b) a data:text/plain;base64 that DECODES to an sk- key → envelope-hygiene still FAILs (and caps the grade)', async () => {
+    const structured = { count: 3, blob: `data:text/plain;base64,${SK_KEY_B64}` }
+    const { checks, grade } = await judge({ toolCallResult: defaultResult({ structuredContent: structured }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('fail')
+    expect(detailOf(checks, 'mcp-ui-envelope-hygiene')).toMatch(/sk-|secret|credential|model-visible/i)
+    expect(['C', 'D', 'F']).toContain(grade)
+  })
+
+  it('(b) a data: URI whose RAW text carries a ya29. token or an AKIA key → envelope-hygiene still FAILs', async () => {
+    for (const raw of ['data:text/plain,ya29.a0AfB_longopaqueaccesstokenbody1234567890', 'data:text/plain,AKIAIOSFODNN7EXAMPLE']) {
+      const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: { count: 3, note: raw } }) })
+      expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), `${raw}: ${detailOf(checks, 'mcp-ui-envelope-hygiene')}`).toBe('fail')
+    }
+  })
+
+  it('(c) NO REGRESSION: the SAME base64 blob bare (not a data: URI) still FAILs as high-entropy', async () => {
+    const { checks } = await judge({ toolCallResult: defaultResult({ structuredContent: { count: 3, opaque: WOFF_B64 } }) })
+    expect(verdictOf(checks, 'mcp-ui-envelope-hygiene'), detailOf(checks, 'mcp-ui-envelope-hygiene')).toBe('fail')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // (g) HARDENED linkage — a wrong-uri resource does NOT satisfy linkage.
 // ---------------------------------------------------------------------------
 

@@ -382,6 +382,64 @@ describe('envelope hygiene: a leaked secret in any part FAILs', () => {
 })
 
 // ---------------------------------------------------------------------------
+// (f2) DATA: URI EXEMPTION (ax-17j) — a well-formed data: URI is inline CONTENT,
+//   not a credential-by-entropy. Its base64 payload must not false-flag as a
+//   high-entropy secret; but a data: URI CARRYING a recognizable credential
+//   (raw or base64-encoded) still FAILs.
+// ---------------------------------------------------------------------------
+
+// A 1x1 transparent PNG, an inline SVG, and a font blob — legit inline content.
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+const WOFF_B64 = 'dGhpcyBpcyBhIGZha2UgZm9udCBibG9iIGZvciB0ZXN0aW5nIHB1cnBvc2VzIG9ubHkgMTIzNDU='
+// base64 of the literal 'sk-live0deadbeefdeadbeef01234567' — a key smuggled inside a data: URI.
+const SK_KEY_B64 = 'c2stbGl2ZTBkZWFkYmVlZmRlYWRiZWVmMDEyMzQ1Njc='
+
+describe('data: URI hygiene (ax-17j): inline content PASSes, smuggled credentials still FAIL', () => {
+  it('(a) a data:image/png;base64 blob in a tool-output → hygiene PASSes (not a high-entropy credential)', async () => {
+    const parts = [{ type: 'tool-output-available', toolCallId: 'c1', output: { thumbnail: `data:image/png;base64,${PNG_B64}`, count: 3 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(a) an inline data:image/svg+xml (no base64) → hygiene PASSes', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8"/></svg>', count: 3 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(a) a data:font/woff2;base64 blob → hygiene PASSes', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { font: `data:font/woff2;base64,${WOFF_B64}`, count: 3 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('pass')
+  })
+
+  it('(b) a data:text/plain;base64 that DECODES to an sk- key → hygiene still FAILs', async () => {
+    const parts = [{ type: 'tool-output-available', toolCallId: 'c1', output: { blob: `data:text/plain;base64,${SK_KEY_B64}` } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+    expect(detailOf(checks, 'ui-stream-envelope-hygiene')).toMatch(/sk-|secret|credential/i)
+  })
+
+  it('(b) a data: URI whose RAW text carries a ya29. token → hygiene still FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { note: 'data:text/plain,ya29.a0AfB_longopaqueaccesstokenbody1234567890' } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(b) a data: URI whose RAW text carries an AKIA key → hygiene still FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { note: 'data:text/plain,AKIAIOSFODNN7EXAMPLE' } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(c) NO REGRESSION: the SAME base64 blob bare (not a data: URI) still FAILs as high-entropy', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { opaque: WOFF_B64 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // (g) PROJECTION-PARITY — output must match the JSON twin; SKIP when no twin.
 // ---------------------------------------------------------------------------
 

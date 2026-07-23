@@ -2073,13 +2073,68 @@ function looksHighEntropy(raw: string): boolean {
 }
 
 /**
+ * A WELL-FORMED `data:` URI — `data:<mime>[;param=val…][;base64],<payload>`. A
+ * data: URI is inline CONTENT (an embedded image/font/SVG), NOT a credential:
+ * its base64 payload is high-entropy by nature and must not, by its ENTROPY
+ * ALONE, read as a leaked secret. This is a narrow benign-SHAPE guard (like
+ * `looksBenignDotted`) — it exempts a data: URI from the entropy heuristic only;
+ * the VALUE_SECRET_PATTERNS scan (raw + decoded payload) still applies, so a
+ * credential SMUGGLED inside a data: URI is still caught. Anchored at the start
+ * and requiring a `<type>/<subtype>` media type + a comma, so a bare `data:`
+ * prefix or an arbitrary base64 blob does NOT qualify.
+ */
+const DATA_URI_RE = /^data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[a-z0-9-]+=[^,;]*)*(;base64)?,/i
+
+/** Cap on the base64 payload we decode-and-scan (bytes of base64 text), bounding cost. */
+const MAX_DATA_URI_B64 = 256 * 1024
+
+/** Parse a well-formed data: URI, returning its base64 flag + raw payload, else null. */
+function parseWellFormedDataUri(s: string): { base64: boolean; payload: string } | undefined {
+  const m = DATA_URI_RE.exec(s)
+  if (!m) return undefined
+  return { base64: Boolean(m[1]), payload: s.slice(m[0].length) }
+}
+
+/**
+ * Decode a base64 data: URI payload to a byte-preserving (latin1) string for a
+ * credential-pattern scan. BOUNDED: only the first MAX_DATA_URI_B64 chars are
+ * decoded (a whole 4-char-aligned slice), so a huge embedded image is not fully
+ * expanded. Returns undefined on undecodable input.
+ */
+function decodeDataUriBase64(payload: string): string | undefined {
+  let b64 = payload.length > MAX_DATA_URI_B64 ? payload.slice(0, MAX_DATA_URI_B64) : payload
+  b64 = b64.replace(/[^A-Za-z0-9+/=]/g, '') // strip whitespace/newlines a data: payload may carry
+  b64 = b64.slice(0, b64.length - (b64.length % 4)) // 4-char align so atob never rejects a sliced tail
+  if (!b64) return undefined
+  try {
+    return atob(b64)
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * A credential label if `s` — or any whitespace-delimited token WITHIN it —
  * matches a value-shape heuristic, else undefined. Tokenizing catches a
  * credential embedded in narration text (e.g. `content[].text`), not only a
  * value that IS the credential.
  */
 function valueSecretLabel(s: string): string | undefined {
+  // Known credential SHAPES always win — scanned against the raw text first, so a
+  // data: URI whose RAW payload carries e.g. `ya29.…`/`AKIA…` is caught regardless.
   for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(s)) return label
+  // Benign-shape guard: a value that IS a well-formed data: URI is inline content,
+  // EXEMPT from the entropy heuristic (its base64 payload is high-entropy by
+  // nature). Still scan the DECODED base64 payload for known credential patterns
+  // so a key smuggled as `data:text/plain;base64,<sk-…>` is not laundered through.
+  const dataUri = parseWellFormedDataUri(s.trim())
+  if (dataUri) {
+    if (dataUri.base64) {
+      const decoded = decodeDataUriBase64(dataUri.payload)
+      if (decoded) for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(decoded)) return `${label} (base64-encoded inside a data: URI)`
+    }
+    return undefined
+  }
   for (const tok of s.split(/[\s"'`<>(){}\[\],;]+/)) {
     if (looksHighEntropy(tok)) return 'high-entropy credential-like string'
   }
