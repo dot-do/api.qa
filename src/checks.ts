@@ -2073,26 +2073,63 @@ function looksHighEntropy(raw: string): boolean {
 }
 
 /**
- * A WELL-FORMED `data:` URI — `data:<mime>[;param=val…][;base64],<payload>`. A
- * data: URI is inline CONTENT (an embedded image/font/SVG), NOT a credential:
- * its base64 payload is high-entropy by nature and must not, by its ENTROPY
- * ALONE, read as a leaked secret. This is a narrow benign-SHAPE guard (like
- * `looksBenignDotted`) — it exempts a data: URI from the entropy heuristic only;
- * the VALUE_SECRET_PATTERNS scan (raw + decoded payload) still applies, so a
- * credential SMUGGLED inside a data: URI is still caught. Anchored at the start
- * and requiring a `<type>/<subtype>` media type + a comma, so a bare `data:`
- * prefix or an arbitrary base64 blob does NOT qualify.
+ * A WELL-FORMED `data:` URI — `data:<mime>[;param=val…][;base64],<payload>`.
+ * Group 1 captures the `<type>/<subtype>` MIME; group 2 the `;base64` flag.
+ * Anchored at the start and requiring a `<type>/<subtype>` media type + a comma,
+ * so a bare `data:` prefix or an arbitrary base64 blob does NOT qualify.
+ *
+ * A data: URI CAN be legitimate inline media (an embedded image/font/PDF) whose
+ * payload is high-entropy binary by nature — that must not, by ENTROPY ALONE,
+ * read as a leaked secret. But the exemption is NARROW and MIME-scoped (see
+ * `isMediaBinaryMime` + `MIN_MEDIA_DATA_URI_BYTES`): a text-ish MIME
+ * (text/*, application/json, …) earns NO entropy exemption, so an OPAQUE
+ * high-entropy secret laundered as `data:text/plain;base64,<opaque>` is still
+ * caught. The VALUE_SECRET_PATTERNS scan (raw + decoded payload) applies to ALL
+ * data: URIs, so a KNOWN key smuggled inside one is always caught.
  */
-const DATA_URI_RE = /^data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[a-z0-9-]+=[^,;]*)*(;base64)?,/i
+const DATA_URI_RE = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)(?:;[a-z0-9-]+=[^,;]*)*(;base64)?,/i
+
+/**
+ * MIME types where a HIGH-ENTROPY payload is the NORM (real inline media/binary),
+ * so entropy alone must not read as a secret. `image/*`, `audio/*`, `video/*`,
+ * `font/*`, `model/*` qualify by top-level type; binary `application/*` needs an
+ * explicit allow-list entry (below). Everything text-ish — text/*, application/
+ * json|xml|javascript, application/*+json/+xml, x-www-form-urlencoded, … — is
+ * DELIBERATELY absent, so it earns no exemption and stays subject to the entropy
+ * heuristic (closing the opaque-secret-laundering evasion).
+ */
+const MEDIA_BINARY_APPLICATION_MIMES = new Set([
+  'application/pdf',
+  'application/wasm',
+  'application/zip',
+  'application/ogg',
+  'application/octet-stream',
+])
+function isMediaBinaryMime(mime: string): boolean {
+  const type = mime.slice(0, mime.indexOf('/'))
+  if (type === 'image' || type === 'audio' || type === 'video' || type === 'font' || type === 'model') return true
+  return MEDIA_BINARY_APPLICATION_MIMES.has(mime)
+}
+
+/**
+ * Minimum plausible-media size (decoded bytes, or raw payload chars when not
+ * base64) for the entropy exemption. A real inline image/font/pdf is comfortably
+ * ≥512 bytes; a laundered 40–100-char opaque secret decodes to only ~30–75
+ * bytes. Below this bar a media/binary MIME earns NO exemption — closing the
+ * "claim image/octet-stream but carry a tiny secret" vector — while a genuinely
+ * tiny legit blob (a 1×1 PNG) still passes because its DECODED bytes are binary
+ * (outside the base64 charset) and so do not read as high-entropy anyway.
+ */
+const MIN_MEDIA_DATA_URI_BYTES = 512
 
 /** Cap on the base64 payload we decode-and-scan (bytes of base64 text), bounding cost. */
 const MAX_DATA_URI_B64 = 256 * 1024
 
-/** Parse a well-formed data: URI, returning its base64 flag + raw payload, else null. */
-function parseWellFormedDataUri(s: string): { base64: boolean; payload: string } | undefined {
+/** Parse a well-formed data: URI, returning its (lowercased) MIME + base64 flag + raw payload, else null. */
+function parseWellFormedDataUri(s: string): { mime: string; base64: boolean; payload: string } | undefined {
   const m = DATA_URI_RE.exec(s)
   if (!m) return undefined
-  return { base64: Boolean(m[1]), payload: s.slice(m[0].length) }
+  return { mime: (m[1] ?? '').toLowerCase(), base64: Boolean(m[2]), payload: s.slice(m[0].length) }
 }
 
 /**
@@ -2123,15 +2160,30 @@ function valueSecretLabel(s: string): string | undefined {
   // Known credential SHAPES always win — scanned against the raw text first, so a
   // data: URI whose RAW payload carries e.g. `ya29.…`/`AKIA…` is caught regardless.
   for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(s)) return label
-  // Benign-shape guard: a value that IS a well-formed data: URI is inline content,
-  // EXEMPT from the entropy heuristic (its base64 payload is high-entropy by
-  // nature). Still scan the DECODED base64 payload for known credential patterns
-  // so a key smuggled as `data:text/plain;base64,<sk-…>` is not laundered through.
+  // A value that IS a well-formed data: URI. The entropy exemption here is NARROW
+  // — granted ONLY for genuine media/binary content, never for a text-ish MIME —
+  // so an OPAQUE high-entropy secret laundered as `data:text/plain;base64,<opaque>`
+  // (or text/plain raw, application/json, a tiny "octet-stream", …) stays subject
+  // to the entropy heuristic and still FAILs.
   const dataUri = parseWellFormedDataUri(s.trim())
   if (dataUri) {
-    if (dataUri.base64) {
-      const decoded = decodeDataUriBase64(dataUri.payload)
-      if (decoded) for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(decoded)) return `${label} (base64-encoded inside a data: URI)`
+    // (4) KNOWN patterns are scanned for EVERY data: URI: the raw text was already
+    // scanned above (so a raw `ya29.…`/`AKIA…` is caught); also scan the
+    // base64-DECODED payload so a key smuggled as `data:…;base64,<sk-…>` is caught.
+    const decoded = dataUri.base64 ? decodeDataUriBase64(dataUri.payload) : undefined
+    if (decoded) for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(decoded)) return `${label} (base64-encoded inside a data: URI)`
+    // (1)+(2) Entropy exemption ONLY for a recognized media/binary MIME whose
+    // payload is a plausible-media SIZE. A text-ish MIME, or a media MIME too
+    // small to be real inline media, does NOT qualify.
+    const payloadBytes = decoded ? decoded.length : dataUri.payload.length
+    if (isMediaBinaryMime(dataUri.mime) && payloadBytes >= MIN_MEDIA_DATA_URI_BYTES) return undefined
+    // (3) Not exempt: apply the entropy heuristic to the payload (decoded when
+    // base64, else the raw payload). An opaque high-entropy payload FAILs; a
+    // low-entropy text data: URI (`data:text/plain,Hello World`, a tiny 1×1 PNG
+    // whose decoded bytes are binary) still PASSes.
+    const entropyTarget = decoded ?? dataUri.payload
+    for (const tok of entropyTarget.split(/[\s"'`<>(){}\[\],;]+/)) {
+      if (looksHighEntropy(tok)) return 'high-entropy credential-like string'
     }
     return undefined
   }

@@ -393,6 +393,16 @@ const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9
 const WOFF_B64 = 'dGhpcyBpcyBhIGZha2UgZm9udCBibG9iIGZvciB0ZXN0aW5nIHB1cnBvc2VzIG9ubHkgMTIzNDU='
 // base64 of the literal 'sk-live0deadbeefdeadbeef01234567' — a key smuggled inside a data: URI.
 const SK_KEY_B64 = 'c2stbGl2ZTBkZWFkYmVlZmRlYWRiZWVmMDEyMzQ1Njc='
+// An OPAQUE 43-char high-entropy secret with NO known VALUE_SECRET_PATTERNS prefix —
+// exactly what the entropy heuristic exists to catch. It must FAIL both bare AND when
+// laundered inside a text/json/tiny-binary data: URI (the ax-17j evasion, gate af8cb0ca).
+const OPAQUE_SECRET = 'Xk7Qm2Zp9Rf4Vb8Nc1Ld6Wg0Ht3Jy5Uq7Es2Ao4Ti'
+// A REALISTIC ≥512-byte inline image (16×16 PNG, 671 decoded bytes) — legit high-entropy
+// media that must stay EXEMPT from the entropy heuristic.
+const PNG_LARGE_B64 = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACZklEQVR4nA3MkYI0OxCA0cYfg4vBxeBgcDA4WNhY2FjYWNgYHAwOBgeDi8GLeYPv9nmAs23bRtj+EbdA2n7IW6Rsv8iW0O2BbRnfntSt0LYXfRPGtjM3ZW0H2xb+EUIghh9SiOTwSwkJCQ80ZCw88VCo4UULQg87IygzHKxgdxADIf4QYyTFX3JMlPhAYkbjE4sFjy9qFFrc6VEZ8WBGY8XzDtIPIUVi+iWlRE4PSspIeqKpYOmFJ6GmnZaUng5GMmY6WcnvIEdC/iXmRMoPcs6U/ERyQfMLy4LnnZqVlg96NkY+mdlZ+bqD8ksoiVgepJLJ5UkpBSkvtAhWdrwotRy0YvRyMoozy8Uq9Q4kEeRBlEySJ1kKRV6ICCo7JorLQRWjyUkXZ8jFlMqS9x3og6CZqE+SFrK+KCqI7qgqpgeuRtWTpk7Xi6GVqW+WtjuwTLAn0QrJXmQTiu2IKWoHZobbSTWn2UW3yrA30xrLPnfgT4IXor9ILmTfKa6IH6gb5ifuTvWL5pXub4Y3pn9Y3u+gFkJ9EauQ6k6uSqkHUg2tJ1Ydrxe1Vlp902tj1A+zdlb93kF7EZoQ205qSm4HpRnSTrQ51i68VWp701qjtw+jdWb7stq4gy6EvhO7kvpB7kbpJ9Id7RfWK97f1N5o/UPvndG/zD5Y/e8Oxk4YShwHaRh5nJThyLjQUbHxxkejjg9tdPr4MsZgjj/WmHcwlTAP4jTSPMnTKfNCZkXnG5sNnx/q7LT5pc/BmH/MOVnzvztYB2EZcZ2k5eR1UVZF1htdDVsffHXq+tLWoK8/xprM9R9rLf4HPKlnH95EcQMAAAAASUVORK5CYII='
+// A ≥512-byte binary font-ish blob (600 decoded bytes) — legit high-entropy media.
+const FONT_LARGE_B64 = 'KYrrTK0Ob9Awk/JVtBd22TuY+V6/HH3iQqEAZ8YlhOtNrg9oySqL9FS3FnHQM5L9X7wdets4mQZmxSSD4kGgD2HCI4TlRqcYeNs6nfxfvhFz0DGW91S1KorpSK8ObcwjheZHoAFiwzyc/165GHvaNZf0VbITcNFOrg1syyqJ6Ee5GnvcPZ7/QKADYsUkh+ZJqwhpzi+M7XLSMZD3VrUUe90+n/hZuhtkxCeG4UCjAm3PLI3qS6gJlvZVtBNy0TCf8VKzFHXWN4joS6oNbM8ugeNAoQZnxCW6GnnYP579XLMVdtcwkfJTrAxvzimI60qlB2TFIoPgQd4+nfxbuhl41wmqy2yNLk/wELPSdZQ3VvkbuNl+nzxdwmKBIEfmBaTLbY4vSOkKq9R0lzZR8BOy3X+cPVr7GLkmRuUEo8JhgC9B4gOkxWaHOFj7Gr3cf54xU/ARttd0lQqqyWiPLk3sA6XGZ4AhQuMcvN9+mThb+hW31HWSM1Dxbo4tTOsKqchnmTpb/B2+32CAI0LlBKfGaYsoSe4PrM1S8hGw13aVNFv9Hr/YeZo7ROQHpsFggyJN7wytymuIKbbWdZQzUvEQv9FykzRV9heoyGuKLUzvDqHDYIEmR+QFmjpZ+B++3XyTNVb3ELHSc4wsT+4JqMtqhSdE5QKjwGH+Hr3ce5o5WPdpyqsM7U4vkHDTshX0VzaZe9i5Hv9cPaIC4UAnhmXEqw3uTyiJasu0FPdWMZBz0r0f/F06m3jZRiaFZMOiAeBPIYJjxKUG51g4m3rdvB/+UTOQcda3FPVq'
+const b64of = (s: string) => Buffer.from(s, 'latin1').toString('base64')
 
 describe('data: URI hygiene (ax-17j): inline content PASSes, smuggled credentials still FAIL', () => {
   it('(a) a data:image/png;base64 blob in a tool-output → hygiene PASSes (not a high-entropy credential)', async () => {
@@ -436,6 +446,39 @@ describe('data: URI hygiene (ax-17j): inline content PASSes, smuggled credential
     const parts = [{ type: 'data-widgets', id: 'd1', data: { opaque: WOFF_B64 } }]
     const { checks } = await judge({ parts })
     expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  // (d) EVASION CLOSED (gate af8cb0ca): an OPAQUE high-entropy secret laundered inside a
+  //   TEXT-ish or tiny-binary data: URI must NOT be exempted — the entropy heuristic still
+  //   catches it. The MIME-scoped + size-scoped exemption only covers genuine inline media.
+  it('(d) an OPAQUE secret laundered as data:text/plain;base64 → hygiene still FAILs (not exempt)', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { blob: `data:text/plain;base64,${b64of(OPAQUE_SECRET)}` } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(d) an OPAQUE secret as raw data:text/plain,<opaque> → hygiene still FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { blob: `data:text/plain,${OPAQUE_SECRET}` } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(d) an OPAQUE secret in data:application/json;base64,{token:…} → hygiene still FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { blob: `data:application/json;base64,${b64of(JSON.stringify({ token: OPAQUE_SECRET }))}` } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(d) an OPAQUE secret in a TINY data:application/octet-stream;base64 → hygiene still FAILs (below media-size floor)', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { blob: `data:application/octet-stream;base64,${b64of(OPAQUE_SECRET)}` } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('(d) NO OVER-BLOCK: a REALISTIC ≥512-byte data:image/png and data:font/woff2 blob → hygiene PASSes (legit media exempt)', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { img: `data:image/png;base64,${PNG_LARGE_B64}`, font: `data:font/woff2;base64,${FONT_LARGE_B64}`, count: 3 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('pass')
   })
 })
 
