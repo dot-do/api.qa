@@ -215,6 +215,22 @@ describe('transport: the v1 stream header + SSE content-type are enforced', () =
     const { grade } = await judge({ header: null, twin: WIDGETS })
     expect(grade).not.toBe('A+')
   })
+
+  it('a NON-2xx status (500) with an otherwise-valid v1 SSE stream → transport FAILs (response.ok is false)', async () => {
+    const { checks } = await judge({ status: 500, twin: WIDGETS })
+    expect(verdictOf(checks, 'ui-stream-transport'), detailOf(checks, 'ui-stream-transport')).toBe('fail')
+    expect(detailOf(checks, 'ui-stream-transport')).toMatch(/500|non-2xx|response\.ok/i)
+    // the downstream sub-signals do NOT false-pass on a non-consumable stream
+    expect(verdictOf(checks, 'ui-stream-framing')).toBe('skip')
+    expect(verdictOf(checks, 'ui-stream-part-shapes')).toBe('skip')
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene')).toBe('skip')
+  })
+
+  it('a NON-2xx status (404) with a valid stream → transport FAILs and caps the grade', async () => {
+    const { checks, grade } = await judge({ status: 404, twin: WIDGETS })
+    expect(verdictOf(checks, 'ui-stream-transport')).toBe('fail')
+    expect(grade).not.toBe('A+')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -256,6 +272,22 @@ describe('framing: SSE framing + a bare [DONE] terminal are enforced', () => {
     const { checks } = await judge({ body })
     expect(verdictOf(checks, 'ui-stream-framing')).toBe('fail')
     expect(detailOf(checks, 'ui-stream-framing')).toMatch(/type|no typed data/i)
+  })
+
+  it('standard SSE fields (event:/id:/retry:) interleaved with valid data: chunks → framing PASSes (ignored, non-fatal)', async () => {
+    const body =
+      `event: message\n` +
+      `id: 42\n` +
+      `data: ${JSON.stringify({ type: 'start' })}\n\n` +
+      `retry: 1500\n` +
+      `data: ${JSON.stringify({ type: 'text-start', id: 't1' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'text-delta', id: 't1', delta: 'hi' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'text-end', id: 't1' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'finish' })}\n\n` +
+      `data: [DONE]\n\n`
+    const { checks } = await judge({ body })
+    expect(verdictOf(checks, 'ui-stream-framing'), detailOf(checks, 'ui-stream-framing')).toBe('pass')
+    expect(verdictOf(checks, 'ui-stream-part-shapes')).toBe('pass')
   })
 })
 
@@ -328,6 +360,25 @@ describe('envelope hygiene: a leaked secret in any part FAILs', () => {
     const { grade } = await judge({ parts })
     expect(grade).not.toBe('A+')
   })
+
+  it('a dotted ya29. Google OAuth token under a BENIGN field name (note) → hygiene FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { note: 'ya29.a0AfB_longopaqueaccesstokenbody1234567890', count: 3 } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+    expect(detailOf(checks, 'ui-stream-envelope-hygiene')).toMatch(/secret|credential|ya29/i)
+  })
+
+  it('a dotted 1// Google OAuth refresh token under a benign field name → hygiene FAILs', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { ref: '1//0longopaquerefreshtokenbody1234567890abcd' } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene')).toBe('fail')
+  })
+
+  it('benign DOTTED strings (domain / version / dotted field-path) do NOT false-positive → hygiene PASSes', async () => {
+    const parts = [{ type: 'data-widgets', id: 'd1', data: { homepage: 'api.example.com', version: 'v1.2.3-beta.4', path: 'a.b.c', pkg: 'com.example.myapp' } }]
+    const { checks } = await judge({ parts })
+    expect(verdictOf(checks, 'ui-stream-envelope-hygiene'), detailOf(checks, 'ui-stream-envelope-hygiene')).toBe('pass')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -338,6 +389,22 @@ describe('projection-parity: tool-output-available output vs the JSON twin', () 
   it('output CONSISTENT with the twin → parity PASSes', async () => {
     const { checks } = await judge({ twin: WIDGETS })
     expect(verdictOf(checks, 'ui-stream-parity')).toBe('pass')
+  })
+
+  it('an ENVELOPED twin {ok:true,data:WIDGETS} vs an output emitting the WIDGETS slice → parity PASSes (single-level unwrap)', async () => {
+    const { checks } = await judge({ twin: { ok: true, data: WIDGETS } })
+    expect(verdictOf(checks, 'ui-stream-parity'), detailOf(checks, 'ui-stream-parity')).toBe('pass')
+  })
+
+  it('a twin wrapping the slice under `result` → parity PASSes', async () => {
+    const { checks } = await judge({ twin: { result: WIDGETS } })
+    expect(verdictOf(checks, 'ui-stream-parity'), detailOf(checks, 'ui-stream-parity')).toBe('pass')
+  })
+
+  it('a GENUINE divergence inside an envelope ({ok,data:DIFFERENT}) still FAILs (unwrap is not a blanket pass)', async () => {
+    const { checks } = await judge({ twin: { ok: true, data: { count: 4, widgets: [{ id: 'x' }] } } })
+    expect(verdictOf(checks, 'ui-stream-parity')).toBe('fail')
+    expect(detailOf(checks, 'ui-stream-parity')).toMatch(/diverge|register divergence/i)
   })
 
   it('output DIVERGENT from the twin → parity FAILs', async () => {
