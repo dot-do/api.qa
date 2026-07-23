@@ -220,20 +220,61 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     //    Keyless requires a POSITIVE 2xx signal (not merely "not a 401"): a 401
     //    with no WWW-Authenticate, or an unresolved probe, is NEVER read as
     //    keyless — it stays PROTECTED(-but-broken) and FAILS the OAuth checks.
+    //    ax-q4t POST-only streamable-HTTP MCP: a spec-legal server with no
+    //    server-initiated SSE answers the unauthenticated GET with 405 (or another
+    //    non-2xx/non-401) yet still answers a real JSON-RPC initialize over
+    //    unauthenticated POST. When the GET gives NEITHER a clear keyless (2xx) NOR
+    //    a clear protected (401/403 / WWW-Authenticate) signal, the decision falls
+    //    to the unauthenticated POST-initialize probe (ROLE.mcpUnauthInit — fetched
+    //    ONCE in observeTarget, only in this undecided case, SSRF-gated):
+    //      POST 2xx + a JSON-RPC initialize RESULT that is itself a real MCP
+    //      InitializeResult (no error; result is a non-null OBJECT carrying
+    //      `protocolVersion`)                                    => KEYLESS (POST-only)
+    //                                                            => OAuth siblings SKIP.
+    //      POST 401/403 / WWW-Authenticate                     => PROTECTED
+    //                                                            => OAuth siblings APPLY (no SKIP).
+    //      POST 5xx / 404 / garbage / non-JSON-RPC, OR a 2xx result
+    //      that is null / a primitive / an object with no
+    //      protocolVersion                                     => NOT keyless
+    //                                                            => no free SKIP; graded as before.
     const unauthStatus = unauthEv?.status ?? null
     const unauthWww = unauthEv?.headers['www-authenticate']
-    const mcpChallengesAuth =
+    const getKeyless = unauthStatus !== null && unauthStatus >= 200 && unauthStatus < 300
+    const getChallengesAuth =
       unauthStatus === 401 ||
       unauthStatus === 403 ||
       (typeof unauthWww === 'string' && unauthWww.length > 0)
+    // The GET gave no clear keyless/protected signal — consult the POST probe.
+    const getUndecided = !getKeyless && !getChallengesAuth
+    const postInitEv = findEvidence(bundle, ROLE.mcpUnauthInit)
+    const postInitStatus = postInitEv?.status ?? null
+    const postInitWww = postInitEv?.headers['www-authenticate']
+    const postInitMsg = parseMcpMessage(postInitEv)
+    // Genuine keyless POST-only MCP: 2xx AND a JSON-RPC initialize RESULT that is
+    // ITSELF a real MCP InitializeResult — a non-null OBJECT carrying
+    // `protocolVersion` (the one REQUIRED field of MCP's InitializeResult; see
+    // isMcpInitializeResult below). NOT a JSON-RPC error, NOT a non-2xx/non-JSON
+    // body, and NOT a degenerate result (null, a primitive, or an object with no
+    // protocolVersion) — a broken initialize that never returns a usable result
+    // must not earn a free SKIP; it falls through to be graded as before.
+    const postInitKeyless =
+      postInitStatus !== null &&
+      postInitStatus >= 200 &&
+      postInitStatus < 300 &&
+      !!postInitMsg &&
+      postInitMsg.error === undefined &&
+      isMcpInitializeResult(postInitMsg.result)
+    const postInitChallengesAuth =
+      postInitStatus === 401 ||
+      postInitStatus === 403 ||
+      (typeof postInitWww === 'string' && postInitWww.length > 0)
+    const mcpChallengesAuth = getChallengesAuth || (getUndecided && postInitChallengesAuth)
     const isKeylessMcp =
       isRemote &&
       !remoteNoUrl &&
       !mcpViolation &&
       !mcpChallengesAuth &&
-      unauthStatus !== null &&
-      unauthStatus >= 200 &&
-      unauthStatus < 300
+      (getKeyless || (getUndecided && postInitKeyless))
 
     // Consistent skip/violation gate for every MCP-OAuth sibling check.
     const mcpCheck = (
@@ -258,9 +299,12 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       } else if (mcpViolation) {
         result = { verdict: 'fail', detail: mcpViolation }
       } else if (isKeylessMcp) {
+        const via = getKeyless
+          ? `the unauthenticated MCP GET returned ${unauthStatus} with no auth challenge`
+          : `the unauthenticated MCP GET returned ${unauthStatus} but an unauthenticated POST initialize returned ${postInitStatus} with a JSON-RPC result (POST-only streamable-HTTP MCP)`
         result = {
           verdict: 'skip',
-          detail: `keyless MCP (No-ask Zone, AXP Clause 7) — the unauthenticated MCP request returned ${unauthStatus} with no auth challenge; OAuth 2.1 is not required for a keyless-first-value surface`,
+          detail: `keyless MCP (No-ask Zone, AXP Clause 7) — ${via}; OAuth 2.1 is not required for a keyless-first-value surface`,
         }
       } else {
         result = judge()
@@ -1100,6 +1144,27 @@ function parseMcpMessage(ev: Evidence | undefined): Record<string, unknown> | un
     } catch { /* ignore non-JSON data lines */ }
   }
   return found
+}
+
+/**
+ * True when a JSON-RPC `result` looks like a genuine MCP InitializeResult: a
+ * non-null OBJECT (not an array, not a primitive) carrying `protocolVersion` —
+ * the one REQUIRED field of MCP's InitializeResult (serverInfo/capabilities are
+ * optional and not required here). Used to gate the ax-q4t keyless-POST-only
+ * detection (checks.ts ~251) so a degenerate/broken unauthenticated initialize
+ * — `result: null`, a primitive result, or an object missing protocolVersion —
+ * is NEVER read as a genuine keyless MCP handshake (no free SKIP; graded as
+ * before). mcp-remote-live (judgeMcpRemoteLive, below) grades a DECLARED
+ * server.json remote differently — reachability + tools/list is its signal,
+ * since a `mcp-declared` server is already known to exist — so it does not
+ * need this same-shape check; this helper is specific to the unauthenticated
+ * keyless-detection probe, which has no other evidence that the answering
+ * endpoint is a real MCP server.
+ */
+function isMcpInitializeResult(result: unknown): result is Record<string, unknown> {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return false
+  const protocolVersion = (result as Record<string, unknown>).protocolVersion
+  return typeof protocolVersion === 'string' && protocolVersion.length > 0
 }
 
 /** The `result.tools[]` (each tool's `name`) advertised by a tools/list message. */
