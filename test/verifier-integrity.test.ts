@@ -209,8 +209,24 @@ describe('(a) SSRF — a hostile url in every SAME-ORIGIN-gated card field is re
           expect(hostsOf(calls).every((h) => h === 'good.example')).toBe(true)
           // No credential/metadata body captured.
           expect(noSecretLeak(bundle)).toBe(true)
-          // The surface fails closed (never a false pass).
-          expect(verdictOf(checks, failedCheck), `${failedCheck}: ${detailOf(checks, failedCheck)}`).not.toBe('pass')
+          if (failedCheck === 'ui-stream-transport') {
+            // uiMessageStream.url is dropped BEFORE any fetch (the same-origin
+            // gate in observeUiStream / isPubliclyRoutableSameOrigin), so no
+            // stream evidence is EVER recorded for this fixture and
+            // ui-stream-transport honestly SKIPs (declared: false) — it can
+            // never reach 'pass' regardless of whether the *internal* judge
+            // logic (header/content-type checks) is correct, so asserting
+            // "not pass" here is not a discriminator on this check. The two
+            // assertions above (no off-origin call, no leaked secret) ARE the
+            // load-bearing SSRF property this row guards — they fail if the
+            // same-origin drop at observeUiStream ever lets the hostile url
+            // through. Assert the honest, correct outcome explicitly instead
+            // of a vague "not pass" that would pass even if this were broken.
+            expect(verdictOf(checks, failedCheck), `${failedCheck}: ${detailOf(checks, failedCheck)}`).toBe('skip')
+          } else {
+            // The surface fails closed (never a false pass).
+            expect(verdictOf(checks, failedCheck), `${failedCheck}: ${detailOf(checks, failedCheck)}`).not.toBe('pass')
+          }
         })
       }
     })
@@ -812,7 +828,17 @@ describe('(d) session-bug regressions — a false pass on any = the fix regresse
   })
 
   it('ax-7vu: an opaque secret padded past the size floor under data:image/png does not earn the media exemption', async () => {
-    const secret = 'sk-' + 'A'.repeat(48) // a KNOWN sk- key-shaped opaque secret
+    // Deliberately GENERIC opaque high-entropy (mixed-case + digits, dot-free) —
+    // NOT a known credential SHAPE (no sk-/AKIA/gh*_/xox*-/ya29./1//… prefix), so
+    // it matches NO VALUE_SECRET_PATTERNS entry and is NOT caught by the raw/
+    // base64 pattern scan (checks.ts valueSecretLabel) before the media-exemption
+    // path runs. That forces this fixture through isMediaBinaryMime + the size
+    // floor + mediaBytesMatchMime — the padded payload is NOT real PNG bytes, so
+    // ONLY the ax-7vu magic-byte check (mediaBytesMatchMime) denies the media
+    // exemption and lets the entropy heuristic catch it. If mediaBytesMatchMime
+    // were ever dropped, isMediaBinaryMime('image/png') + the size floor alone
+    // would grant the exemption and this would false-PASS.
+    const secret = 'aB3fG7hK2mN9pQ4rS8tU1vW6xY0zC5dE2fH7jL4nP9qR3sTz'
     const dataUri = `data:image/png;base64,${Buffer.from(secret + 'B'.repeat(600)).toString('base64')}`
     const { checks } = await judgeMcpUi({ structuredContent: { icon: dataUri, count: 3, widgets: [{ id: 'w1' }] } })
     expect(verdictOf(checks, 'mcp-ui-envelope-hygiene')).toBe('fail')
