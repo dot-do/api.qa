@@ -475,6 +475,62 @@ describe('ax-q4t: GET 405 + unauthenticated POST initialize decides keyless vs p
     for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
   })
 
+  // (LOW gate finding) A degenerate/broken unauthenticated POST initialize —
+  // result: null, a primitive result, or an object missing the REQUIRED
+  // protocolVersion field — is NOT a genuine keyless MCP handshake. Without this
+  // shape check, a broken server that never returns a usable initialize result
+  // would earn a free SKIP on all six mcp-oauth checks instead of being graded.
+  it('(c) GET 405 + POST initialize 2xx with result: null → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":null}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).toBe('fail')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with a PRIMITIVE result ("ok") → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":"ok"}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with an EMPTY object result ({}) → NOT keyless (no protocolVersion)', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with an object result but NO protocolVersion → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{"foo":1}}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(a) GET 405 + POST initialize 2xx WITH protocolVersion (the genuine apps.ax case) → KEYLESS, SKIP', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: INIT_RESULT,
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+  })
+
   // The unauthenticated POST-initialize probe records evidence under this exact
   // role — a precise signal of whether the ax-q4t probe fired (distinct from the
   // MCP-UI/registry handshake POSTs to the same url).

@@ -227,11 +227,15 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     //    a clear protected (401/403 / WWW-Authenticate) signal, the decision falls
     //    to the unauthenticated POST-initialize probe (ROLE.mcpUnauthInit — fetched
     //    ONCE in observeTarget, only in this undecided case, SSRF-gated):
-    //      POST 2xx + a JSON-RPC initialize RESULT (no error) => KEYLESS (POST-only)
+    //      POST 2xx + a JSON-RPC initialize RESULT that is itself a real MCP
+    //      InitializeResult (no error; result is a non-null OBJECT carrying
+    //      `protocolVersion`)                                    => KEYLESS (POST-only)
     //                                                            => OAuth siblings SKIP.
     //      POST 401/403 / WWW-Authenticate                     => PROTECTED
     //                                                            => OAuth siblings APPLY (no SKIP).
-    //      POST 5xx / 404 / garbage / non-JSON-RPC             => NOT keyless
+    //      POST 5xx / 404 / garbage / non-JSON-RPC, OR a 2xx result
+    //      that is null / a primitive / an object with no
+    //      protocolVersion                                     => NOT keyless
     //                                                            => no free SKIP; graded as before.
     const unauthStatus = unauthEv?.status ?? null
     const unauthWww = unauthEv?.headers['www-authenticate']
@@ -246,15 +250,20 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     const postInitStatus = postInitEv?.status ?? null
     const postInitWww = postInitEv?.headers['www-authenticate']
     const postInitMsg = parseMcpMessage(postInitEv)
-    // Genuine keyless POST-only MCP: 2xx AND a JSON-RPC initialize RESULT (a real
-    // server answering), NOT a JSON-RPC error and NOT a non-2xx/non-JSON body.
+    // Genuine keyless POST-only MCP: 2xx AND a JSON-RPC initialize RESULT that is
+    // ITSELF a real MCP InitializeResult — a non-null OBJECT carrying
+    // `protocolVersion` (the one REQUIRED field of MCP's InitializeResult; see
+    // isMcpInitializeResult below). NOT a JSON-RPC error, NOT a non-2xx/non-JSON
+    // body, and NOT a degenerate result (null, a primitive, or an object with no
+    // protocolVersion) — a broken initialize that never returns a usable result
+    // must not earn a free SKIP; it falls through to be graded as before.
     const postInitKeyless =
       postInitStatus !== null &&
       postInitStatus >= 200 &&
       postInitStatus < 300 &&
       !!postInitMsg &&
       postInitMsg.error === undefined &&
-      postInitMsg.result !== undefined
+      isMcpInitializeResult(postInitMsg.result)
     const postInitChallengesAuth =
       postInitStatus === 401 ||
       postInitStatus === 403 ||
@@ -1135,6 +1144,27 @@ function parseMcpMessage(ev: Evidence | undefined): Record<string, unknown> | un
     } catch { /* ignore non-JSON data lines */ }
   }
   return found
+}
+
+/**
+ * True when a JSON-RPC `result` looks like a genuine MCP InitializeResult: a
+ * non-null OBJECT (not an array, not a primitive) carrying `protocolVersion` —
+ * the one REQUIRED field of MCP's InitializeResult (serverInfo/capabilities are
+ * optional and not required here). Used to gate the ax-q4t keyless-POST-only
+ * detection (checks.ts ~251) so a degenerate/broken unauthenticated initialize
+ * — `result: null`, a primitive result, or an object missing protocolVersion —
+ * is NEVER read as a genuine keyless MCP handshake (no free SKIP; graded as
+ * before). mcp-remote-live (judgeMcpRemoteLive, below) grades a DECLARED
+ * server.json remote differently — reachability + tools/list is its signal,
+ * since a `mcp-declared` server is already known to exist — so it does not
+ * need this same-shape check; this helper is specific to the unauthenticated
+ * keyless-detection probe, which has no other evidence that the answering
+ * endpoint is a real MCP server.
+ */
+function isMcpInitializeResult(result: unknown): result is Record<string, unknown> {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return false
+  const protocolVersion = (result as Record<string, unknown>).protocolVersion
+  return typeof protocolVersion === 'string' && protocolVersion.length > 0
 }
 
 /** The `result.tools[]` (each tool's `name`) advertised by a tools/list message. */
