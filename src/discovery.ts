@@ -51,6 +51,18 @@ export const ROLE = {
   // MCP OAuth conformance (RFC 9728 / 8414 / 7591 / 7636 / 8707). Recorded only
   // when agents.json declares an HTTP/SSE MCP interface (interfaces.mcp.url).
   mcpUnauth: 'probe:mcp:unauthenticated',
+  /**
+   * Unauthenticated POST `initialize` handshake (ax-q4t): a spec-legal POST-only
+   * streamable-HTTP MCP server answers the unauthenticated GET with a non-2xx/
+   * non-401 (e.g. 405 Method Not Allowed) yet still answers a real JSON-RPC
+   * initialize over unauthenticated POST. Recorded ONLY when the GET probe gives
+   * neither a clear keyless (2xx) nor a clear protected (401/403 / WWW-Authenticate)
+   * signal — so the keyless-vs-protected decision (checks.ts) can see whether the
+   * endpoint is a usable keyless MCP that just doesn't serve GET. SSRF-gated (the
+   * mcpUrl already passed the same-origin + public-routable gate; observeMcp adds
+   * its own private-host backstop).
+   */
+  mcpUnauthInit: 'probe:mcp:unauthenticated-initialize',
   mcpProtectedResource: 'surface:mcp:oauth-protected-resource',
   mcpAsMetadata: 'surface:mcp:oauth-authorization-server',
   /** RFC 8414 fallback well-known: /.well-known/openid-configuration. */
@@ -1132,7 +1144,28 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   const mcpUrl = agents.mcp?.url
   if (mcpUrl && isPubliclyRoutableSameOrigin(mcpUrl, origin)) {
     // (d) Probe the MCP endpoint UNAUTHENTICATED — expect 401 + WWW-Authenticate.
-    await observer.observe(ROLE.mcpUnauth, mcpUrl, { accept: 'application/json' })
+    const unauthEv = await observer.observe(ROLE.mcpUnauth, mcpUrl, { accept: 'application/json' })
+    // (d-ii) ax-q4t: a spec-legal POST-only streamable-HTTP MCP server (no server-
+    //     initiated SSE) answers the unauthenticated GET with a non-2xx/non-401
+    //     (e.g. 405 Method Not Allowed) even though it answers a real JSON-RPC
+    //     initialize over unauthenticated POST. When the GET gives NEITHER a clear
+    //     keyless (2xx) NOR a clear protected (401/403 / WWW-Authenticate) signal,
+    //     probe the MCP handshake directly with an unauthenticated POST initialize —
+    //     REUSING the SSRF-gated observeMcp path (same private-host backstop the
+    //     live-remote handshake uses). mcpUrl already passed the same-origin +
+    //     publicly-routable gate above, so an off-origin/hostile url is never
+    //     reached here. checks.ts reads this probe to tell keyless-POST-only
+    //     (2xx JSON-RPC result => SKIP) from protected (401/403 => still OAuth-
+    //     graded) from broken (5xx/garbage => no free SKIP).
+    {
+      const gs = unauthEv.status
+      const getWww = unauthEv.headers['www-authenticate']
+      const getKeyless = gs !== null && gs >= 200 && gs < 300
+      const getChallengesAuth = gs === 401 || gs === 403 || (typeof getWww === 'string' && getWww.length > 0)
+      if (!getKeyless && !getChallengesAuth) {
+        await observer.observeMcp(ROLE.mcpUnauthInit, mcpUrl, mcpInitializeRequest())
+      }
+    }
     // (a) RFC 9728 protected-resource metadata at the MCP origin (same-origin).
     const prUrl = wellKnownAt(mcpUrl, 'oauth-protected-resource')
     const prEv = prUrl ? await observer.observe(ROLE.mcpProtectedResource, prUrl, { accept: 'application/json' }) : undefined
