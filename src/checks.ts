@@ -2097,18 +2097,114 @@ const DATA_URI_RE = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)(?:;[a-z0-9-]+=[^,;]*)*(;
  * json|xml|javascript, application/*+json/+xml, x-www-form-urlencoded, … — is
  * DELIBERATELY absent, so it earns no exemption and stays subject to the entropy
  * heuristic (closing the opaque-secret-laundering evasion).
+ *
+ * `application/octet-stream` is DELIBERATELY EXCLUDED (ax-7vu): a generic-binary
+ * MIME has NO magic signature to validate, so it was exactly the "claim generic
+ * binary" laundering vector — pad an opaque secret past the size floor under
+ * octet-stream and it would evade both the entropy heuristic and any magic
+ * check. A legitimate blob must declare its REAL type (image/png, application/
+ * pdf, …) so its magic bytes can be verified.
  */
 const MEDIA_BINARY_APPLICATION_MIMES = new Set([
   'application/pdf',
   'application/wasm',
   'application/zip',
   'application/ogg',
-  'application/octet-stream',
 ])
 function isMediaBinaryMime(mime: string): boolean {
   const type = mime.slice(0, mime.indexOf('/'))
   if (type === 'image' || type === 'audio' || type === 'video' || type === 'font' || type === 'model') return true
   return MEDIA_BINARY_APPLICATION_MIMES.has(mime)
+}
+
+/**
+ * Magic-byte (file-signature) table, keyed by the claimed lowercased MIME. Each
+ * MIME maps to a list of ALTERNATIVE signatures (OR); each alternative is a list
+ * of (offset, bytes) segments that must ALL match (AND) — so a container format
+ * whose signature spans two offsets (RIFF….WEBP, RIFF….WAVE) is expressed
+ * directly. Bytes are compared against the decoded payload read as latin1 (each
+ * `charCodeAt` is one raw byte, 0–255). A `data:` URI claiming a media MIME whose
+ * decoded bytes do NOT match one of its signatures is NOT the media it claims to
+ * be — so it earns NO entropy exemption (ax-7vu: closes the padded-fake-media
+ * laundering residual). image/svg+xml (TEXT, not binary) and audio/mpeg (a masked
+ * MPEG frame-sync, plus the ID3 tag) are handled specially in the matcher below.
+ */
+const MEDIA_MAGIC: Record<string, number[][][]> = {
+  'image/png': [[[0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]]],
+  'image/jpeg': [[[0, 0xff, 0xd8, 0xff]]],
+  'image/gif': [[[0, ...ascii('GIF87a')]], [[0, ...ascii('GIF89a')]]],
+  'image/webp': [[[0, ...ascii('RIFF')], [8, ...ascii('WEBP')]]],
+  'image/bmp': [[[0, ...ascii('BM')]]],
+  'image/x-icon': [[[0, 0x00, 0x00, 0x01, 0x00]]],
+  'image/vnd.microsoft.icon': [[[0, 0x00, 0x00, 0x01, 0x00]]],
+  'image/tiff': [[[0, 0x49, 0x49, 0x2a, 0x00]], [[0, 0x4d, 0x4d, 0x00, 0x2a]]],
+  'font/woff2': [[[0, ...ascii('wOF2')]]],
+  'font/woff': [[[0, ...ascii('wOFF')]]],
+  'font/ttf': [[[0, 0x00, 0x01, 0x00, 0x00]], [[0, ...ascii('OTTO')]], [[0, ...ascii('true')]]],
+  'application/font-sfnt': [[[0, 0x00, 0x01, 0x00, 0x00]], [[0, ...ascii('OTTO')]], [[0, ...ascii('true')]]],
+  'audio/ogg': [[[0, ...ascii('OggS')]]],
+  'video/ogg': [[[0, ...ascii('OggS')]]],
+  'application/ogg': [[[0, ...ascii('OggS')]]],
+  'audio/wav': [[[0, ...ascii('RIFF')], [8, ...ascii('WAVE')]]],
+  'video/mp4': [[[4, ...ascii('ftyp')]]],
+  'video/webm': [[[0, 0x1a, 0x45, 0xdf, 0xa3]]],
+  'application/pdf': [[[0, ...ascii('%PDF')]]],
+  'application/wasm': [[[0, 0x00, 0x61, 0x73, 0x6d]]],
+  'application/zip': [[[0, 0x50, 0x4b, 0x03, 0x04]]],
+}
+
+/** ASCII code points of a signature string, for the magic table. */
+function ascii(s: string): number[] {
+  return Array.from(s, (c) => c.charCodeAt(0))
+}
+
+/**
+ * Does the decoded payload's MAGIC actually match the CLAIMED media MIME? This is
+ * the required condition (ax-7vu) that closes the padded-binary laundering hole:
+ * an opaque secret padded past the size floor under a media MIME (data:image/png;
+ * base64,<secret+padding>) is NOT a real PNG, so its magic fails and it earns NO
+ * entropy exemption. `bytes` is the decoded payload read as latin1 (base64 case)
+ * or the raw payload (non-base64 case) — each charCodeAt is one raw byte.
+ *
+ * - image/svg+xml is TEXT: the payload (trimmed, lowercased) must start with
+ *   `<svg` or `<?xml`, NOT be opaque high-entropy base64.
+ * - audio/mpeg is an ID3 tag OR a masked MPEG frame-sync (0xFF followed by a byte
+ *   whose top three bits are set).
+ * - Every other MIME uses the signature table. A media MIME with NO known
+ *   signature returns FALSE (conservative — better a rare false-positive on an
+ *   exotic media type than a laundering hole).
+ */
+function mediaBytesMatchMime(mime: string, bytes: string): boolean {
+  if (mime === 'image/svg+xml') {
+    const head = bytes.slice(0, 256).trimStart().toLowerCase()
+    return head.startsWith('<svg') || head.startsWith('<?xml')
+  }
+  if (mime === 'audio/mpeg') {
+    if (matchSegment(bytes, [0, ...ascii('ID3')])) return true
+    // MPEG audio frame sync: 0xFF then a byte with the top 3 bits set (0xE0 mask).
+    return bytes.length >= 2 && bytes.charCodeAt(0) === 0xff && (bytes.charCodeAt(1) & 0xe0) === 0xe0
+  }
+  const alternatives = MEDIA_MAGIC[mime]
+  if (!alternatives) return false // no known signature we can validate → not exempt
+  for (const alt of alternatives) {
+    if (alt.every((seg) => matchSegment(bytes, seg))) return true
+  }
+  return false
+}
+
+/**
+ * A single (offset, ...bytes) segment matches when the decoded payload is long
+ * enough to contain it and every byte at `offset+i` equals the expected value.
+ * A payload too short to hold the signature does NOT match (fail closed).
+ */
+function matchSegment(bytes: string, seg: number[]): boolean {
+  const offset = seg[0]!
+  const sig = seg.slice(1)
+  if (bytes.length < offset + sig.length) return false
+  for (let i = 0; i < sig.length; i++) {
+    if (bytes.charCodeAt(offset + i) !== sig[i]) return false
+  }
+  return true
 }
 
 /**
@@ -2172,11 +2268,22 @@ function valueSecretLabel(s: string): string | undefined {
     // base64-DECODED payload so a key smuggled as `data:…;base64,<sk-…>` is caught.
     const decoded = dataUri.base64 ? decodeDataUriBase64(dataUri.payload) : undefined
     if (decoded) for (const [re, label] of VALUE_SECRET_PATTERNS) if (re.test(decoded)) return `${label} (base64-encoded inside a data: URI)`
-    // (1)+(2) Entropy exemption ONLY for a recognized media/binary MIME whose
-    // payload is a plausible-media SIZE. A text-ish MIME, or a media MIME too
-    // small to be real inline media, does NOT qualify.
+    // (1)+(2)+(ax-7vu) Entropy exemption ONLY for a recognized media/binary MIME
+    // whose payload is a plausible-media SIZE *and* whose decoded MAGIC BYTES
+    // actually match the claimed media type. A text-ish MIME, a media MIME too
+    // small to be real inline media, or a padded FAKE (a media MIME whose bytes do
+    // NOT match its signature — data:image/png;base64,<secret+padding>) does NOT
+    // qualify, so the entropy heuristic below still catches the laundered secret.
+    // A media MIME we have no signature for defaults to NOT exempt (conservative).
     const payloadBytes = decoded ? decoded.length : dataUri.payload.length
-    if (isMediaBinaryMime(dataUri.mime) && payloadBytes >= MIN_MEDIA_DATA_URI_BYTES) return undefined
+    const magicSource = decoded ?? dataUri.payload
+    if (
+      isMediaBinaryMime(dataUri.mime) &&
+      payloadBytes >= MIN_MEDIA_DATA_URI_BYTES &&
+      mediaBytesMatchMime(dataUri.mime, magicSource)
+    ) {
+      return undefined
+    }
     // (3) Not exempt: apply the entropy heuristic to the payload (decoded when
     // base64, else the raw payload). An opaque high-entropy payload FAILs; a
     // low-entropy text data: URI (`data:text/plain,Hello World`, a tiny 1×1 PNG
