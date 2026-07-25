@@ -24,6 +24,18 @@
 
 import type { VerificationReport, Grade, Verdict } from './types.js'
 import { TAGLINE, AXP_ANCHOR, JUDGED, ADMISSION, VILLAIN } from './copy.js'
+import { sealIcon, githubIcon, GITHUB_TITLE } from './icons.js'
+
+/**
+ * The tagline's head clause, for viewports where the full ruled line wraps to
+ * three lines inside an announcement pill.
+ *
+ * DERIVED from TAGLINE, never retyped: copy.ts:7 rules that string verbatim, so
+ * a second hand-written copy would be exactly the drift copy.ts exists to
+ * prevent. Splitting on the em dash yields "AX = Agent eXperience", which keeps
+ * the ruled capital X. The full line still renders on every viewport that fits it.
+ */
+const TAGLINE_SHORT = TAGLINE.split('—')[0]?.trim() || TAGLINE
 
 export function esc(text: string): string {
   return text
@@ -47,25 +59,45 @@ function tokensCss(): string {
   --card: oklch(0.998 0.004 175);
   --card-foreground: oklch(0.205 0.021 210);
   --muted: oklch(0.958 0.010 185);
-  --muted-foreground: oklch(0.470 0.020 200);
-  --primary: oklch(0.560 0.118 185);
+  --muted-foreground: oklch(0.445 0.020 200);
+  --primary: oklch(0.520 0.118 185);
   --primary-foreground: oklch(0.992 0.006 180);
   --accent: oklch(0.700 0.110 205);
   --accent-foreground: oklch(0.205 0.021 210);
   --border: oklch(0.905 0.013 190);
   --input: oklch(0.945 0.010 190);
-  --ring: oklch(0.560 0.118 185);
-  --pass: oklch(0.560 0.140 158);
+  --ring: oklch(0.520 0.118 185);
+  --pass: oklch(0.500 0.135 158);
   --pass-soft: oklch(0.945 0.045 158);
-  --fail: oklch(0.560 0.198 27);
+  --fail: oklch(0.545 0.195 27);
   --fail-soft: oklch(0.950 0.045 27);
-  --skip: oklch(0.640 0.018 200);
-  --warn: oklch(0.580 0.140 70);
+  --skip: oklch(0.520 0.018 200);
+  --warn: oklch(0.545 0.130 70);
+  --warn-soft: oklch(0.955 0.045 70);
   --code-bg: oklch(0.190 0.024 220);
   --code-fg: oklch(0.910 0.014 190);
+  /* Accent for text on the fixed dark plate (pre.code + .invariant). Theme-
+     invariant on purpose: the plate does not theme, so its accent must not. */
+  --on-code: oklch(0.800 0.130 175);
+  --on-code-muted: oklch(0.700 0.020 200);
+  /* Grade ramp — monotonic in hue (green 158 -> red 27), never reusing a value
+     between two grades, every step >=4.5:1 on --card. See DESIGN.md §1. */
+  --grade-aplus: oklch(0.500 0.145 158);
+  --grade-a: oklch(0.515 0.138 150);
+  --grade-b: oklch(0.535 0.130 128);
+  --grade-c: oklch(0.545 0.135 75);
+  --grade-d: oklch(0.550 0.165 45);
+  --grade-f: oklch(0.545 0.195 27);
   --glow-a: oklch(0.720 0.130 175 / 0.30);
   --glow-b: oklch(0.700 0.120 205 / 0.24);
   --radius: 0.7rem;
+  --radius-chip: 0.35rem;
+  /* Motion: exponential ease-out, never bounce. Name the curve per-property at
+     every use site — CSS shorthand does NOT carry a timing function across a
+     list, so an omitted curve silently falls back to ease, an ease-IN-out. */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 120ms;
+  --dur-base: 220ms;
   --shadow-sm: 0 1px 2px oklch(0.30 0.02 210 / 0.06), 0 1px 3px oklch(0.30 0.02 210 / 0.05);
   --shadow-md: 0 4px 12px oklch(0.30 0.02 210 / 0.08), 0 2px 4px oklch(0.30 0.02 210 / 0.05);
   --shadow-lg: 0 18px 40px oklch(0.30 0.02 210 / 0.12), 0 6px 12px oklch(0.30 0.02 210 / 0.06);
@@ -83,7 +115,10 @@ function tokensCss(): string {
     --primary: oklch(0.735 0.130 178);
     --primary-foreground: oklch(0.165 0.021 220);
     --accent: oklch(0.760 0.110 205);
-    --accent-foreground: oklch(0.165 0.021 220);
+    /* Dark-mode fix: the light value here was a near-black painted on a dark
+       translucent accent (1.35:1). The accent chip needs a LIGHT foreground
+       once the surface under it is dark. */
+    --accent-foreground: oklch(0.900 0.040 205);
     --border: oklch(0.290 0.022 218);
     --input: oklch(0.270 0.022 218);
     --ring: oklch(0.735 0.130 178);
@@ -91,8 +126,15 @@ function tokensCss(): string {
     --pass-soft: oklch(0.290 0.055 158);
     --fail: oklch(0.680 0.190 27);
     --fail-soft: oklch(0.300 0.070 27);
-    --skip: oklch(0.600 0.020 200);
-    --warn: oklch(0.770 0.150 75);
+    --skip: oklch(0.640 0.020 200);
+    --warn: oklch(0.770 0.150 70);
+    --warn-soft: oklch(0.310 0.060 70);
+    --grade-aplus: oklch(0.720 0.150 158);
+    --grade-a: oklch(0.740 0.145 150);
+    --grade-b: oklch(0.770 0.140 128);
+    --grade-c: oklch(0.790 0.145 75);
+    --grade-d: oklch(0.735 0.170 45);
+    --grade-f: oklch(0.680 0.190 27);
     --code-bg: oklch(0.135 0.020 222);
     --code-fg: oklch(0.900 0.016 190);
     --glow-a: oklch(0.680 0.140 175 / 0.26);
@@ -107,14 +149,25 @@ function tokensCss(): string {
 function baseCss(): string {
   return `
 *,*::before,*::after{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
+/* scroll-padding clears the sticky nav: without it every in-page anchor lands
+   under the bar, and #checklist (a .section-tight, 3.5rem of top padding) put
+   its own eyebrow behind the nav. */
+html{-webkit-text-size-adjust:100%;scroll-padding-top:5rem}
+@media (prefers-reduced-motion: no-preference){html{scroll-behavior:smooth}}
 body{
-  margin:0;font-family:var(--font-sans);
+  margin:0;font-family:var(--font-sans);font-size:1rem;
   background:var(--background);color:var(--foreground);
   line-height:1.6;letter-spacing:-0.011em;
   font-variant-numeric:tabular-nums;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
+/* Grid and flex items default to min-width:auto, so a single unbreakable token
+   (a digest, a long CLI flag) can floor a track above the viewport and push the
+   whole document into horizontal scroll. Opt every layout child out of that. */
+.hero-grid>*,.feat-grid>*,.tracks>*,.price-grid>*,.rep-main>*,.foot-grid>*{min-width:0}
+/* Long unbreakable strings this design is full of: digests, signatures, CLI
+   invocations, hostnames. Break them rather than letting them size the layout. */
+code,.mono,.rep-host,.rep-crumb{overflow-wrap:anywhere}
 h1,h2,h3{line-height:1.08;letter-spacing:-0.03em;font-weight:700;margin:0;text-wrap:balance}
 p{margin:0}
 a{color:inherit;text-decoration:none}
@@ -124,14 +177,23 @@ code,pre,.mono{font-family:var(--font-mono);font-feature-settings:'liga' 0}
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important}
 }
-.wrap{max-width:72rem;margin:0 auto;padding:0 1.5rem}
+.wrap{max-width:72rem;margin:0 auto;padding:0 clamp(1.15rem,4vw,1.5rem)}
 .eyebrow{font-size:.74rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--primary)}
 .lede{color:var(--muted-foreground);font-size:1.075rem;line-height:1.65}
 
 /* buttons */
-.btn{display:inline-flex;align-items:center;gap:.5rem;font-weight:600;font-size:.94rem;
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;font-weight:600;font-size:.94rem;
   padding:.62rem 1.05rem;border-radius:calc(var(--radius) - .15rem);border:1px solid transparent;
-  cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),background .18s,border-color .18s,box-shadow .18s}
+  min-height:2.5rem;white-space:nowrap;
+  cursor:pointer;transition:transform .18s var(--ease-out),background .18s var(--ease-out),
+    border-color .18s var(--ease-out),box-shadow .18s var(--ease-out),color .18s var(--ease-out)}
+/* Bare icon link — no border, no fill, no button chrome. Sits beside a solid
+   CTA, so the contrast in weight is the point. Padding is hit-area only. */
+.icon-link{display:inline-flex;align-items:center;justify-content:center;flex:none;
+  color:var(--muted-foreground);padding:.4rem;margin:-.4rem;border-radius:var(--radius-chip);
+  transition:color var(--dur-fast) var(--ease-out)}
+.icon-link:hover{color:var(--foreground)}
+.icon-link .icon{width:1.35rem;height:1.35rem}
 .btn-primary{background:var(--primary);color:var(--primary-foreground);box-shadow:var(--shadow-sm)}
 .btn-primary:hover{transform:translateY(-1px);box-shadow:var(--shadow-md)}
 .btn-primary:active{transform:translateY(0);box-shadow:var(--shadow-sm)}
@@ -139,61 +201,117 @@ code,pre,.mono{font-family:var(--font-mono);font-feature-settings:'liga' 0}
 .btn-ghost:hover{background:var(--muted)}
 .btn-ghost:active{background:color-mix(in oklch,var(--muted) 70%,var(--border))}
 .btn.mono{font-family:var(--font-mono);font-size:.85rem;letter-spacing:0}
+/* Nav-scale button. The default .btn is sized for hero/pricing calls to action
+   and reads oversized inside a 60px bar. */
+.btn-sm{min-height:2.15rem;padding:.32rem .78rem;font-size:.85rem}
+.btn-sm.mono{font-size:.79rem}
 
 /* nav */
-.nav{position:sticky;top:0;z-index:40;backdrop-filter:saturate(1.4) blur(10px);
+.nav{position:sticky;top:0;z-index:40;-webkit-backdrop-filter:saturate(1.4) blur(10px);
+  backdrop-filter:saturate(1.4) blur(10px);
   background:color-mix(in oklch,var(--background) 82%,transparent);border-bottom:1px solid var(--border)}
-.nav-in{display:flex;align-items:center;gap:1.5rem;height:60px}
-.brand{display:inline-flex;align-items:center;gap:.5rem;font-weight:700;font-size:1.02rem;letter-spacing:-0.02em}
-.brand .seal{width:20px;height:20px;flex:none}
+/* min-height, not height: a fixed 60px let the CTA label wrap to two lines and
+   break out through the nav's own bottom border on narrow viewports. */
+.nav-in{display:flex;align-items:center;gap:1.5rem;min-height:60px}
+.brand{display:inline-flex;align-items:center;gap:.5rem;font-weight:700;font-size:1.02rem;letter-spacing:-0.02em;flex:none}
+/* The seal sizes off its own text context; .brand pins it beside the wordmark.
+   The glyph paints with currentColor so verdict badges can tint it pass/warn,
+   but the LOGO mark is always brand — it does not follow the text color into
+   white on dark, and it does not shift on hover. */
+.seal{width:1.15em;height:1.15em;flex:none}
+.brand .seal{width:20px;height:20px;color:var(--primary)}
 .nav-links{display:flex;gap:1.4rem;margin-left:.5rem}
-.nav-links a{color:var(--muted-foreground);font-size:.9rem;font-weight:500}
+.nav-links a{color:var(--muted-foreground);font-size:.9rem;font-weight:500;
+  transition:color var(--dur-fast) var(--ease-out)}
 .nav-links a:hover{color:var(--foreground)}
-.nav-cta{margin-left:auto;display:flex;align-items:center;gap:.75rem}
+.nav-cta{margin-left:auto;display:flex;align-items:center;gap:.6rem;flex:none}
+.nav-cta-short{display:none}
+@media(max-width:900px){.nav-links{gap:1rem}}
+/* Below 780px the mono CTA label no longer fits beside the brand, so swap it for
+   a short one rather than let it wrap or push the document into h-scroll. */
+@media(max-width:780px){
+  .nav-cta-full{display:none}
+  .nav-cta-short{display:inline}
+  .nav-in{gap:.75rem}
+}
 @media(max-width:720px){.nav-links{display:none}}
 
-/* section rhythm — deliberately uneven, not uniform padding */
-.section{padding:5.5rem 0}
-.section-tight{padding:3.5rem 0}
+/* Section rhythm. Padding does NOT collapse, so the gap a reader perceives is
+   the sum of two facing paddings — the old fixed 5.5/3.5 alternation summed to
+   exactly 9rem at five consecutive boundaries, i.e. perfectly uniform. These
+   scale with the viewport so a phone does not spend ~530px on padding alone. */
+.section{padding:clamp(3rem,8vw,5.5rem) 0}
+.section-tight{padding:clamp(2.25rem,5vw,3.5rem) 0}
 .section h2{font-size:clamp(1.7rem,3.6vw,2.5rem)}
 .center{text-align:center;max-width:42rem;margin:0 auto}
 
 /* footer */
-.foot{border-top:1px solid var(--border);padding:3rem 0 3.5rem;color:var(--muted-foreground)}
+.foot{border-top:1px solid var(--border);padding:clamp(2.25rem,5vw,3rem) 0 clamp(2.5rem,5vw,3.5rem);color:var(--muted-foreground)}
 .foot-grid{display:flex;flex-wrap:wrap;gap:2.5rem;justify-content:space-between}
-.foot a{color:var(--muted-foreground);font-size:.9rem}
+.foot a{color:var(--muted-foreground);font-size:.9rem;transition:color var(--dur-fast) var(--ease-out)}
 .foot a:hover{color:var(--foreground)}
 .foot-col h4{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--foreground);margin:0 0 .7rem}
 .foot-col a{display:block;margin:.35rem 0}
 
 /* verdict pills */
-.pill{display:inline-flex;align-items:center;gap:.35rem;font-size:.74rem;font-weight:600;
-  padding:.16rem .5rem;border-radius:99px;letter-spacing:.01em}
+.pill{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;
+  font-size:.74rem;font-weight:600;line-height:1;white-space:nowrap;
+  padding:.28rem .55rem;border-radius:99px;letter-spacing:.01em}
 .pill.pass{background:var(--pass-soft);color:var(--pass)}
 .pill.fail{background:var(--fail-soft);color:var(--fail)}
 .pill.skip{background:var(--muted);color:var(--skip)}
 
 pre.code{background:var(--code-bg);color:var(--code-fg);padding:1rem 1.15rem;border-radius:var(--radius);
   overflow-x:auto;font-size:.85rem;line-height:1.7;margin:0}
-.code .tok-c{color:oklch(0.62 0.02 200)}
-.code .tok-k{color:oklch(0.78 0.13 175)}`
+/* A scrollable region must be reachable without a pointer; pre[tabindex] is set
+   in the markup so keyboard users can pan these commands. */
+pre.code:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.code .tok-c{color:var(--on-code-muted)}
+.code .tok-k{color:var(--on-code)}`
 }
 
 /**
- * Head metadata beyond the basics. Deliberately no webfont links: the page is
- * self-contained and CSP-clean (no external hosts), so the font tokens resolve
- * through local/system stacks only. The theme-color pair keeps the browser
- * chrome in step with the lab-paper / night surface.
+ * Head metadata beyond the basics.
+ *
+ * WEBFONTS: this file previously shipped none, on the grounds that the page was
+ * CSP-clean with no external hosts. The cost was that `--font-sans` NAMED Inter
+ * and `--font-mono` NAMED JetBrains Mono while neither ever loaded — so every
+ * letter-spacing value here (-0.011em body, -0.03em headings, -.05em seals) was
+ * tuned for Inter's metrics and applied to whatever system-ui resolved to.
+ *
+ * The pairing is Inter (UI/prose) + JetBrains Mono (code, digests, verdicts):
+ * Inter's tall x-height holds up at the .74rem chip sizes this design leans on,
+ * and JetBrains Mono's wide, unambiguous glyphs are built for reading hashes —
+ * which is most of what a report page is. `display=swap` means the system stack
+ * paints first, so this never blocks the verdict.
+ *
+ * TRADEOFF (deliberate, flagged): this adds fonts.googleapis.com and
+ * fonts.gstatic.com as external origins. To restore the zero-external-host
+ * property, self-host both as subset woff2 and swap these links for @font-face.
  */
 function headMeta(): string {
   return `<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7fbfa">
-<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#12181c">`
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#12181c">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta property="og:image" content="https://api.qa/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://api.qa/og.png">`
 }
 
-/** The verified-seal glyph — a check inside a rounded shield. Reused in nav + hero. */
-function sealSvg(cls = 'seal'): string {
-  return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2.5l7.5 3v5.2c0 4.6-3.1 8.4-7.5 10.3-4.4-1.9-7.5-5.7-7.5-10.3V5.5l7.5-3z" fill="var(--primary)" opacity="0.16"/><path d="M12 2.5l7.5 3v5.2c0 4.6-3.1 8.4-7.5 10.3-4.4-1.9-7.5-5.7-7.5-10.3V5.5l7.5-3z" stroke="var(--primary)" stroke-width="1.4"/><path d="M8.4 12.2l2.5 2.5 4.7-5" stroke="var(--primary)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`
-}
+/**
+ * Seal + GitHub marks come from `src/icons.ts`, which sources them from
+ * `lucide-static` and `simple-icons`. No glyph path data is authored here.
+ */
+const sealSvg = sealIcon
+const githubSvg = githubIcon
 
 function shell(opts: { title: string; description: string; jsonLd: object; body: string; extraCss?: string; script?: string }): string {
   return `<!doctype html>
@@ -235,8 +353,8 @@ function navHtml(active: 'landing' | 'report'): string {
     <a class="brand" href="/">${sealSvg()} api.qa</a>
     ${links}
     <div class="nav-cta">
-      <a class="btn btn-ghost" href="https://github.com/dot-do/api.qa">GitHub</a>
-      <a class="btn btn-primary mono" href="/self">curl api.qa/{domain}</a>
+      <a class="icon-link" href="https://github.com/dot-do/api.qa" aria-label="Source on ${esc(GITHUB_TITLE)}" title="Source on ${esc(GITHUB_TITLE)}">${githubSvg()}</a>
+      <a class="btn btn-sm btn-primary mono" href="/self"><span class="nav-cta-full">curl api.qa/{domain}</span><span class="nav-cta-short">See a report</span></a>
     </div>
   </div></header>`
 }
@@ -320,7 +438,7 @@ const PRICING: Array<{ name: string; price: string; note: string; features: stri
 
 function landingCss(): string {
   return `
-.hero{position:relative;overflow:hidden;padding:4.5rem 0 4rem}
+.hero{position:relative;overflow:hidden;padding:clamp(2.5rem,7vw,4.5rem) 0 clamp(2.5rem,6vw,4rem)}
 .hero::before{content:'';position:absolute;inset:-30% 0 auto 0;height:60rem;z-index:0;pointer-events:none;
   background:radial-gradient(60rem 32rem at 25% 0%,var(--glow-a),transparent 60%),
              radial-gradient(52rem 30rem at 82% 8%,var(--glow-b),transparent 62%)}
@@ -330,7 +448,15 @@ function landingCss(): string {
   padding:.32rem .7rem .32rem .4rem;border-radius:99px;border:1px solid var(--border);
   background:var(--card);color:var(--muted-foreground);box-shadow:var(--shadow-sm)}
 .announce b{background:var(--primary);color:var(--primary-foreground);font-size:.68rem;font-weight:700;
-  padding:.12rem .42rem;border-radius:99px;letter-spacing:.02em}
+  padding:.12rem .42rem;border-radius:99px;letter-spacing:.02em;flex:none}
+.announce:hover{border-color:color-mix(in oklch,var(--primary) 45%,var(--border))}
+/* A pill is a one-clause form, and the full ruled tagline wraps to three lines
+   inside one on a phone. Swap to the head clause rather than reshape the pill. */
+.announce-short{display:none}
+@media(max-width:640px){
+  .announce-full{display:none}
+  .announce-short{display:inline}
+}
 .hero h1{font-size:clamp(2.3rem,5.4vw,3.5rem);margin:1.3rem 0 0;font-weight:800}
 .hero h1 .hl{color:var(--primary)}
 .hero .lede{margin-top:1.15rem;max-width:34rem;font-size:1.12rem}
@@ -344,7 +470,7 @@ function landingCss(): string {
 
 /* the sample credential card shown in the hero */
 .cred{position:relative;background:var(--card);border:1px solid var(--border);border-radius:calc(var(--radius) + .3rem);
-  box-shadow:var(--shadow-lg);padding:1.6rem 1.7rem}
+  box-shadow:var(--shadow-lg);padding:clamp(1.25rem,4vw,1.6rem) clamp(1.25rem,4vw,1.7rem)}
 .cred-top{display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .cred-host{font-family:var(--font-mono);font-size:.9rem;color:var(--muted-foreground)}
 .cred-mark{display:flex;align-items:center;gap:1.1rem;margin:1.1rem 0 .3rem}
@@ -364,10 +490,10 @@ function landingCss(): string {
 /* invariant band — a fixed dark plate in both themes, like the code blocks:
    the one sentence the whole product hangs on reads as engraved, not themed */
 .invariant{background:var(--code-bg);color:var(--code-fg)}
-.invariant .wrap{padding-top:3.2rem;padding-bottom:3.2rem}
-.invariant .eyebrow{color:oklch(0.78 0.13 175)}
+.invariant .wrap{padding-top:clamp(2.25rem,6vw,3.2rem);padding-bottom:clamp(2.25rem,6vw,3.2rem)}
+.invariant .eyebrow{color:var(--on-code)}
 .invariant .q{font-size:clamp(1.35rem,3vw,2rem);font-weight:600;letter-spacing:-.025em;max-width:52rem;line-height:1.32;text-wrap:balance}
-.invariant .q em{font-style:normal;color:oklch(0.78 0.13 175);font-weight:700}
+.invariant .q em{font-style:normal;color:var(--on-code);font-weight:700}
 .invariant .sub{margin-top:1rem;opacity:.72;max-width:44rem;font-size:1rem}
 
 /* mechanism ledger — one framed panel, hairline rules, not six floating cards.
@@ -376,7 +502,7 @@ function landingCss(): string {
   background:var(--border);border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);
   overflow:hidden;box-shadow:var(--shadow-sm)}
 @media(max-width:860px){.feat-grid{grid-template-columns:1fr}}
-.feat{background:var(--card);padding:1.5rem 1.6rem}
+.feat{background:var(--card);padding:clamp(1.25rem,3.5vw,1.5rem) clamp(1.25rem,3.5vw,1.6rem)}
 .feat .n{font-family:var(--font-mono);font-size:.78rem;color:var(--primary);font-weight:600}
 .feat h3{font-size:1.12rem;margin:.55rem 0 .5rem}
 .feat p{color:var(--muted-foreground);font-size:.94rem;line-height:1.6}
@@ -396,7 +522,7 @@ function landingCss(): string {
 /* how it works — two tracks */
 .tracks{display:grid;grid-template-columns:1fr 1fr;gap:1.15rem;margin-top:2.5rem}
 @media(max-width:820px){.tracks{grid-template-columns:1fr}}
-.track{border:1px solid var(--border);border-radius:var(--radius);padding:1.6rem;background:var(--card);box-shadow:var(--shadow-sm)}
+.track{border:1px solid var(--border);border-radius:var(--radius);padding:clamp(1.25rem,4vw,1.6rem);background:var(--card);box-shadow:var(--shadow-sm)}
 .track .tag{font-family:var(--font-mono);font-size:.72rem;font-weight:600;color:var(--accent-foreground);
   background:color-mix(in oklch,var(--accent) 24%,transparent);padding:.16rem .5rem;border-radius:99px}
 .track h3{font-size:1.22rem;margin:.85rem 0 1rem}
@@ -407,12 +533,12 @@ function landingCss(): string {
   display:grid;place-items:center;font-family:var(--font-mono);font-size:.78rem;font-weight:600;
   color:var(--primary);border:1px solid var(--primary)}
 .track li b{color:var(--foreground);font-weight:600}
-.track code{background:var(--muted);padding:.08rem .32rem;border-radius:4px;font-size:.82rem}
+.track code{background:var(--muted);padding:.08rem .32rem;border-radius:var(--radius-chip);font-size:.82rem}
 
 /* pricing */
 .price-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1.15rem;margin-top:2.75rem;align-items:start}
 @media(max-width:820px){.price-grid{grid-template-columns:1fr;max-width:26rem;margin-inline:auto}}
-.tier{border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);padding:1.7rem;background:var(--card);box-shadow:var(--shadow-sm)}
+.tier{border:1px solid var(--border);border-radius:calc(var(--radius) + .1rem);padding:clamp(1.35rem,4vw,1.7rem);background:var(--card);box-shadow:var(--shadow-sm)}
 .tier.featured{border-color:var(--primary);box-shadow:var(--shadow-lg);position:relative}
 .tier.featured::after{content:'Most portable';position:absolute;top:-.7rem;left:50%;transform:translateX(-50%);
   background:var(--primary);color:var(--primary-foreground);font-size:.68rem;font-weight:700;letter-spacing:.03em;
@@ -428,7 +554,7 @@ function landingCss(): string {
 
 /* final cta */
 .cta-final{position:relative;overflow:hidden;border-radius:calc(var(--radius) + .4rem);
-  border:1px solid var(--border);background:var(--card);padding:3.4rem 2rem;text-align:center;box-shadow:var(--shadow-md)}
+  border:1px solid var(--border);background:var(--card);padding:clamp(2.25rem,6vw,3.4rem) clamp(1.25rem,4vw,2rem);text-align:center;box-shadow:var(--shadow-md)}
 .cta-final::before{content:'';position:absolute;inset:auto 0 -60% 0;height:30rem;z-index:0;
   background:radial-gradient(40rem 20rem at 50% 100%,var(--glow-a),transparent 65%)}
 .cta-final > *{position:relative;z-index:1}
@@ -454,10 +580,10 @@ export function landingHtml(): string {
 
   const hero = `<section class="hero"><div class="wrap hero-grid">
     <div>
-      <a class="announce" href="https://apis.ax/axp"><b>Thesis</b> ${esc(TAGLINE)}</a>
+      <a class="announce" href="https://apis.ax/axp"><b>Thesis</b><span class="announce-full">${esc(TAGLINE)}</span><span class="announce-short">${esc(TAGLINE_SHORT)}</span></a>
       <h1>An agent won’t integrate an API it can’t <span class="hl">trust</span></h1>
       <p class="lede">And a principal can’t prove their API works for agents by asserting it — assertions are exactly what Goodharted fleets produce. api.qa is the proof mechanism of the agent-first arc: the external, third-party verifier that grades a surface from its own published contracts, held outside the building fleet’s write access — every grade here is ${JUDGED}. Verdicts are deterministic, Ed25519-attested, replayable, and bind to a ratified digest.</p>
-      <pre class="code hero-cmd"><span class="tok-k">curl</span> https://api.qa/example.com  <span class="tok-c"># public grade page, as markdown</span>
+      <pre tabindex="0" class="code hero-cmd"><span class="tok-k">curl</span> https://api.qa/example.com  <span class="tok-c"># public grade page, as markdown</span>
 <span class="tok-k">npx</span> autonomous-qa example.com   <span class="tok-c"># same verifier core, locally (advisory)</span>
 <span class="tok-k">npx</span> autonomous-qa mcp           <span class="tok-c"># MCP: verify_domain, discover_domain, verify_pinned_spec</span></pre>
       <div class="trust">
@@ -558,7 +684,7 @@ export function landingHtml(): string {
     <div class="eyebrow">The stakes</div>
     <h2 style="margin-top:.7rem">Attack the product, not the verifier</h2>
     <p class="lede center" style="margin-top:.9rem">Fail, and the agent-first web routes around you: to agents you are invisible, to wallets you are unbounded risk. Pass, and you are zero-shot transactable — an agent that has never seen you discovers, understands, and pays you on first contact — and your Listing is admitted to the catalog, ${JUDGED}. Admission is <code>${esc(ADMISSION)}</code>.</p>
-    <pre class="code" style="display:inline-block;text-align:left;margin-top:1.7rem"><span class="tok-k">curl</span> https://api.qa/your-api.com</pre>
+    <pre tabindex="0" class="code" style="display:inline-block;text-align:left;margin-top:1.7rem"><span class="tok-k">curl</span> https://api.qa/your-api.com</pre>
     <div class="hero-actions" style="justify-content:center;margin-top:1.2rem">
       <a class="btn btn-ghost" href="/self">/self &middot; dogfooding: api.qa under its own checks, 10/10</a>
       <a class="btn btn-ghost" href="/llms.txt">/llms.txt &middot; the design</a>
@@ -579,23 +705,23 @@ export function landingHtml(): string {
 // ---------------------------------------------------------------------------
 
 const GRADE_COLOR: Record<Grade, string> = {
-  'A+': 'var(--pass)',
-  A: 'var(--pass)',
-  B: 'var(--primary)',
-  C: 'var(--warn)',
-  D: 'oklch(0.64 0.17 45)',
-  F: 'var(--fail)',
+  'A+': 'var(--grade-aplus)',
+  A: 'var(--grade-a)',
+  B: 'var(--grade-b)',
+  C: 'var(--grade-c)',
+  D: 'var(--grade-d)',
+  F: 'var(--grade-f)',
 }
 
 const VERDICT_LABEL: Record<Verdict, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip' }
 
 function reportCss(): string {
   return `
-.rep-hero{position:relative;overflow:hidden;padding:3rem 0 2.5rem}
+.rep-hero{position:relative;overflow:hidden;padding:clamp(1.75rem,5vw,3rem) 0 clamp(1.5rem,4vw,2.5rem)}
 .rep-hero::before{content:'';position:absolute;inset:-40% 0 auto 0;height:40rem;z-index:0;pointer-events:none;
   background:radial-gradient(48rem 26rem at 30% 0%,var(--glow-a),transparent 62%)}
 .rep-card{position:relative;z-index:1;background:var(--card);border:1px solid var(--border);
-  border-radius:calc(var(--radius) + .3rem);box-shadow:var(--shadow-lg);padding:2rem 2.1rem}
+  border-radius:calc(var(--radius) + .3rem);box-shadow:var(--shadow-lg);padding:clamp(1.25rem,4.5vw,2rem) clamp(1.25rem,4.5vw,2.1rem)}
 .rep-crumb{font-family:var(--font-mono);font-size:.82rem;color:var(--muted-foreground)}
 .rep-crumb a{color:var(--primary)}
 .rep-main{display:grid;grid-template-columns:auto 1fr;gap:1.9rem;align-items:center;margin-top:1.1rem}
@@ -607,11 +733,17 @@ function reportCss(): string {
 .rep-host{font-family:var(--font-mono);font-size:1.05rem;color:var(--muted-foreground)}
 .rep-score{font-size:2.6rem;font-weight:800;letter-spacing:-.03em;margin:.15rem 0 .1rem}
 .rep-score small{font-size:1rem;font-weight:500;color:var(--muted-foreground)}
-.rep-badges{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.65rem}
-.badge{display:inline-flex;align-items:center;gap:.4rem;font-size:.78rem;font-weight:600;
-  padding:.24rem .62rem;border-radius:99px;border:1px solid var(--border);background:var(--background)}
+.rep-badges{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.65rem;align-items:center}
+/* Uniform height + nowrap: "Ed25519 attested" used to wrap to two lines, so the
+   attestation badge rendered at roughly double the height of the two beside it.
+   min-height (not vertical padding) is what keeps them optically identical. */
+.badge{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;
+  font-size:.78rem;font-weight:600;line-height:1;white-space:nowrap;
+  padding:0 .7rem;min-height:1.9rem;border-radius:99px;
+  border:1px solid var(--border);background:var(--background)}
+.badge .seal{width:1.05em;height:1.05em}
 .badge.att{color:var(--pass);border-color:color-mix(in oklch,var(--pass) 40%,var(--border))}
-.badge.adv{color:var(--warn);border-color:color-mix(in oklch,var(--warn) 40%,var(--border))}
+.badge.adv{color:var(--warn);background:var(--warn-soft);border-color:color-mix(in oklch,var(--warn) 40%,var(--border))}
 .rep-meter{display:flex;gap:5px;margin-top:1.25rem}
 .rep-meter i{height:9px;flex:1;border-radius:99px;background:var(--border)}
 .rep-meter i.pass{background:var(--pass)}
@@ -623,7 +755,7 @@ function reportCss(): string {
 .note{background:var(--fail-soft);color:var(--fail);border-radius:var(--radius);padding:.9rem 1.15rem;
   font-size:.9rem;font-weight:500;margin-top:1.4rem}
 
-.rep-sec{padding:2.4rem 0}
+.rep-sec{padding:clamp(1.75rem,5vw,2.4rem) 0}
 .rep-sec h2{font-size:1.35rem;letter-spacing:-.02em}
 .rep-sec .sub{color:var(--muted-foreground);font-size:.92rem;margin-top:.3rem}
 
@@ -639,16 +771,16 @@ table.ax tr:first-child td{border-top:0}
 /* check details — one ruled ledger, same frame vocabulary as the AX table */
 .checks{margin-top:1.2rem;background:var(--card);border:1px solid var(--border);
   border-radius:var(--radius);overflow:hidden}
-.chk{padding:1rem 1.2rem;border-top:1px solid var(--border)}
+.chk{padding:clamp(.9rem,3vw,1rem) clamp(1rem,3vw,1.2rem);border-top:1px solid var(--border)}
 .chk:first-child{border-top:0}
 .chk.fail{background:color-mix(in oklch,var(--fail-soft) 45%,var(--card))}
 .chk-h{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
 .chk-h .t{font-weight:600;font-size:.96rem}
 .chk-h code{font-family:var(--font-mono);font-size:.76rem;color:var(--muted-foreground);
-  background:var(--muted);padding:.1rem .4rem;border-radius:5px}
+  background:var(--muted);padding:.1rem .4rem;border-radius:var(--radius-chip)}
 .chk p{color:var(--muted-foreground);font-size:.9rem;margin-top:.5rem;line-height:1.6}
 
-.attest{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.4rem 1.5rem;margin-top:1.1rem}
+.attest{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(1.1rem,3.5vw,1.4rem) clamp(1.1rem,3.5vw,1.5rem);margin-top:1.1rem}
 .attest .kv{display:grid;grid-template-columns:8.5rem 1fr;gap:.55rem 1rem;font-size:.82rem}
 @media(max-width:560px){.attest .kv{grid-template-columns:1fr}}
 .attest .kv dt{color:var(--muted-foreground);font-weight:500}
@@ -767,7 +899,7 @@ export function reportPageHtml(r: VerificationReport): string {
   const repro = `<section class="rep-sec"><div class="wrap repro">
     <h2>Verify this yourself</h2>
     <p>Judging is a pure function of the embedded evidence bundle. Re-run the checks over it and you must get this same grade, or the report is forged or the verifier version changed.</p>
-    <pre class="code"><span class="tok-c"># fetch the full report and re-judge its embedded evidence</span>
+    <pre tabindex="0" class="code"><span class="tok-c"># fetch the full report and re-judge its embedded evidence</span>
 curl -H <span class="tok-k">'accept: application/json'</span> https://api.qa/${esc(host)} | npx autonomous-qa rejudge</pre>
     <p style="margin-top:1rem">Agents: <code>curl https://api.qa/${esc(host)}</code> returns this report as markdown; <code>accept: application/json</code> returns the full report with the replayable evidence bundle.</p>
   </div></section>`

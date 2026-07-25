@@ -1,0 +1,5 @@
+{
+  "env": {
+    "IMPECCABLE_CONTEXT_DIR": ".agents/context"
+  }
+}
