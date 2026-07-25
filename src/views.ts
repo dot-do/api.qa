@@ -786,6 +786,33 @@ const GRADE_COLOR: Record<Grade, string> = {
 
 const VERDICT_LABEL: Record<Verdict, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip' }
 
+/**
+ * Severity rank for the AX meter: earned, then not-applicable, then failed.
+ * Only `pass` scores a point, so the meter is a gauge of points earned — and a
+ * gauge reads left-to-right filled-then-empty.
+ */
+const METER_RANK: Record<Verdict, number> = { pass: 0, skip: 1, fail: 2 }
+
+/**
+ * Order the meter segments green → grey → red.
+ *
+ * The source order (grade.ts `axScoreOf`) is checklist order 1..10, which is
+ * correct for the TABLE — the table is a list of ten named checks and its rows
+ * must line up with the checklist on the landing page. It is wrong for the
+ * METER, which is not a list: it is a single gauge of "how many of ten". In
+ * checklist order a fail at item 3 puts red in the middle of the strip and the
+ * bar reads as scattered noise instead of a score.
+ *
+ * Sorting is stable within a rank, so checklist order is preserved inside each
+ * group and the mapping stays legible on hover.
+ *
+ * Returns a NEW array. `r.axScore.items` is serialized into the JSON report and
+ * signed over, so sorting it in place would alter attested output.
+ */
+export function meterSegments(items: VerificationReport['axScore']['items']): VerificationReport['axScore']['items'] {
+  return [...items].sort((a, b) => METER_RANK[a.verdict] - METER_RANK[b.verdict])
+}
+
 function reportCss(): string {
   return `
 .rep-hero{padding-block:clamp(1.75rem,4.5vw,3rem)}
@@ -890,9 +917,16 @@ export function reportPageHtml(r: VerificationReport): string {
     datePublished: r.verifiedAt,
   }
 
-  const meter = r.axScore.items
+  const meter = meterSegments(r.axScore.items)
     .map((i) => `<i class="${i.verdict === 'pass' ? 'pass' : i.verdict === 'fail' ? 'fail' : ''}" title="${esc(i.title)}: ${VERDICT_LABEL[i.verdict]}"></i>`)
     .join('')
+  const failed = r.axScore.items.filter((i) => i.verdict === 'fail').length
+  const skipped = r.axScore.items.filter((i) => i.verdict === 'skip').length
+  // The per-segment title is hover-only, so the counts have to live on the
+  // label or a keyboard/screen-reader user gets a bar with no reading.
+  const meterLabel = `AX score: ${r.axScore.points} of 10 passed`
+    + (failed ? `, ${failed} failed` : '')
+    + (skipped ? `, ${skipped} not applicable` : '')
 
   const attBadge = r.attested
     ? `<span class="chip pass">${sealSvg()} Ed25519 attested</span>`
@@ -913,7 +947,7 @@ export function reportPageHtml(r: VerificationReport): string {
           </div>
         </div>
       </div>
-      <div class="rep-meter" aria-label="AX score, ${r.axScore.points} of 10">${meter}</div>
+      <div class="rep-meter" role="img" aria-label="${esc(meterLabel)}">${meter}</div>
       <div class="rep-facts">
         <span>verified <b>${esc(r.verifiedAt)}</b></span>
         <span>seed <b>${r.seed}</b> (replayable)</span>
