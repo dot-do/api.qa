@@ -173,7 +173,7 @@ code,.mono,.rep-host,.rep-crumb{font-family:var(--mono);overflow-wrap:anywhere}
 
 /* Headings take the sans; anything the machine produced stays mono. */
 h1,h2,h3{font-family:var(--sans);margin:0;text-wrap:balance}
-h1{font-weight:700;letter-spacing:-.028em;line-height:1.06;font-size:clamp(1.85rem,5.2vw,3.4rem)}
+h1{font-weight:700;letter-spacing:-.028em;line-height:1.06;font-size:clamp(2.2rem,7vw,3.4rem)}
 h2{font-weight:700;letter-spacing:-.024em;line-height:1.1;font-size:clamp(1.4rem,3.4vw,2.15rem)}
 h1 em,h2 em{font-style:normal;color:var(--teal)}
 
@@ -181,8 +181,14 @@ h1 em,h2 em{font-style:normal;color:var(--teal)}
 .sheet{max-width:1320px;margin:0 auto;border-inline:1px solid var(--rule);min-height:100vh;background:var(--paper)}
 .pad{padding-inline:clamp(1rem,3.5vw,2.5rem)}
 /* Hatching marks a region that carries no reading — separators only. */
+/* The stripe stop is SOFT on purpose. A hard stop (var(--hatch) 0 1px,
+   transparent 1px ...) gives the rasteriser nothing to antialias against, so on
+   a rotated axis at fractional device-pixel ratios individual stripes drop out
+   and the spacing reads ragged — most visible on phones. Ramping to transparent
+   over ~1px lets it antialias and the pattern stays even at any DPR. */
 .hatch{height:22px;border-block:1px solid var(--rule);
-  background-image:repeating-linear-gradient(-45deg,var(--hatch) 0 1px,transparent 1px 7px)}
+  background-image:repeating-linear-gradient(-45deg,
+    var(--hatch) 0, var(--hatch) 1px, transparent 2px, transparent 8px)}
 
 .eyebrow{font-family:var(--mono);font-size:.66rem;letter-spacing:.16em;text-transform:uppercase;
   color:var(--ink-soft);display:flex;align-items:center;gap:.5rem;margin:0}
@@ -227,7 +233,15 @@ h1 em,h2 em{font-style:normal;color:var(--teal)}
    #menu precedes the nav in the DOM purely so a sibling combinator can reach
    the trigger; being absolutely positioned, its DOM order does not affect
    where it renders. */
-.menu{display:none;position:absolute;top:100%;left:0;right:0}
+/* The nav must sit ABOVE the scrim. .menu is positioned and the nav's .pad is
+   static, so without these the fixed scrim paints over the bar itself and dims
+   the logo and the close control — the overlay looks broken in both themes.
+   The panel drops to top:100%, below the bar, so nothing is hidden by this. */
+/* Opaque, not just stacked above: .pad has no background of its own, so the
+   scrim painted straight THROUGH the transparent bar and the nav still read
+   as dimmed. Matches --paper, so nothing changes when the menu is closed. */
+.navwrap>.pad{position:relative;z-index:2;background:var(--paper)}
+.menu{display:none;position:absolute;top:100%;left:0;right:0;z-index:1}
 .menu:target{display:block}
 @media(min-width:821px){.menu{display:none !important}}
 .menu-scrim{position:fixed;inset:0;background:var(--scrim)}
@@ -494,6 +508,12 @@ function landingCss(): string {
 .hero h1{margin:1.1rem auto 0;max-width:26ch}
 .hero .lede{margin:1.1rem auto 0}
 .actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1.75rem;justify-content:center}
+/* Phones: stack and fill. Two side-by-side pills at this width leave each one
+   too narrow to read as a primary action. */
+@media(max-width:560px){
+  .actions{flex-direction:column;align-items:stretch}
+  .actions .btn{width:100%}
+}
 .trust{display:flex;flex-wrap:wrap;gap:.4rem 1.5rem;margin-top:1.35rem;justify-content:center;
   font-family:var(--mono);font-size:.72rem;color:var(--ink-soft)}
 .trust span{display:inline-flex;align-items:center;gap:.45rem}
