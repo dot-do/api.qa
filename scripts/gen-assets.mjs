@@ -5,118 +5,157 @@
  *   node scripts/gen-assets.mjs
  *
  * Produces `src/assets.ts` containing base64 payloads for:
- *   - og.png              1200x630 social card
+ *   - og.png                1200x630 social card
  *   - apple-touch-icon.png  180x180
- *   - favicon.ico          32x32 (PNG bytes; browsers accept PNG under .ico)
+ *   - favicon.ico           32x32 (PNG bytes; browsers accept PNG under .ico)
  *
  * The Worker has no filesystem and no image pipeline, so these are inlined as
- * data rather than served from disk. They are committed, so a normal build does
- * NOT need to run this — rerun it only when the mark or the card copy changes.
+ * data. They are committed, so a normal build does NOT run this — rerun it only
+ * when the mark, the tokens, or the card copy change.
  *
- * The seal glyph is read from `lucide-static` at generation time, the same
- * source `src/icons.ts` uses at runtime. No path data is authored here.
+ * WHY CHROME AND NOT rsvg-convert: the card is set in IBM Plex, which is a
+ * webfont. rsvg resolves through fontconfig, so on any machine without Plex
+ * installed it silently falls back to Helvetica and the card ships in the wrong
+ * typeface — which is exactly what happened before this rewrite. Chrome loads
+ * the same Google Fonts stylesheet the site uses, so the card is rendered in the
+ * real face, in the real design language, from the real tokens.
  *
- * Requires `rsvg-convert` (brew install librsvg) on the machine running it.
+ * WHY THE TOKENS ARE PARSED OUT OF views.ts: hand-copied hex values drift the
+ * moment a token moves. They already had. The light-theme `:root` block is the
+ * single source; this script reads it.
+ *
+ * Requires Google Chrome. Set CHROME=/path/to/chrome to override.
  */
 
 import { execFileSync } from 'node:child_process'
-import { writeFileSync, mkdtempSync, readFileSync } from 'node:fs'
+import { writeFileSync, mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShieldCheck } from 'lucide-static'
 
-// --- brand constants, resolved to sRGB hex --------------------------------
-// rsvg has no OKLCH support, so the tokens in views.ts are resolved here once.
-// If a token changes, update its twin below and rerun.
-const C = {
-  paper: '#e9ecea', // --paper          oklch(0.930 0.004 175)
-  ink: '#0f1c20', // --ink            oklch(0.205 0.021 210)
-  primary: '#00776c', // --teal           oklch(0.520 0.118 185)
-  plate: '#0d1519', // --plate          oklch(0.190 0.024 220)
-  onCode: '#4fd6c0', // --plate-accent   oklch(0.800 0.130 175)
-  plateText: '#e4efec', // --plate-ink      oklch(0.910 0.014 190)
-  muted: '#5c6b6d', // --ink-soft
+const CHROME =
+  process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+if (!existsSync(CHROME)) {
+  console.error(`\nChrome not found at:\n  ${CHROME}\nSet CHROME=/path/to/chrome and rerun.\n`)
+  process.exit(1)
 }
 
-// Plex if the generating machine has it installed; otherwise a neutral grotesque.
-// rsvg resolves through fontconfig, so this is a best-effort preference.
-const FONT = "'IBM Plex Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif"
-const MONO = "'IBM Plex Mono', 'SF Mono', Menlo, Consolas, monospace"
+// --- tokens, read from the stylesheet rather than copied -------------------
+
+const viewsSrc = readFileSync(new URL('../src/views.ts', import.meta.url), 'utf8')
+const rootBlock = viewsSrc.slice(viewsSrc.indexOf(':root{'), viewsSrc.indexOf('@media (prefers-color-scheme: dark)'))
+
+function token(name) {
+  const m = rootBlock.match(new RegExp(`--${name}:\\s*([^;]+);`))
+  if (!m) throw new Error(`token --${name} not found in views.ts :root block`)
+  return m[1].trim()
+}
+
+const T = Object.fromEntries(
+  ['paper', 'panel', 'ink', 'ink-soft', 'rule', 'teal', 'plate', 'plate-ink', 'plate-accent'].map(
+    (n) => [n, token(n)],
+  ),
+)
+console.log('tokens read from views.ts:')
+for (const [k, v] of Object.entries(T)) console.log(`  --${k}: ${v}`)
 
 /** Children of the lucide SVG, minus its own opening tag. */
-function innerOf(svg) {
-  const open = svg.indexOf('>')
-  const close = svg.lastIndexOf('</svg>')
-  return svg.slice(open + 1, close).trim().replace(/\s+/g, ' ')
+function inner(svg) {
+  const a = svg.indexOf('>'), b = svg.lastIndexOf('</svg>')
+  return svg.slice(a + 1, b).trim().replace(/\s+/g, ' ')
 }
-const SEAL = innerOf(ShieldCheck)
+const SEAL = inner(ShieldCheck)
 
-/** A seal scaled from lucide's 24x24 box to `size`, positioned at x,y. */
-function seal(x, y, size, color, strokeWidth = 2) {
-  const s = size / 24
-  return `<g transform="translate(${x} ${y}) scale(${s})" fill="none" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${SEAL}</g>`
+function seal(size, color, strokeWidth = 2) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${SEAL}</svg>`
 }
+
+const FONTS = `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600;700&display=block">`
+
+/** The hatched separator band, same recipe as the site. */
+const HATCH = (h = 22) =>
+  `<div style="height:${h}px;border-top:1px solid ${T.rule};border-bottom:1px solid ${T.rule};
+    background-image:repeating-linear-gradient(-45deg, color-mix(in oklch, ${T.ink} 16%, transparent) 0 1px, transparent 1px 7px)"></div>`
 
 // --- the 1200x630 social card ---------------------------------------------
-// Structure mirrors the site: lab-paper field, the mark, one line of what it
-// is, and the ruled JUDGED formula on the same fixed dark plate the page uses
-// for its load-bearing sentence.
-function ogSvg() {
-  const bandY = 470
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-  <rect width="1200" height="630" fill="${C.paper}"/>
-  ${seal(96, 92, 76, C.primary, 2.1)}
-  <text x="190" y="152" font-family="${FONT}" font-size="66" font-weight="800" fill="${C.ink}" letter-spacing="-2">api.qa</text>
-  <text x="96" y="286" font-family="${FONT}" font-size="54" font-weight="700" fill="${C.ink}" letter-spacing="-1.6">The external verifier for</text>
-  <text x="96" y="352" font-family="${FONT}" font-size="54" font-weight="700" fill="${C.ink}" letter-spacing="-1.6">agent-first APIs</text>
-  <text x="96" y="416" font-family="${MONO}" font-size="27" fill="${C.muted}">curl api.qa/{domain}</text>
-  <rect x="0" y="${bandY}" width="1200" height="160" fill="${C.plate}"/>
-  <text x="96" y="${bandY + 68}" font-family="${FONT}" font-size="21" font-weight="600" fill="${C.onCode}" letter-spacing="2.4">THE CORE INVARIANT</text>
-  <text x="96" y="${bandY + 118}" font-family="${FONT}" font-size="34" font-weight="600" fill="${C.plateText}" letter-spacing="-0.8">judged by api.qa, never self-graded</text>
-</svg>`
+// Mirrors the page: ruled top bar, hatch, title block, hatch, and the ruled
+// invariant on the fixed dark plate.
+function ogHtml() {
+  return `<!doctype html><meta charset="utf-8">${FONTS}
+<style>
+  *{box-sizing:border-box;margin:0}
+  body{width:1200px;height:630px;background:${T.paper};color:${T.ink};
+    font-family:'IBM Plex Sans',sans-serif;display:flex;flex-direction:column;overflow:hidden}
+  .bar{display:flex;align-items:center;gap:12px;padding:26px 64px;
+    font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:27px;letter-spacing:-.02em}
+  .body{flex:1;padding:56px 64px 0;display:flex;flex-direction:column}
+  h1{font-size:76px;font-weight:700;letter-spacing:-.03em;line-height:1.05;max-width:17ch}
+  h1 em{font-style:normal;color:${T.teal}}
+  .cmd{margin-top:auto;margin-bottom:46px;font-family:'IBM Plex Mono',monospace;
+    font-size:26px;background:${T.plate};color:${T['plate-ink']};
+    padding:16px 22px;align-self:flex-start}
+  .plate{background:${T.plate};color:${T['plate-ink']};padding:26px 64px 30px}
+  .plate .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:17px;letter-spacing:.16em;
+    text-transform:uppercase;color:${T['plate-accent']};display:flex;align-items:center;gap:10px}
+  .plate .eyebrow::before{content:"";width:7px;height:7px;background:${T['plate-accent']}}
+  .plate .line{margin-top:14px;font-size:36px;font-weight:600;letter-spacing:-.02em}
+</style>
+<div class="bar">${seal(30, T.teal, 2.1)} api.qa</div>
+${HATCH()}
+<div class="body">
+  <h1>The external verifier for <em>agent-first</em> APIs</h1>
+  <div class="cmd">curl api.qa/{domain}</div>
+</div>
+<div class="plate">
+  <div class="eyebrow">The core invariant</div>
+  <div class="line">judged by api.qa, never self-graded</div>
+</div>`
 }
 
 /** Square app icon: the mark on the brand plate. */
-function iconSvg(size) {
-  const pad = size * 0.19
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
-  <rect width="${size}" height="${size}" rx="${size * 0.22}" fill="${C.plate}"/>
-  ${seal(pad, pad, size - pad * 2, C.onCode, 2.2)}
-</svg>`
+function iconHtml(size) {
+  const pad = Math.round(size * 0.2)
+  return `<!doctype html><meta charset="utf-8">
+<style>*{box-sizing:border-box;margin:0}
+  body{width:${size}px;height:${size}px;background:${T.plate};
+    display:grid;place-items:center;overflow:hidden}</style>
+<div>${seal(size - pad * 2, T['plate-accent'], 2.2)}</div>`
 }
 
-// --- rasterize -------------------------------------------------------------
+// --- render ----------------------------------------------------------------
 const tmp = mkdtempSync(join(tmpdir(), 'apiqa-assets-'))
 
-function png(svg, name, width, height) {
-  const svgPath = join(tmp, `${name}.svg`)
+function shot(html, name, w, h) {
+  const htmlPath = join(tmp, `${name}.html`)
   const pngPath = join(tmp, `${name}.png`)
-  writeFileSync(svgPath, svg)
-  try {
-    execFileSync('rsvg-convert', ['-w', String(width), '-h', String(height), '-o', pngPath, svgPath])
-  } catch (err) {
-    console.error(`\nrsvg-convert failed for ${name}. Install it with:  brew install librsvg\n`)
-    throw err
-  }
+  writeFileSync(htmlPath, html)
+  execFileSync(CHROME, [
+    '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
+    // budget gives the webfont time to arrive before the frame is captured
+    '--virtual-time-budget=8000',
+    `--window-size=${w},${h}`,
+    `--screenshot=${pngPath}`,
+    `file://${htmlPath}`,
+  ], { stdio: 'pipe' })
   const bytes = readFileSync(pngPath)
-  console.log(`  ${name}.png  ${width}x${height}  ${(bytes.length / 1024).toFixed(1)} KB`)
-  // ASSET_OUT=<dir> also drops the raster next to you, for eyeballing the card.
+  console.log(`  ${name}.png  ${w}x${h}  ${(bytes.length / 1024).toFixed(1)} KB`)
   if (process.env.ASSET_OUT) writeFileSync(join(process.env.ASSET_OUT, `${name}.png`), bytes)
   return bytes.toString('base64')
 }
 
-console.log('generating brand assets:')
-const og = png(ogSvg(), 'og', 1200, 630)
-const apple = png(iconSvg(180), 'apple-touch-icon', 180, 180)
-const ico = png(iconSvg(32), 'favicon', 32, 32)
+console.log('\nrendering via Chrome:')
+const og = shot(ogHtml(), 'og', 1200, 630)
+const apple = shot(iconHtml(180), 'apple-touch-icon', 180, 180)
+const ico = shot(iconHtml(32), 'favicon', 32, 32)
 
 const out = `/**
  * GENERATED FILE — do not edit by hand.
  * Regenerate with: node scripts/gen-assets.mjs
  *
  * Base64 raster brand assets, inlined because a Worker has no filesystem.
- * The seal glyph originates from \`lucide-static\`, the same source
- * \`src/icons.ts\` uses at runtime.
+ * Rendered by Chrome from the same tokens and typefaces the site uses; the seal
+ * glyph originates from \`lucide-static\`, the same source \`src/icons.ts\` uses.
  */
 
 /** 1200x630 social card, referenced by og:image / twitter:image. */
