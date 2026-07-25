@@ -80,7 +80,9 @@ function tokensCss(): string {
 
   /* The plate is theme-INVARIANT: terminals read as the same dark surface in
      both themes, the way a screenshot of a terminal would. */
-  --plate: oklch(0.190 0.024 220);
+  /* Deep enough to stay a distinct surface on DARK paper too: at 0.190 the
+     snippet measured 1.01:1 against a 0.185 paper and vanished. */
+  --plate: oklch(0.128 0.022 222);
   --plate-ink: oklch(0.910 0.014 190);
   --plate-dim: oklch(0.680 0.016 195);
   --plate-rule: oklch(0.280 0.020 220);
@@ -138,7 +140,7 @@ function tokensCss(): string {
        tuned, not chosen: below ~0.84 the field bleeds through the text and
        small copy drops under 4.5:1. */
     --window-bg: color-mix(in srgb, oklch(0.225 0.016 212) 86%, transparent);
-    --term-bg: color-mix(in srgb, oklch(0.190 0.024 220) 84%, transparent);
+    --term-bg: color-mix(in srgb, var(--plate) 84%, transparent);
   }
 }`
 }
@@ -256,11 +258,11 @@ h1 em,h2 em{font-style:normal;color:var(--teal)}
 
 /* verdict chips */
 .chip{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;
-  font-family:var(--mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;
-  line-height:1;white-space:nowrap;padding:.28rem .48rem;border:1px solid}
+  font-family:var(--mono);font-size:.64rem;font-weight:600;letter-spacing:.1em;
+  text-transform:uppercase;line-height:1;white-space:nowrap;padding:.28rem .48rem;border:1px solid}
 .chip.pass{color:var(--pass);border-color:color-mix(in srgb,var(--pass) 42%,transparent)}
 .chip.fail{color:var(--fail);border-color:color-mix(in srgb,var(--fail) 42%,transparent)}
-.chip.skip{color:var(--skip);border-color:var(--rule)}
+.chip.skip{color:var(--ink-soft);border-color:color-mix(in srgb,var(--ink) 28%,transparent)}
 .chip.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 42%,transparent)}
 
 /* terminal — the one dark surface in the system */
@@ -870,12 +872,15 @@ table.ax td.v{text-align:right;width:6rem}
 .checks{margin-top:1.75rem;border:1px solid var(--rule);background:var(--panel)}
 .chk{padding:.95rem clamp(.8rem,2.5vw,1.2rem);border-top:1px solid var(--rule-soft)}
 .chk:first-child{border-top:0}
-.chk.fail{background:color-mix(in srgb,var(--fail-soft) 55%,var(--panel))}
+/* A wash of red reads as a highlighter mark, which is the wrong idiom for a
+   ruled certificate. The FAIL chip already carries the signal at the head of
+   every row, so the row only needs a whisper of warmth behind it. */
+.chk.fail{background:color-mix(in srgb,var(--fail-soft) 20%,var(--panel))}
 .chk-h{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
 .chk-h .t{font-weight:600;font-size:.95rem}
 .chk-h code{font-family:var(--mono);font-size:.72rem;color:var(--ink-soft);
   background:color-mix(in srgb,var(--ink) 7%,transparent);padding:.1rem .4rem}
-.chk p{color:var(--ink-soft);font-size:.88rem;margin-top:.5rem;line-height:1.6;max-width:78ch}
+.chk p{color:var(--ink-soft);font-size:.88rem;margin-top:.5rem;line-height:1.6;max-width:104ch}
 
 .attest{margin-top:1.75rem;border:1px solid var(--rule);background:var(--panel);padding:clamp(1.1rem,3vw,1.4rem)}
 .attest dl{display:grid;grid-template-columns:9rem 1fr;gap:.55rem 1rem;margin:0;font-size:.82rem}
