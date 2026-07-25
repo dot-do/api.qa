@@ -25,6 +25,16 @@ import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type Suit
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
 import { sealDocument } from './icons.js'
+
+/**
+ * Favicon ground + mark, kept in step with the PNG icons in src/assets.ts.
+ * These duplicate --plate/--teal because a favicon has no cascade to inherit
+ * from; the DUPLICATION IS THE HAZARD — the SVG favicon shipped the pre-56206a6
+ * plate for several deploys while the PNG siblings moved, so the same site
+ * served two favicons on two different grounds. Asserted in test/views.test.ts.
+ */
+export const FAVICON_GROUND = 'oklch(0.185 0.014 210)'
+export const FAVICON_MARK = 'oklch(0.760 0.128 178)'
 import {
   assetBytes,
   OG_PNG_BASE64,
@@ -630,7 +640,7 @@ export function createApp(
             // currentColor has nothing to inherit from in a favicon context, so
             // the mark is resolved against the dark plate at both theme settings.
             return asset(
-              sealDocument({ size: 32, color: 'oklch(0.800 0.130 175)', background: 'oklch(0.190 0.024 220)' }),
+              sealDocument({ size: 32, color: FAVICON_MARK, background: FAVICON_GROUND }),
               'image/svg+xml',
             )
           }

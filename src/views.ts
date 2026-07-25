@@ -124,12 +124,12 @@ function tokensCss(): string {
     --warn-soft: oklch(0.330 0.060 70);
     --skip: oklch(0.640 0.020 200);
     --hatch: oklch(0.930 0.010 185 / 0.13);
-    --grade-aplus: oklch(0.760 0.145 160);
+    --grade-aplus: var(--pass);
     --grade-a: oklch(0.775 0.140 150);
     --grade-b: oklch(0.800 0.135 128);
     --grade-c: oklch(0.815 0.140 75);
     --grade-d: oklch(0.760 0.165 45);
-    --grade-f: oklch(0.700 0.180 27);
+    --grade-f: var(--fail);
     /* Lifted so the windows never converge with the field they float on: at the
        previous values the terminal separated from the dark stop at 1.16:1 and
        visually dissolved into it. */
@@ -139,7 +139,7 @@ function tokensCss(): string {
     /* Translucent at night so the field reads through the windows. Alpha is
        tuned, not chosen: below ~0.84 the field bleeds through the text and
        small copy drops under 4.5:1. */
-    --window-bg: color-mix(in srgb, oklch(0.225 0.016 212) 86%, transparent);
+    --window-bg: color-mix(in srgb, var(--panel) 86%, transparent);
     --term-bg: color-mix(in srgb, var(--plate) 84%, transparent);
   }
 }`

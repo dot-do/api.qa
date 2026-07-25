@@ -8,7 +8,9 @@
  */
 
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { meterSegments } from '../src/views.js'
+import { FAVICON_GROUND, FAVICON_MARK } from '../src/worker.js'
 import type { AxScore, Verdict } from '../src/types.js'
 
 type Item = AxScore['items'][number]
@@ -73,5 +75,62 @@ describe('meterSegments', () => {
 
   it('handles an empty item list without throwing', () => {
     expect(meterSegments([])).toEqual([])
+  })
+})
+
+/**
+ * Token-drift guards. Both of these defects actually shipped: --term-bg
+ * color-mixed a hardcoded copy of --plate and kept the old value when --plate
+ * moved, and the SVG favicon painted on the pre-56206a6 plate while its PNG
+ * siblings moved — the same site served two favicons on two different grounds.
+ * A value copied instead of referenced is correct exactly until the source
+ * moves, and nothing else in the toolchain notices.
+ */
+describe('token drift', () => {
+  const views = readFileSync(new URL('../src/views.ts', import.meta.url), 'utf8')
+
+  /** Declared values from a :root block, keyed by token name. */
+  function tokens(block: string): Map<string, string> {
+    const out = new Map<string, string>()
+    for (const m of block.matchAll(/--([a-z-]+):\s*([^;]+);/g)) out.set(m[1]!, m[2]!.trim())
+    return out
+  }
+  const darkBlock = views.slice(views.indexOf('@media (prefers-color-scheme: dark)'))
+  const dark = tokens(darkBlock.slice(0, darkBlock.indexOf('}`')))
+
+  /**
+   * Coincidences that are NOT copies. Each must be justified, because the whole
+   * point of the check is that a human declares intent rather than the equality
+   * passing silently. --teal-ink is "ink on a teal fill"; in dark it happens to
+   * equal --paper, but in LIGHT the two differ, so referencing would be
+   * correct-by-accident and would break if --paper moved.
+   */
+  const ALLOWED_COINCIDENCES = [['paper', 'teal-ink']]
+
+  it('no token value is duplicated verbatim — a duplicate IS a copy waiting to drift', () => {
+    const seen = new Map<string, string[]>()
+    for (const [name, value] of dark) {
+      if (value.startsWith('var(') || value.startsWith('color-mix')) continue
+      seen.set(value, [...(seen.get(value) ?? []), name])
+    }
+    for (const pair of ALLOWED_COINCIDENCES) {
+      for (const [value, names] of seen) {
+        if (pair.every((n) => names.includes(n))) seen.set(value, names.filter((n) => !pair.includes(n)))
+      }
+    }
+    const dupes = [...seen.entries()].filter(([, names]) => names.length > 1)
+    expect(dupes, `duplicated dark token values: ${JSON.stringify(dupes)}`).toEqual([])
+  })
+
+  it('composed tokens reference other tokens rather than inlining their values', () => {
+    for (const [name, value] of dark) {
+      if (!value.startsWith('color-mix')) continue
+      expect(value, `--${name} inlines a literal instead of referencing a token`).toMatch(/var\(--/)
+    }
+  })
+
+  it('the SVG favicon uses the same ground and mark as the generated PNG icons', () => {
+    expect(FAVICON_GROUND).toBe(dark.get('paper'))
+    expect(FAVICON_MARK).toBe(dark.get('teal'))
   })
 })
