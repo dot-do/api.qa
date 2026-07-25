@@ -24,6 +24,13 @@ import { verifyTarget, rejudge } from './verify.js'
 import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type SuiteReport } from './pinned.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
+import { sealDocument } from './icons.js'
+import {
+  assetBytes,
+  OG_PNG_BASE64,
+  APPLE_TOUCH_ICON_PNG_BASE64,
+  FAVICON_PNG_BASE64,
+} from './assets.js'
 import { generateSigningKey, importSigningKeyPair, verdictDigest } from './attest.js'
 import { sha256Hex } from './digest.js'
 import {
@@ -615,6 +622,28 @@ export function createApp(
           if (path === '/health') return json({ ok: true, verifier: 'api.qa', version: VERIFIER_VERSION })
           if (path === '/offers/attested-run') return json(selfOffer(), 402)
 
+          // Brand assets. These MUST be matched before DOMAIN_ROUTE: that regex
+          // accepts any single dotted segment, so `/favicon.ico` would otherwise
+          // be treated as a domain to verify — minting a signed Grade F report
+          // (and firing a live outbound probe) on every browser visit.
+          if (path === '/favicon.svg') {
+            // currentColor has nothing to inherit from in a favicon context, so
+            // the mark is resolved against the dark plate at both theme settings.
+            return asset(
+              sealDocument({ size: 32, color: 'oklch(0.800 0.130 175)', background: 'oklch(0.190 0.024 220)' }),
+              'image/svg+xml',
+            )
+          }
+          if (path === '/favicon.ico') {
+            return asset(assetBytes(FAVICON_PNG_BASE64), 'image/png')
+          }
+          if (path === '/apple-touch-icon.png' || path === '/apple-touch-icon-precomposed.png') {
+            return asset(assetBytes(APPLE_TOUCH_ICON_PNG_BASE64), 'image/png')
+          }
+          if (path === '/og.png') {
+            return asset(assetBytes(OG_PNG_BASE64), 'image/png')
+          }
+
           const domain = path === '/self' ? 'api.qa' : DOMAIN_ROUTE.exec(path)?.[1]
           if (domain) {
             const isSelf = domain === 'api.qa'
@@ -1163,6 +1192,22 @@ function json(body: unknown, status = 200, extra: Record<string, string> = {}): 
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', link: LINKSET, 'access-control-allow-origin': '*', ...extra },
+  })
+}
+
+/**
+ * Immutable brand asset (favicon, app icon, OG card). These are content-stable
+ * for a given verifier build, so they carry a long max-age — unlike a verdict,
+ * whose freshness is the whole point.
+ */
+function asset(body: string | Uint8Array, contentType: string, extra: Record<string, string> = {}): Response {
+  return new Response(body as BodyInit, {
+    headers: {
+      'content-type': contentType,
+      'cache-control': 'public, max-age=604800, immutable',
+      'access-control-allow-origin': '*',
+      ...extra,
+    },
   })
 }
 
