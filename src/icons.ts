@@ -16,7 +16,7 @@
  * icons in `em` so they track the text they sit beside.
  */
 
-import { ShieldCheck } from 'lucide-static'
+import { ShieldCheck, Menu, X } from 'lucide-static'
 import { siGithub } from 'simple-icons'
 
 /**
@@ -32,6 +32,21 @@ function inner(svg: string): string {
 }
 
 const SHIELD_CHECK_INNER = inner(ShieldCheck)
+
+/** Stroke icon in this design's house geometry: 24-box, 2px, round joins. */
+function strokeIcon(svg: string, cls: string, size: number): string {
+  return `<svg class="${cls}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner(svg)}</svg>`
+}
+
+/** Hamburger trigger for the mobile navigation panel. */
+export function menuIcon(cls = 'icon'): string {
+  return strokeIcon(Menu, cls, 20)
+}
+
+/** Dismiss control inside the mobile navigation panel. */
+export function closeIcon(cls = 'icon'): string {
+  return strokeIcon(X, cls, 16)
+}
 
 /**
  * The verified-seal glyph — a shield enclosing a check. api.qa's mark on the

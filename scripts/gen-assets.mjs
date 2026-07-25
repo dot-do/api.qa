@@ -29,17 +29,19 @@ import { ShieldCheck } from 'lucide-static'
 // rsvg has no OKLCH support, so the tokens in views.ts are resolved here once.
 // If a token changes, update its twin below and rerun.
 const C = {
-  paper: '#f7fbfa', // --background  oklch(0.988 0.006 175)
-  ink: '#0f1c20', // --foreground  oklch(0.205 0.021 210)
-  primary: '#00776c', // --primary     oklch(0.520 0.118 185)
-  plate: '#0d1519', // --code-bg     oklch(0.190 0.024 220)
-  onCode: '#4fd6c0', // --on-code     oklch(0.800 0.130 175)
-  plateText: '#e4efec', // --code-fg     oklch(0.910 0.014 190)
-  muted: '#5c6b6d', // --muted-foreground
+  paper: '#e9ecea', // --paper          oklch(0.930 0.004 175)
+  ink: '#0f1c20', // --ink            oklch(0.205 0.021 210)
+  primary: '#00776c', // --teal           oklch(0.520 0.118 185)
+  plate: '#0d1519', // --plate          oklch(0.190 0.024 220)
+  onCode: '#4fd6c0', // --plate-accent   oklch(0.800 0.130 175)
+  plateText: '#e4efec', // --plate-ink      oklch(0.910 0.014 190)
+  muted: '#5c6b6d', // --ink-soft
 }
 
-const FONT = "Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif"
-const MONO = "'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace"
+// Plex if the generating machine has it installed; otherwise a neutral grotesque.
+// rsvg resolves through fontconfig, so this is a best-effort preference.
+const FONT = "'IBM Plex Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+const MONO = "'IBM Plex Mono', 'SF Mono', Menlo, Consolas, monospace"
 
 /** Children of the lucide SVG, minus its own opening tag. */
 function innerOf(svg) {
