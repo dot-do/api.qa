@@ -21,8 +21,8 @@
  * real face, in the real design language, from the real tokens.
  *
  * WHY THE TOKENS ARE PARSED OUT OF views.ts: hand-copied hex values drift the
- * moment a token moves. They already had. The light-theme `:root` block is the
- * single source; this script reads it.
+ * moment a token moves. They already had. The DARK-theme `:root` block is the
+ * single source, because the card is the dark UI; this script reads it.
  *
  * Requires Google Chrome. Set CHROME=/path/to/chrome to override.
  */
@@ -44,7 +44,10 @@ if (!existsSync(CHROME)) {
 // --- tokens, read from the stylesheet rather than copied -------------------
 
 const viewsSrc = readFileSync(new URL('../src/views.ts', import.meta.url), 'utf8')
-const rootBlock = viewsSrc.slice(viewsSrc.indexOf(':root{'), viewsSrc.indexOf('@media (prefers-color-scheme: dark)'))
+// The card is the dark-mode UI, so it reads the DARK :root block. Light values
+// would be the wrong palette entirely.
+const darkStart = viewsSrc.indexOf('@media (prefers-color-scheme: dark)')
+const rootBlock = viewsSrc.slice(darkStart, viewsSrc.indexOf('}`', darkStart))
 
 function token(name) {
   const m = rootBlock.match(new RegExp(`--${name}:\\s*([^;]+);`))
@@ -53,7 +56,7 @@ function token(name) {
 }
 
 const T = Object.fromEntries(
-  ['paper', 'panel', 'ink', 'ink-soft', 'rule', 'teal', 'plate', 'plate-ink', 'plate-accent'].map(
+  ['paper', 'ink', 'ink-soft', 'teal'].map(
     (n) => [n, token(n)],
   ),
 )
@@ -73,54 +76,32 @@ function seal(size, color, strokeWidth = 2) {
 
 const FONTS = `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600;700&display=block">`
 
-/** The hatched separator band, same recipe as the site. */
-const HATCH = (h = 22) =>
-  `<div style="height:${h}px;border-top:1px solid ${T.rule};border-bottom:1px solid ${T.rule};
-    background-image:repeating-linear-gradient(-45deg, color-mix(in oklch, ${T.ink} 16%, transparent) 0 1px, transparent 1px 7px)"></div>`
-
 // --- the 1200x630 social card ---------------------------------------------
-// Mirrors the page: ruled top bar, hatch, title block, hatch, and the ruled
-// invariant on the fixed dark plate.
+// Logo and tagline on the dark UI. Nothing else: a social card is seen at
+// thumbnail size in a feed, so anything past the mark and one line is noise.
 function ogHtml() {
   return `<!doctype html><meta charset="utf-8">${FONTS}
 <style>
   *{box-sizing:border-box;margin:0}
   body{width:1200px;height:630px;background:${T.paper};color:${T.ink};
-    font-family:'IBM Plex Sans',sans-serif;display:flex;flex-direction:column;overflow:hidden}
-  .bar{display:flex;align-items:center;gap:12px;padding:26px 64px;
-    font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:27px;letter-spacing:-.02em}
-  .body{flex:1;padding:56px 64px 0;display:flex;flex-direction:column}
-  h1{font-size:76px;font-weight:700;letter-spacing:-.03em;line-height:1.05;max-width:17ch}
-  h1 em{font-style:normal;color:${T.teal}}
-  .cmd{margin-top:auto;margin-bottom:46px;font-family:'IBM Plex Mono',monospace;
-    font-size:26px;background:${T.plate};color:${T['plate-ink']};
-    padding:16px 22px;align-self:flex-start}
-  .plate{background:${T.plate};color:${T['plate-ink']};padding:26px 64px 30px}
-  .plate .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:17px;letter-spacing:.16em;
-    text-transform:uppercase;color:${T['plate-accent']};display:flex;align-items:center;gap:10px}
-  .plate .eyebrow::before{content:"";width:7px;height:7px;background:${T['plate-accent']}}
-  .plate .line{margin-top:14px;font-size:36px;font-weight:600;letter-spacing:-.02em}
+    font-family:'IBM Plex Sans',sans-serif;overflow:hidden;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:38px}
+  .lockup{display:flex;align-items:center;gap:22px;
+    font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:82px;letter-spacing:-.04em}
+  .tagline{font-size:37px;font-weight:400;color:${T['ink-soft']};letter-spacing:-.015em}
 </style>
-<div class="bar">${seal(30, T.teal, 2.1)} api.qa</div>
-${HATCH()}
-<div class="body">
-  <h1>The external verifier for <em>agent-first</em> APIs</h1>
-  <div class="cmd">curl api.qa/{domain}</div>
-</div>
-<div class="plate">
-  <div class="eyebrow">The core invariant</div>
-  <div class="line">judged by api.qa, never self-graded</div>
-</div>`
+<div class="lockup">${seal(74, T.teal, 2.1)} api.qa</div>
+<div class="tagline">The external verifier for agent-first APIs</div>`
 }
 
-/** Square app icon: the mark on the brand plate. */
+/** Square app icon: the mark on the dark UI ground. */
 function iconHtml(size) {
   const pad = Math.round(size * 0.2)
   return `<!doctype html><meta charset="utf-8">
 <style>*{box-sizing:border-box;margin:0}
-  body{width:${size}px;height:${size}px;background:${T.plate};
+  body{width:${size}px;height:${size}px;background:${T.paper};
     display:grid;place-items:center;overflow:hidden}</style>
-<div>${seal(size - pad * 2, T['plate-accent'], 2.2)}</div>`
+<div>${seal(size - pad * 2, T.teal, 2.2)}</div>`
 }
 
 // --- render ----------------------------------------------------------------
