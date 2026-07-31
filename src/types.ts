@@ -319,11 +319,33 @@ export interface EndpointExpect {
     path: string
     equals?: unknown
     exists?: boolean
+    /**
+     * Closed-vocabulary membership: the value at `path` must deep-equal ONE of
+     * these values (e.g. AXP's pricing `model` ∈ ["free","metered"]). A missing
+     * path or a value outside the set is a failure.
+     */
+    oneOf?: unknown[]
     gte?: number
     lte?: number
     gt?: number
     lt?: number
   }>
+}
+
+/**
+ * Conditional applicability for `probe` / `check` requirements: the requirement
+ * applies only when the value at `path` inside the FIRST declared probe of
+ * channel `fromProbe` (as OBSERVED in this run — entry index 0) deep-equals
+ * `equals`. A non-applicable requirement passes as "not applicable" (this is
+ * how a free-model API passes AXP's metering requirements). FAIL-CLOSED rule:
+ * when the source probe was not observed, is not JSON, or the path does not
+ * resolve, the requirement APPLIES — applicability can only be proven by the
+ * observed value, never by its absence.
+ */
+export interface AppliesWhen {
+  fromProbe: string
+  path: string
+  equals: unknown
 }
 
 export type PinnedRequirement =
@@ -384,9 +406,17 @@ export type PinnedRequirement =
        * When present, every declared entry for this channel must carry a
        * `param` member; the verifier sets that query parameter to this value.
        * Object form derives the value from another channel's observed JSON
-       * body — the VERIFIER, never the manifest, owns the amount.
+       * body — the VERIFIER, never the manifest, owns the amount. `multiply`
+       * scales by a fixed factor; `multiplyRange: [lo, hi]` scales by a
+       * SEED-RANDOMIZED factor drawn deterministically from the run seed within
+       * [lo, hi] — so the exact probed amount is not precomputable from the
+       * declared ceiling (AXP Clause 5), yet fully replayable from the report's
+       * seed. When both are present, `multiply` wins (the fixed pin is
+       * stricter).
        */
-      paramValue?: number | { fromProbe: string; path: string; multiply?: number }
+      paramValue?: number | { fromProbe: string; path: string; multiply?: number; multiplyRange?: [number, number] }
+      /** Conditional applicability (see AppliesWhen). Absent = always applies. */
+      appliesWhen?: AppliesWhen
       /**
        * When true, every declared entry's pathname must ALSO be observed
        * answering `200` with a top-level `type: "OK"` JSON envelope somewhere
@@ -408,7 +438,19 @@ export type PinnedRequirement =
    * verification instead of letting it ride a coarse floor that tolerates its
    * violation. A `skip` or unknown check id is a failure under `must: 'pass'`.
    */
-  | { id: string; kind: 'check'; check: string; must: 'pass' }
+  | {
+      id: string
+      kind: 'check'
+      check: string
+      must: 'pass'
+      /**
+       * Conditional applicability (see AppliesWhen): e.g. AXP pins
+       * `check-offers-402` with `appliesWhen {fromProbe:'pricing', path:'model',
+       * equals:'metered'}` so a free-model target passes it as not applicable
+       * instead of being wrongly failed. Absent = always applies.
+       */
+      appliesWhen?: AppliesWhen
+    }
 
 export interface PinnedSpec {
   $type: 'PinnedSpec'

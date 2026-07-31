@@ -1,9 +1,9 @@
 {
   "$type": "PinnedSpec",
   "name": "apis-ax-axp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "standard": "https://apis.ax/axp",
-  "description": "The apis.ax curation gate as an api.qa PinnedSpec: the machine-checkable form of AXP, the Agent eXperience Protocol. Every RFC-2119 MUST clause is pinned to its OWN discriminating verification — a specific api.qa check (kind:'check') or a behavioral probe — so no clause rides a coarse aggregate that would tolerate its violation. Every requirement restates an obligation printed in PROTOCOL.md; the seven probe requirements are verbatim its Appendix A.4, resolved against the target's own card-declared probe manifest (agents.json `probes`, Appendix A.3) and failing closed when it is absent, incomplete, or invalid. The manifest declares only WHERE the verifier probes; what counts as passing lives here, and the verifier derives the over-ceiling, below-ceiling, and zero amounts itself. The knownEmpty/knownForbidden pathnames must also be observed serving 200 OK in the same run (pathMustServeOk), so a dedicated decoy endpoint cannot satisfy Clause 4. api.qa (held outside the building fleet's write access) verifies a target against this contract; a Listing is admitted to the catalog iff api.qa returns passed: true.",
+  "description": "The apis.ax curation gate as an api.qa PinnedSpec: the machine-checkable form of AXP, the Agent eXperience Protocol. Every RFC-2119 MUST clause is pinned to its OWN discriminating verification — a specific api.qa check (kind:'check') or a behavioral probe — so no clause rides a coarse aggregate that would tolerate its violation. Every requirement restates an obligation printed in PROTOCOL.md; the eight probe requirements are verbatim its Appendix A.4, resolved against the target's own card-declared probe manifest (agents.json `probes`, Appendix A.3) and failing closed when it is absent, incomplete, or invalid. The manifest declares only WHERE the verifier probes; what counts as passing lives here, and the verifier derives the over-ceiling, below-ceiling, and zero amounts itself. The knownEmpty/knownForbidden pathnames must also be observed serving 200 OK in the same run (pathMustServeOk), so a dedicated decoy endpoint cannot satisfy Clause 4. Clause 3's deterministic content negotiation (three faces, address > Accept > client-class precedence, Link alternates — Appendix A.7) is pinned via the four conneg checks plus machine-legible-home, and conneg-forced-face fails closed when a home advertises no resolvable alternates. api.qa (held outside the building fleet's write access) verifies a target against this contract; a Listing is admitted to the catalog iff api.qa returns passed: true.",
   "requirements": [
     { "id": "llms-present", "kind": "surface", "surface": "llms.txt", "must": "present" },
     { "id": "agents-present", "kind": "surface", "surface": "agents.json", "must": "valid" },
@@ -11,10 +11,15 @@
       "versionPrefix": "3.1", "minOperations": 1 },
 
     { "id": "check-machine-legible-home", "kind": "check", "check": "machine-legible-home", "must": "pass" },
+    { "id": "check-conneg-accept", "kind": "check", "check": "conneg-accept", "must": "pass" },
+    { "id": "check-conneg-client-class", "kind": "check", "check": "conneg-client-class", "must": "pass" },
+    { "id": "check-conneg-alternates", "kind": "check", "check": "conneg-alternates", "must": "pass" },
+    { "id": "check-conneg-forced-face", "kind": "check", "check": "conneg-forced-face", "must": "pass" },
     { "id": "check-offers-402", "kind": "check", "check": "offers-402", "must": "pass",
       "appliesWhen": { "fromProbe": "pricing", "path": "model", "equals": "metered" } },
     { "id": "check-keyless-flow", "kind": "check", "check": "keyless-flow", "must": "pass" },
     { "id": "check-agents-json", "kind": "check", "check": "agents-json", "must": "pass" },
+    { "id": "check-card-interfaces-linked", "kind": "check", "check": "card-interfaces-linked", "must": "pass" },
     { "id": "probe-manifest-valid", "kind": "check", "check": "probe-manifest", "must": "pass" },
 
     { "id": "keyless-first-value", "kind": "probe", "probe": "keyless",
@@ -30,15 +35,15 @@
       "expect": { "status": 200, "paths": [ { "path": "hardCeiling", "gt": 0 } ] } },
     { "id": "hard-ceiling-enforced", "kind": "probe", "probe": "overCeiling",
       "appliesWhen": { "fromProbe": "pricing", "path": "model", "equals": "metered" },
-      "paramValue": { "fromProbe": "pricing", "path": "hardCeiling", "multiply": 1000 },
+      "paramValue": { "fromProbe": "pricing", "path": "hardCeiling", "multiplyRange": [500, 1500] },
       "expect": { "status": [402], "paths": [ { "path": "type", "equals": "OFFER" } ] } },
     { "id": "hard-ceiling-below", "kind": "probe", "probe": "overCeiling",
       "appliesWhen": { "fromProbe": "pricing", "path": "model", "equals": "metered" },
       "paramValue": { "fromProbe": "pricing", "path": "hardCeiling", "multiply": 0.5 },
-      "expect": { "status": 200 } },
+      "expect": { "status": 200, "paths": [ { "path": "type", "equals": "OK" } ] } },
     { "id": "hard-ceiling-not-premature", "kind": "probe", "probe": "overCeiling",
       "appliesWhen": { "fromProbe": "pricing", "path": "model", "equals": "metered" },
       "paramValue": 0,
-      "expect": { "status": 200 } }
+      "expect": { "status": 200, "paths": [ { "path": "type", "equals": "OK" } ] } }
   ]
 }

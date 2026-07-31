@@ -82,7 +82,7 @@ export function assertWellFormedXml(xml: string): void {
   if (stack.length) throw new Error(`unclosed tags: ${stack.join(', ')}`)
 }
 
-type Handler = (req: { method: string; accept: string; body?: string }) => {
+type Handler = (req: { method: string; accept: string; body?: string; headers?: Record<string, string> }) => {
   status: number
   contentType?: string
   body?: string
@@ -233,7 +233,14 @@ export function makeFetcher(routes: Routes, origin = GOOD): Fetcher {
         headers: { 'content-type': 'application/json' },
       })
     }
-    const out = handler({ method, accept, body: typeof init?.body === 'string' ? init.body : undefined })
+    // All lowercased request headers, so conneg fixtures can branch on the
+    // client-class simulation headers (sec-fetch-*, user-agent).
+    const reqHeaders: Record<string, string> = {}
+    const rawHeaders = init?.headers
+    if (rawHeaders instanceof Headers) rawHeaders.forEach((v, k) => { reqHeaders[k.toLowerCase()] = v })
+    else if (Array.isArray(rawHeaders)) for (const [k, v] of rawHeaders) reqHeaders[k.toLowerCase()] = v
+    else if (rawHeaders) for (const [k, v] of Object.entries(rawHeaders)) reqHeaders[k.toLowerCase()] = v as string
+    const out = handler({ method, accept, body: typeof init?.body === 'string' ? init.body : undefined, headers: reqHeaders })
     return new Response(out.body ?? '', {
       status: out.status,
       headers: { 'content-type': out.contentType ?? 'text/plain', ...(out.headers ?? {}) },

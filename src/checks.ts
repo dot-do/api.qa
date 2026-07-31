@@ -23,6 +23,8 @@ import {
   isGithubNamespace,
   githubNamespaceOwner,
   parseJsonRpcMessage,
+  faceOfMediaType,
+  faceAlternatesOf,
   toolObjectsFrom,
   uiTemplateOfTool,
   resourceUriOfResult,
@@ -738,6 +740,238 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       streamEvidence, judgeUiStreamParity(us)))
   }
 
+  // ── AXP structural checks (Clause 3 conneg + Clause 6 cross-linking) ──────
+  //    Discriminating checks the AXP pinned spec binds via kind:'check':
+  //    machine-legible-home, conneg-accept, conneg-client-class,
+  //    conneg-alternates, conneg-forced-face (Clause 3 / Appendix A.7) and
+  //    card-interfaces-linked (Clause 6). Gated on the AXP opt-in signal — the
+  //    card-declared probe manifest (agents.json top-level `probes`), exactly
+  //    like the probe-manifest check: a target that never claimed AXP SKIPs
+  //    every one (generic advisory grading unaffected, no honesty cap), and a
+  //    pinned `must:'pass'` requirement turns that skip into a fail-closed
+  //    gate. A target that DOES declare the manifest is judged strictly.
+  {
+    const axpClaimed = agents.probes !== undefined
+    const axpSkip = (): { verdict: Verdict; detail: string } => ({
+      verdict: 'skip',
+      detail: 'no probe manifest declared (agents.json top-level `probes`) — target does not claim AXP; under a pinned must:pass this fails closed',
+    })
+
+    const asAgent = findEvidence(bundle, ROLE.rootAgent)
+    const asBrowser = findEvidence(bundle, ROLE.rootBrowser)
+    const asJson = findEvidence(bundle, ROLE.rootJson)
+    const asMarkdown = findEvidence(bundle, ROLE.rootMarkdown)
+    const asBrowserNav = findEvidence(bundle, ROLE.rootBrowserNav)
+    const asAgentUa = findEvidence(bundle, ROLE.rootAgentUa)
+
+    // Face judges (AXP A.7.1), shared by every conneg check below. The
+    // markdown face tolerates text/plain ONLY when the body is not JSON and
+    // not HTML (A.7.1: tolerated, SHOULD NOT be relied on).
+    const isHtmlFace = (ev: Evidence | undefined) => ok(ev) && ev!.body != null && looksLikeHtml(ev!.body)
+    const isJsonFace = (ev: Evidence | undefined) =>
+      ok(ev) && (ev!.contentType ?? '').toLowerCase().includes('json') && parseJsonBody(ev) !== undefined
+    const isMdFace = (ev: Evidence | undefined) => {
+      if (!ok(ev) || ev!.body == null || looksLikeHtml(ev!.body)) return false
+      const ct = (ev!.contentType ?? '').toLowerCase()
+      return ct.includes('markdown') || (ct.includes('text/plain') && parseJsonBody(ev) === undefined)
+    }
+    const got = (ev: Evidence | undefined) =>
+      `status ${ev?.status ?? 'ERR'}, content-type ${ev?.contentType ?? '(none)'}`
+
+    // (Clause 3, pinned `check-machine-legible-home`) — the home and the
+    // sampled declared typed bodies answer machine-legible non-HTML to every
+    // MACHINE-class request: bare `Accept: */*`, explicit `application/json`,
+    // and a known agent User-Agent. What a BROWSER gets is Clause 3 step-3a
+    // business (conneg-client-class), deliberately not judged here.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        const machineProfiles: Array<[string, Evidence | undefined]> = [
+          ['Accept: */* (bare)', asAgent],
+          ['Accept: application/json', asJson],
+          ['a known agent User-Agent on */*', asAgentUa],
+        ]
+        for (const [label, ev] of machineProfiles) {
+          if (!ok(ev) || ev?.body == null) problems.push(`home under ${label}: no 2xx body (${got(ev)})`)
+          else if (looksLikeHtml(ev.body)) problems.push(`home under ${label} answered HTML — a machine client received a wall of markup`)
+        }
+        let typedJudged = 0
+        for (const p of probes) {
+          if (p.status === null || p.status < 200 || p.status >= 300 || p.body == null) continue
+          typedJudged++
+          if (looksLikeHtml(p.body)) {
+            problems.push(`typed body ${p.role.replace(/^probe:endpoint:/, '')} answered HTML to Accept: application/json`)
+          }
+        }
+        result = problems.length === 0
+          ? pass(`home machine-legible under all three machine-class profiles; ${typedJudged} sampled typed bod${typedJudged === 1 ? 'y' : 'ies'} non-HTML`)
+          : { verdict: 'fail', detail: problems.slice(0, 6).join('; ') }
+      }
+      checks.push(check('machine-legible-home',
+        'home + typed bodies are machine-legible for every machine-class client (AXP Clause 3)', undefined,
+        [ROLE.rootAgent, ROLE.rootJson, ROLE.rootAgentUa, ...probes.map((p) => p.role)], result))
+    }
+
+    // (Clause 3, pinned `check-conneg-accept`, A.7 step 2) — an explicit
+    // face-naming Accept header receives exactly its face.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        if (!isHtmlFace(asBrowser)) problems.push(`Accept: text/html did not receive the HTML face (${got(asBrowser)})`)
+        if (!isJsonFace(asJson)) problems.push(`Accept: application/json did not receive the JSON face (${got(asJson)})`)
+        if (!isMdFace(asMarkdown)) problems.push(`Accept: text/markdown did not receive the markdown face (${got(asMarkdown)})`)
+        if (problems.length === 0) {
+          const jsonBody = parseJsonBody(asJson) as Record<string, unknown> | undefined
+          const isLd = jsonBody !== undefined && (jsonBody.$context !== undefined || jsonBody['@context'] !== undefined)
+          result = pass('text/html → HTML, application/json → JSON, text/markdown → markdown' +
+            (isLd
+              ? '; JSON face is JSON-LD ($context/@context present)'
+              : '; JSON face carries no $context/@context (SHOULD be JSON-LD — informational, A.7.1)'))
+        } else {
+          result = { verdict: 'fail', detail: problems.join('; ') }
+        }
+      }
+      checks.push(check('conneg-accept',
+        'explicit Accept selects its face: text/html → HTML, application/json → JSON, text/markdown → markdown (AXP A.7 step 2)', undefined,
+        [ROLE.rootBrowser, ROLE.rootJson, ROLE.rootMarkdown], result))
+    }
+
+    // (Clause 3, pinned `check-conneg-client-class`, A.7 step 3) — the three
+    // `*/*` client-class defaults: Sec-Fetch-detected browser navigation →
+    // HTML, known agent User-Agent → markdown, everything else (bare curl) →
+    // JSON.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        if (!isJsonFace(asAgent)) problems.push(`bare Accept: */* did not default to the JSON face (${got(asAgent)}) — everything that is neither a browser navigation nor a known agent defaults to JSON (A.7 step 3c)`)
+        if (!isHtmlFace(asBrowserNav)) problems.push(`Sec-Fetch browser navigation on */* did not default to the HTML face (${got(asBrowserNav)}) (A.7 step 3a)`)
+        if (!isMdFace(asAgentUa)) problems.push(`known agent User-Agent on */* did not default to the markdown face (${got(asAgentUa)}) (A.7 step 3b)`)
+        result = problems.length === 0
+          ? pass('*/* defaults: bare client → JSON, Sec-Fetch navigation → HTML, agent User-Agent → markdown')
+          : { verdict: 'fail', detail: problems.join('; ') }
+      }
+      checks.push(check('conneg-client-class',
+        'client-class defaults on Accept: */*: browser (Sec-Fetch) → HTML, known agent UA → markdown, everything else → JSON (AXP A.7 step 3)', undefined,
+        [ROLE.rootAgent, ROLE.rootBrowserNav, ROLE.rootAgentUa], result))
+    }
+
+    // (Clause 3, pinned `check-conneg-alternates`, A.7.5) — every face
+    // response advertises BOTH sibling faces via Link rel="alternate" with a
+    // type parameter.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        const faceResponses: Array<[string, Evidence | undefined]> = [
+          ['JSON (bare */*)', asAgent],
+          ['HTML (Accept: text/html)', asBrowser],
+          ['markdown (Accept: text/markdown)', asMarkdown],
+        ]
+        for (const [label, ev] of faceResponses) {
+          if (!ok(ev)) { problems.push(`${label} face: no 2xx response to judge (${got(ev)})`); continue }
+          const served = faceOfMediaType(ev!.contentType)
+          if (served === undefined) { problems.push(`${label} face: content-type ${ev!.contentType ?? '(none)'} names no AXP face`); continue }
+          const alternates = faceAlternatesOf(ev)
+          const siblings = (['html', 'json', 'md'] as const).filter((f) => f !== served)
+          const missing = siblings.filter((f) => alternates[f] === undefined)
+          if (missing.length > 0) {
+            problems.push(`${label} face advertises no Link rel="alternate" for sibling face(s): ${missing.join(', ')}`)
+          }
+        }
+        result = problems.length === 0
+          ? pass('every face response advertises both sibling faces via Link rel="alternate" + type')
+          : { verdict: 'fail', detail: problems.slice(0, 6).join('; ') }
+      }
+      checks.push(check('conneg-alternates',
+        'every face response advertises its sibling faces via Link rel="alternate" (AXP A.7.5)', undefined,
+        [ROLE.rootAgent, ROLE.rootBrowser, ROLE.rootMarkdown], result))
+    }
+
+    // (Clause 3, pinned `check-conneg-forced-face`, A.7 rule 1) — each
+    // Link-advertised face ADDRESS, fetched with a CONTRADICTORY Accept
+    // header, still serves its advertised face: the address wins. Fails
+    // closed when a face address was never advertised/resolvable — a home
+    // that advertises no alternates cannot demonstrate rule 1.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        const faceJudges: Record<'html' | 'json' | 'md', (ev: Evidence | undefined) => boolean> = {
+          html: isHtmlFace, json: isJsonFace, md: isMdFace,
+        }
+        const contradicted: Record<'html' | 'json' | 'md', string> = {
+          html: 'application/json', json: 'text/html', md: 'text/html',
+        }
+        for (const face of ['html', 'json', 'md'] as const) {
+          const ev = findEvidence(bundle, ROLE.face(face))
+          if (!ev) {
+            problems.push(`no same-origin ${face} face address was advertised via Link rel="alternate" — rule 1 (the address forces) is undemonstrable, failing closed`)
+            continue
+          }
+          if (!faceJudges[face](ev)) {
+            problems.push(`advertised ${face} face address ${ev.url} did not serve the ${face} face under Accept: ${contradicted[face]} (${got(ev)}) — the address must win over the header`)
+            continue
+          }
+          const extMatch = /\.(html|json|md)$/.exec((() => { try { return new URL(ev.url).pathname } catch { return '' } })())
+          if (extMatch && extMatch[1] !== face) {
+            problems.push(`advertised ${face} face address ${ev.url} carries the .${extMatch[1]} face extension — an extension-named address must serve the extension's face (A.7.2)`)
+          }
+        }
+        result = problems.length === 0
+          ? pass('all three Link-advertised face addresses serve their face under a contradictory Accept — the address wins')
+          : { verdict: 'fail', detail: problems.slice(0, 6).join('; ') }
+      }
+      checks.push(check('conneg-forced-face',
+        'Link-advertised face addresses pin their face against a contradictory Accept (AXP A.7 rule 1)', undefined,
+        [ROLE.face('html'), ROLE.face('json'), ROLE.face('md')], result))
+    }
+
+    // (Clause 6, pinned `check-card-interfaces-linked`) — the card names its
+    // interfaces (non-empty interfaces.http and/or interfaces.mcp) and the
+    // sibling machine surfaces mutually cross-link: the card references its
+    // OpenAPI contract and its llms.txt, and the served llms.txt references
+    // both agents.json and the OpenAPI contract.
+    {
+      let result: { verdict: Verdict; detail: string }
+      if (!axpClaimed) {
+        result = axpSkip()
+      } else {
+        const problems: string[] = []
+        if (agents.endpoints.length === 0 && !agents.mcp) {
+          problems.push('card declares no interfaces (interfaces.http empty and no interfaces.mcp)')
+        }
+        if (agents.openapiUrl === undefined) problems.push('card does not reference its OpenAPI contract (openapi / links.openapi)')
+        if (agents.llmsUrl === undefined) problems.push('card does not reference its llms.txt (llms / links.llms)')
+        const llmsEv = findEvidence(bundle, ROLE.llmsTxt)
+        if (!ok(llmsEv) || llmsEv?.body == null) {
+          problems.push('llms.txt did not answer 2xx — the mutual cross-link cannot be confirmed')
+        } else {
+          if (!llmsEv.body.includes('agents.json')) problems.push('llms.txt does not reference agents.json')
+          if (!/openapi/i.test(llmsEv.body)) problems.push('llms.txt does not reference the OpenAPI contract')
+        }
+        result = problems.length === 0
+          ? pass(`card names ${agents.endpoints.length} http endpoint(s)${agents.mcp ? ' + mcp' : ''}; card ↔ openapi ↔ llms.txt mutually cross-linked`)
+          : { verdict: 'fail', detail: problems.slice(0, 6).join('; ') }
+      }
+      checks.push(check('card-interfaces-linked',
+        'card names its interfaces and card ↔ openapi ↔ llms.txt mutually cross-link (AXP Clause 6)', undefined,
+        [ROLE.agentsJson, ROLE.llmsTxt], result))
+    }
+  }
+
   // ── Probe-manifest validity (grade-neutral for targets that declare none) ─
   {
     // The manifest is ADVERSARIAL input: a pinned standard that resolves its
@@ -776,8 +1010,23 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
       }
       const dedupe = (a: Array<{ method: string; url: string; param?: string }>) =>
         [...new Map(a.map((p) => [urlKey(p.url), p])).values()]
+      // The metering surfaces (probes.overCeiling, monetization.probe) are
+      // required IFF the OBSERVED Pricing Document declares model:"metered"
+      // (AXP A.3 / A.5 / Conformance): a free card declares neither and must
+      // not be failed for their absence. The model is read from the
+      // probe:pricing evidence (the card-declared probes.pricing entry 0,
+      // observed in every mode). An unobservable model demands nothing HERE —
+      // the required-channel rule below still demands probes.pricing itself,
+      // and the pinned `pricing-declared` probe fails a pricing surface that
+      // answers no valid Pricing Document.
+      const pricingEv = findEvidence(bundle, ROLE.pricing)
+      const pricingDoc = ok(pricingEv) ? (parseJsonBody(pricingEv) as Record<string, unknown> | undefined) : undefined
+      const observedModel = pricingDoc?.model === 'free' || pricingDoc?.model === 'metered'
+        ? (pricingDoc.model as string)
+        : undefined
       const required: Array<[string, number]> = [
-        ['keyless', 1], ['pricing', 1], ['overCeiling', 1], ['knownEmpty', 2], ['knownForbidden', 2],
+        ['keyless', 1], ['pricing', 1], ['knownEmpty', 2], ['knownForbidden', 2],
+        ...(observedModel === 'metered' ? ([['overCeiling', 1]] as Array<[string, number]>) : []),
       ]
       const deduped: Record<string, Array<{ method: string; url: string; param?: string }>> = {}
       for (const [ch, entries] of Object.entries(manifest)) deduped[ch] = dedupe(entries)
@@ -808,15 +1057,18 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
           problems.push(`probes.overCeiling ${e.url} carries no non-empty "param" (the spend query-parameter name)`)
         }
       }
-      // A card that invites pinned probing must also declare its 402-offer
-      // boundary (monetization.probe), so the structured-offer obligation is
-      // behaviorally verified — never satisfiable by declaration alone.
-      if (!agents.offerProbe) {
-        problems.push('card declares a probe manifest but no monetization.probe URL — the 402 offer boundary cannot be behaviorally verified')
+      // A METERED card that invites pinned probing must also declare its
+      // 402-offer boundary (monetization.probe), so the structured-offer
+      // obligation is behaviorally verified — never satisfiable by declaration
+      // alone. A free card declares no monetization member at all (AXP A.5)
+      // and is not failed for its absence.
+      if (observedModel === 'metered' && !agents.offerProbe) {
+        problems.push('metered card declares a probe manifest but no monetization.probe URL — the 402 offer boundary cannot be behaviorally verified')
       }
-      checks.push(check('probe-manifest', 'card-declared probe manifest is valid', undefined, [ROLE.agentsJson, ROLE.openapi],
+      checks.push(check('probe-manifest', 'card-declared probe manifest is valid', undefined,
+        [ROLE.agentsJson, ROLE.openapi, ...(pricingEv ? [ROLE.pricing] : [])],
         problems.length === 0
-          ? pass('probe manifest declares every required channel; all entries same-origin GET on contract-declared paths')
+          ? pass(`probe manifest declares every required channel (observed pricing model: ${observedModel ?? 'undetermined'}); all entries same-origin GET on contract-declared paths`)
           : { verdict: 'fail', detail: problems.slice(0, 8).join('; ') }))
     }
   }

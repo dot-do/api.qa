@@ -64,7 +64,12 @@ export class Observer {
   constructor(opts: ObserverOpts = {}) {
     this.opts = {
       fetcher: opts.fetcher ?? ((url, init) => fetch(url, init)),
-      budget: opts.budget ?? 24,
+      // 32 (was 24): the AXP Clause 3 conneg plan added up to 7 fixed probes
+      // (3 root client-class profiles, ≤3 Link-advertised face addresses, the
+      // card-declared pricing document). The bump preserves the starvation-fix
+      // invariant that fixed high-value probes never drain the budget out from
+      // under the MCP/402/AAP passes or the capped contract-diff tail.
+      budget: opts.budget ?? 32,
       delayMs: opts.delayMs ?? 150,
       timeoutMs: opts.timeoutMs ?? 10_000,
       maxBodyBytes: opts.maxBodyBytes ?? 262_144,
@@ -77,11 +82,20 @@ export class Observer {
     return this.opts.budget - this.used
   }
 
-  /** Fetch once, record Evidence, return it. Never throws. */
+  /**
+   * Fetch once, record Evidence, return it. Never throws.
+   *
+   * `init.headers` — extra request headers for CLIENT-CLASS simulation
+   * (AXP Clause 3 / Appendix A.7 conneg probes): `Sec-Fetch-*` to present as a
+   * browser navigation, `User-Agent` to present as a known agent. The probe's
+   * ROLE names the profile, so the judge never needs to read them back; they
+   * are lowercased and merged after `accept`/`content-type` (which they never
+   * override).
+   */
   async observe(
     role: string,
     url: string,
-    init: { method?: string; accept?: string; body?: unknown } = {},
+    init: { method?: string; accept?: string; body?: unknown; headers?: Record<string, string> } = {},
   ): Promise<Evidence> {
     const method = (init.method ?? 'GET').toUpperCase()
     // STRUCTURAL SSRF BACKSTOP (DESIGN.md attack #9): re-validate our OWN
@@ -121,6 +135,12 @@ export class Observer {
       if (init.body !== undefined) {
         body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
         headers['content-type'] = 'application/json'
+      }
+      // Client-class simulation headers (conneg probes). accept/content-type
+      // above always win — a caller cannot silently fork the negotiated face.
+      for (const [k, v] of Object.entries(init.headers ?? {})) {
+        const key = k.toLowerCase()
+        if (key !== 'accept' && key !== 'content-type') headers[key] = v
       }
       // SSRF (DESIGN.md attack #9): NEVER let native `fetch` auto-follow a
       // redirect — a hostile-but-legal same-origin GET probe can 3xx to

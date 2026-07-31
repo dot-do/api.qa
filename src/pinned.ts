@@ -32,6 +32,7 @@ import { sha256Hex } from './digest.js'
 import { validateSchema, readPath } from './schema.js'
 import { VERIFIER_VERSION } from './verify.js'
 import type {
+  AppliesWhen,
   CheckResult,
   EndpointExpect,
   Evidence,
@@ -332,6 +333,21 @@ export async function verifyPinnedSpec(
   const phase1 = probeReqs.filter((r) => r.paramValue === undefined || typeof r.paramValue === 'number')
   const phase2 = probeReqs.filter((r) => typeof r.paramValue === 'object' && r.paramValue !== null)
   for (const req of [...phase1, ...phase2]) {
+    // `appliesWhen` gating (AXP: the metering obligations apply IFF the
+    // OBSERVED pricing model is "metered"): a non-applicable requirement is
+    // never fetched and later PASSES as not applicable. Applicability is read
+    // from the SOURCE probe's entry-0 evidence, which the sequential
+    // [...phase1, ...phase2] order has already recorded for a spec that
+    // declares the source (e.g. pricing-declared) ahead of its dependents —
+    // an unobserved source APPLIES the requirement (fail closed).
+    const applicability = evaluateAppliesWhen(req.appliesWhen, probeReqs, observer.items)
+    if (!applicability.applies) {
+      probePlans.set(req.id, {
+        declared: [], entryProblems: new Map(), finalUrls: new Map(),
+        notApplicable: applicability.reason,
+      })
+      continue
+    }
     const plan: ProbePlan = {
       declared: dedupeByUrl(card.probes?.[req.probe] ?? []),
       entryProblems: new Map(),
@@ -361,7 +377,7 @@ export async function verifyPinnedSpec(
         if (typeof req.paramValue === 'number') {
           amount = req.paramValue
         } else {
-          const { fromProbe, path, multiply } = req.paramValue
+          const { fromProbe, path, multiply, multiplyRange } = req.paramValue
           const srcReq = phase1.find((r) => r.probe === fromProbe)
           const srcEv = srcReq
             ? observer.items.find((e) => e.role === `pinned:${srcReq.id}:0`)
@@ -373,7 +389,23 @@ export async function verifyPinnedSpec(
             plan.unresolved = `probes.${fromProbe} yielded no numeric ${path} — cannot derive amount, failing closed`
             break
           }
-          amount = r.value * (multiply ?? 1)
+          // Factor precedence: a fixed `multiply` pin wins; else `multiplyRange`
+          // draws a SEED-RANDOMIZED factor within [lo, hi] — deterministic in
+          // (seed, requirement id), so the probed amount is replayable from the
+          // report yet not precomputable from the declared ceiling (AXP
+          // Clause 5). A malformed range fails closed, never silently ×1.
+          let factor = 1
+          if (multiply !== undefined) {
+            factor = multiply
+          } else if (multiplyRange !== undefined) {
+            const [lo, hi] = Array.isArray(multiplyRange) ? multiplyRange : [undefined, undefined]
+            if (typeof lo !== 'number' || typeof hi !== 'number' || !(lo <= hi)) {
+              plan.unresolved = `requirement ${req.id} carries a malformed paramValue.multiplyRange ${JSON.stringify(multiplyRange)} — expected [lo, hi] with lo <= hi, failing closed`
+              break
+            }
+            factor = lo + seededUnit(seed, req.id) * (hi - lo)
+          }
+          amount = r.value * factor
         }
         if (typeof entry.param !== 'string' || entry.param.length === 0) {
           plan.unresolved =
@@ -449,6 +481,19 @@ export async function verifyPinnedSpec(
         detail: `AX ${axScore.points}/10 (floor ${req.minScore})`, evidence: [],
       })
     } else if (req.kind === 'check') {
+      // `appliesWhen` gating, judged PURELY from the bundle (the same
+      // derivation the observe phase ran): a non-applicable pinned check
+      // passes as not applicable — this is how a free-model target passes
+      // check-offers-402 instead of being wrongly failed on it.
+      const applicability = evaluateAppliesWhen(req.appliesWhen, probeReqs, fullBundle.items)
+      if (!applicability.applies) {
+        results.push({
+          id: req.id, title: `check ${req.check} must ${req.must}`, verdict: 'pass',
+          detail: `${applicability.reason} — passes as not applicable`,
+          evidence: [],
+        })
+        continue
+      }
       // Bind a MUST clause to a SPECIFIC api.qa check, not the coarse floor.
       const c = surfaceChecks.find((sc) => sc.id === req.check)
       const verdict: Verdict = c?.verdict === 'pass' ? 'pass' : 'fail'
@@ -490,6 +535,14 @@ export async function verifyPinnedSpec(
       })
     } else if (req.kind === 'probe') {
       const plan = probePlans.get(req.id)!
+      if (plan.notApplicable !== undefined) {
+        results.push({
+          id: req.id, title: `probe ${req.probe}`, verdict: 'pass',
+          detail: `${plan.notApplicable} — passes as not applicable`,
+          evidence: [],
+        })
+        continue
+      }
       if (plan.unresolved !== undefined) {
         results.push({
           id: req.id, title: `probe ${req.probe}`, verdict: 'fail',
@@ -766,6 +819,64 @@ interface ProbePlan {
   entryProblems: Map<number, string>
   /** Final URLs actually observed (after verifier-owned param injection). */
   finalUrls: Map<number, string>
+  /**
+   * `appliesWhen` said this requirement does not apply to the observed target
+   * (e.g. a metering probe against a free-model API). Nothing was fetched;
+   * the judge reports a PASS with this reason.
+   */
+  notApplicable?: string
+}
+
+/**
+ * Evaluate an `appliesWhen` condition against the recorded evidence: the value
+ * at `path` inside the FIRST spec requirement probing channel `fromProbe`
+ * (entry-0 evidence) must deep-equal `equals` for the requirement to apply.
+ * FAIL-CLOSED: an unobserved source, a non-JSON body, or an unresolvable path
+ * means the requirement APPLIES — not-applicable must be PROVEN by the
+ * observed value. Pure over (requirements, items): the observe phase and the
+ * judge run the identical derivation and agree by construction.
+ */
+function evaluateAppliesWhen(
+  aw: AppliesWhen | undefined,
+  probeReqs: Array<Extract<PinnedRequirement, { kind: 'probe' }>>,
+  items: Evidence[],
+): { applies: boolean; reason: string } {
+  if (aw === undefined) return { applies: true, reason: '' }
+  const srcReq = probeReqs.find((r) => r.probe === aw.fromProbe)
+  const ev = srcReq ? items.find((e) => e.role === `pinned:${srcReq.id}:0`) : undefined
+  let body: unknown
+  try { body = JSON.parse(ev?.body ?? '') } catch { /* unresolved → applies (fail closed) */ }
+  const r = readPath(body, aw.path)
+  if (!srcReq || !ev || !r.found) {
+    return {
+      applies: true,
+      reason: `appliesWhen source probes.${aw.fromProbe} ${aw.path} was not observed — requirement applies (fail closed)`,
+    }
+  }
+  if (JSON.stringify(r.value) === JSON.stringify(aw.equals)) {
+    return { applies: true, reason: `probes.${aw.fromProbe} ${aw.path} = ${JSON.stringify(aw.equals)}` }
+  }
+  return {
+    applies: false,
+    reason: `not applicable: probes.${aw.fromProbe} ${aw.path} = ${JSON.stringify(r.value)} (requirement applies only when it equals ${JSON.stringify(aw.equals)})`,
+  }
+}
+
+/**
+ * Deterministic unit-interval draw from (seed, key) — backs
+ * `paramValue.multiplyRange`'s seed-randomized factor. Same (seed, key) →
+ * same value, always; the report's seed replays the exact probed amount.
+ */
+function seededUnit(seed: number, key: string): number {
+  let h = seed >>> 0
+  for (let i = 0; i < key.length; i++) {
+    h = Math.imul(h ^ key.charCodeAt(i), 2654435761)
+    h = (h << 13) | (h >>> 19)
+  }
+  h = Math.imul(h ^ (h >>> 16), 2246822507)
+  h = Math.imul(h ^ (h >>> 13), 3266489909)
+  h ^= h >>> 16
+  return (h >>> 0) / 4294967296
 }
 
 function dedupeByUrl(entries: ProbeEntry[]): ProbeEntry[] {
@@ -992,6 +1103,11 @@ function judgeExpect(ev: Evidence | undefined, expect: EndpointExpect): string[]
         if (p.exists !== undefined && r.found !== p.exists) problems.push(`path ${p.path} ${p.exists ? 'missing' : 'unexpectedly present'}`)
         if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
           problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
+        }
+        // Closed-vocabulary membership (e.g. AXP pricing model ∈ [free, metered]).
+        if (p.oneOf !== undefined &&
+            (!r.found || !p.oneOf.some((v) => JSON.stringify(v) === JSON.stringify(r.value)))) {
+          problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted one of ${JSON.stringify(p.oneOf)}`)
         }
         // Numeric comparators — the pinned floor/ceiling. A comparator on a
         // path that is absent or non-numeric is itself a failure (the target

@@ -35,6 +35,34 @@ export const ROLE = {
    * (markdown) is handled as partial credit, not a false-fail.
    */
   rootJson: 'probe:root-as-json',
+  /**
+   * Root probed with `Accept: text/markdown` (AXP Clause 3 / A.7 step 2): an
+   * explicit markdown request must receive the markdown face.
+   */
+  rootMarkdown: 'probe:root-as-markdown',
+  // Root probed with the wildcard Accept (*/*) PLUS browser-navigation
+  // `Sec-Fetch-*` headers (Sec-Fetch-Mode: navigate, Sec-Fetch-Dest: document)
+  // — the AXP A.7 step-3a client-class probe: a detected browser navigation
+  // defaults to the HTML face. Detection is by Sec-Fetch, never User-Agent
+  // sniffing.
+  rootBrowserNav: 'probe:root-as-browser-navigate',
+  // Root probed with the wildcard Accept (*/*) PLUS a known agent User-Agent
+  // (AGENT_UA, from the AXP A.7.4 token list) — the A.7 step-3b client-class
+  // probe: a known agent defaults to the token-cheap markdown face.
+  rootAgentUa: 'probe:root-as-agent-ua',
+  /**
+   * A Link-rel=alternate-advertised face address of the home, fetched with a
+   * CONTRADICTORY Accept header (AXP A.7 rule 1: the address wins over the
+   * header). One role per face: probe:face:html | probe:face:json | probe:face:md.
+   */
+  face: (face: 'html' | 'json' | 'md') => `probe:face:${face}`,
+  /**
+   * The card-declared `probes.pricing` entry 0 (AXP A.2 Pricing Document),
+   * observed in EVERY mode (not only pinned) so pure judges — notably the
+   * probe-manifest check's metered-only gating of `probes.overCeiling` +
+   * `monetization.probe` — can read the OBSERVED pricing `model`.
+   */
+  pricing: 'probe:pricing',
   llmsTxt: 'surface:llms.txt',
   agentsJson: 'surface:agents.json',
   icpJson: 'surface:icp.json',
@@ -116,6 +144,81 @@ export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | u
   return bundle.items.find((e) => e.role === role)
 }
 
+// ---------------------------------------------------------------------------
+// Content-negotiation vocabulary (AXP Clause 3 / Appendix A.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * The User-Agent api.qa presents for the agent-class conneg probe. Drawn from
+ * the AXP Appendix A.7.4 MUST-minimum token list (`claude-user`), which is what
+ * makes the markdown-for-agents default decidable from outside.
+ */
+export const AGENT_UA = 'Claude-User/1.0 (+https://api.qa)'
+
+/** The three AXP faces and their media types (Appendix A.7.1). */
+export type FaceName = 'html' | 'json' | 'md'
+
+/** Face named by a media type string (a Link `type` param or a Content-Type). */
+export function faceOfMediaType(mediaType: string | null | undefined): FaceName | undefined {
+  if (!mediaType) return undefined
+  const t = mediaType.split(';')[0]!.trim().toLowerCase()
+  if (t === 'text/html' || t === 'application/xhtml+xml') return 'html'
+  if (t === 'application/json' || t === 'application/ld+json' || t.endsWith('+json')) return 'json'
+  if (t === 'text/markdown') return 'md'
+  return undefined
+}
+
+export interface LinkAlternate {
+  url: string
+  rel?: string
+  type?: string
+}
+
+/**
+ * Parse an HTTP `Link` header into its entries (RFC 8288, the subset the
+ * conneg checks read: uri-reference + rel + type params). Pure, total: a
+ * malformed header yields the entries that do parse, never a throw. Entry
+ * split is on commas that precede a `<` (URLs and quoted params may not
+ * contain a bare `<`, so this is unambiguous for well-formed headers).
+ */
+export function parseLinkHeader(header: string | null | undefined): LinkAlternate[] {
+  if (!header) return []
+  const out: LinkAlternate[] = []
+  for (const part of header.split(/,(?=[^>]*<)/)) {
+    const m = /^\s*<([^>]*)>\s*((?:;[^;]*)*)$/.exec(part)
+    if (!m) continue
+    const entry: LinkAlternate = { url: m[1]! }
+    for (const param of m[2]!.split(';')) {
+      const pm = /^\s*([a-zA-Z][\w-]*)\s*=\s*(?:"([^"]*)"|([^\s";]+))\s*$/.exec(param)
+      if (!pm) continue
+      const name = pm[1]!.toLowerCase()
+      const value = (pm[2] ?? pm[3] ?? '').toLowerCase()
+      if (name === 'rel') entry.rel = value
+      else if (name === 'type') entry.type = value
+    }
+    out.push(entry)
+  }
+  return out
+}
+
+/**
+ * The `rel="alternate"` face siblings advertised by an evidence item's Link
+ * header, keyed by face. First advertisement per face wins. URLs are resolved
+ * against the evidence's own URL (relative Link targets are the common case).
+ */
+export function faceAlternatesOf(ev: Evidence | undefined): Partial<Record<FaceName, string>> {
+  const out: Partial<Record<FaceName, string>> = {}
+  if (!ev) return out
+  for (const alt of parseLinkHeader(ev.headers['link'])) {
+    if (alt.rel !== undefined && !alt.rel.split(/\s+/).includes('alternate')) continue
+    if (alt.rel === undefined) continue
+    const face = faceOfMediaType(alt.type)
+    if (!face || out[face] !== undefined) continue
+    try { out[face] = new URL(alt.url, ev.url).toString() } catch { /* unresolvable target contributes nothing */ }
+  }
+  return out
+}
+
 export function parseJsonBody(ev: Evidence | undefined): unknown | undefined {
   if (!ev || ev.status === null || ev.body === null) return undefined
   try {
@@ -144,6 +247,12 @@ export interface AgentsClaims {
   probes?: Record<string, Array<{ method: string; url: string; param?: string }>>
   attestation?: unknown
   openapiUrl?: string
+  /**
+   * Declared location of the card's llms.txt sibling (top-level `llms` /
+   * `llmsUrl`, or `links.llms`) — read by the card-interfaces-linked check
+   * (AXP Clause 6 mutual cross-linking). Absolutized.
+   */
+  llmsUrl?: string
   /**
    * Declared location of the MCP registry manifest (server.json), if the card
    * advertises one (top-level `serverJson`/`server_json`, or
@@ -268,6 +377,15 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
   const surfaces = d.surfaces as Record<string, unknown> | undefined
   if (!out.openapiUrl && surfaces && typeof surfaces.openapi === 'string') {
     out.openapiUrl = absolutize(surfaces.openapi, origin)
+  }
+  // `links` block (the AXP normative card shape carries links.openapi /
+  // links.llms alongside the top-level members) — a fallback source for both.
+  const links = d.links as Record<string, unknown> | undefined
+  if (!out.openapiUrl && links && typeof links.openapi === 'string') {
+    out.openapiUrl = absolutize(links.openapi, origin)
+  }
+  for (const cand of [d.llms, d.llmsUrl, links?.llms, surfaces?.llms]) {
+    if (out.llmsUrl === undefined && typeof cand === 'string') out.llmsUrl = absolutize(cand, origin)
   }
   return out
 }
@@ -1038,8 +1156,8 @@ async function observeUiStream(origin: string, observer: Observer): Promise<void
 
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
-  await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
-  await observer.observe(ROLE.rootBrowser, `${origin}/`, {
+  const rootAgentEv = await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
+  const rootBrowserEv = await observer.observe(ROLE.rootBrowser, `${origin}/`, {
     accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   })
   // Root probed with a strict `Accept: application/json` (ax-c7m). A fixed,
@@ -1048,6 +1166,43 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   // returns a wall of HTML to an agent that explicitly asked for JSON — a
   // grader blind-spot surfaced by the ICP trial. Same-origin by construction.
   await observer.observe(ROLE.rootJson, `${origin}/`, { accept: 'application/json' })
+  // AXP Clause 3 / Appendix A.7 conneg probes — fixed, identical for every
+  // target. Three more root profiles: an explicit markdown request (A.7 step
+  // 2), a Sec-Fetch-detected browser NAVIGATION on `*/*` (step 3a — HTML by
+  // client class, not by Accept), and a known agent User-Agent on `*/*`
+  // (step 3b — markdown by client class). The judge tells them apart by ROLE.
+  const rootMarkdownEv = await observer.observe(ROLE.rootMarkdown, `${origin}/`, { accept: 'text/markdown' })
+  await observer.observe(ROLE.rootBrowserNav, `${origin}/`, {
+    accept: '*/*',
+    headers: { 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document', 'sec-fetch-site': 'none' },
+  })
+  await observer.observe(ROLE.rootAgentUa, `${origin}/`, { accept: '*/*', headers: { 'user-agent': AGENT_UA } })
+  // Face addresses (A.7 rule 1 — the address wins): resolved from the home's
+  // OWN Link rel="alternate" advertisements (never a guessed extension
+  // convention), each fetched ONCE with a CONTRADICTORY Accept header so the
+  // conneg-forced-face check can confirm the address pins the face. Card-free
+  // but still adversarial input (a Link header is target-controlled), so each
+  // advertised URL passes the SHARED same-origin + publicly-routable gate and
+  // an off-origin/private advertisement is DROPPED, never fetched — the check
+  // then fails closed on the missing face evidence.
+  {
+    const advertised: Partial<Record<FaceName, string>> = {}
+    for (const ev of [rootAgentEv, rootBrowserEv, rootMarkdownEv]) {
+      for (const [face, url] of Object.entries(faceAlternatesOf(ev)) as Array<[FaceName, string]>) {
+        advertised[face] ??= url
+      }
+    }
+    const contradictoryAccept: Record<FaceName, string> = {
+      html: 'application/json',
+      json: 'text/html',
+      md: 'text/html',
+    }
+    for (const face of ['html', 'json', 'md'] as const) {
+      const url = advertised[face]
+      if (!url || !isPubliclyRoutableSameOrigin(url, origin)) continue
+      await observer.observe(ROLE.face(face), url, { accept: contradictoryAccept[face] })
+    }
+  }
   await observer.observe(ROLE.llmsTxt, `${origin}/llms.txt`, { accept: '*/*' })
   const agentsEv = await observer.observe(ROLE.agentsJson, `${origin}/.well-known/agents.json`, {
     accept: 'application/json',
@@ -1083,6 +1238,20 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
     ? await observer.observe(ROLE.openapi, openapiUrl, { accept: 'application/json' })
     : undefined
   const openapi = parseOpenapi(parseJsonBody(openapiEv))
+
+  // 2a. The card-declared Pricing Document (AXP A.2): probes.pricing entry 0,
+  //     fetched in EVERY mode so pure judges can read the OBSERVED `model` —
+  //     the probe-manifest check gates its metered-only demands
+  //     (probes.overCeiling, monetization.probe) on it. Card-derived and
+  //     therefore adversarial: same-origin GET only, or DROPPED unfetched.
+  const pricingEntry = agents.probes?.pricing?.[0]
+  if (
+    pricingEntry &&
+    pricingEntry.method === 'GET' &&
+    isPubliclyRoutableSameOrigin(pricingEntry.url, origin)
+  ) {
+    await observer.observe(ROLE.pricing, pricingEntry.url, { accept: 'application/json' })
+  }
 
   // 2. Seeded endpoint sampling — which endpoints get probed is not
   //    predictable before the run (the seed is fresh), but fully replayable

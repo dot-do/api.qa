@@ -12,7 +12,12 @@ import { axScoreOf, gradeOf } from './grade.js'
 import { attestReport } from './attest.js'
 import type { VerificationReport } from './types.js'
 
-export const VERIFIER_VERSION = '0.1.0'
+// 0.2.0: full pinned apis-ax-axp@2.2.0 coverage — machine-legible-home +
+// card-interfaces-linked + the four AXP A.7 conneg checks (conneg-accept /
+// conneg-client-class / conneg-alternates / conneg-forced-face), appliesWhen
+// gating on kind:check AND kind:probe, paramValue.multiplyRange,
+// expect.paths[].oneOf, metered-gated probe-manifest demands.
+export const VERIFIER_VERSION = '0.2.0'
 
 export interface VerifyTargetOpts extends ObserverOpts {
   /**
