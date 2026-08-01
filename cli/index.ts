@@ -38,6 +38,7 @@ import { pathToFileURL } from 'node:url'
 import { verifyTarget, rejudge } from '../src/verify.js'
 import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/local.js'
 import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
+import { skillText, checkSkill, installSkill, SKILL_NAME } from './skill.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
 import { runEstateGate, formatScoreboard, type GateEntry } from '../src/gate.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
@@ -143,6 +144,40 @@ async function main(): Promise<number> {
   if (cmd === 'mcp') {
     await runMcpServer()
     return 0
+  }
+
+  if (cmd === 'skill') {
+    // skill — distribute the AXP skill (canonical source: the axp.org.ai repo
+    // `skill/SKILL.md`; this package ships a byte-identical, test-pinned copy).
+    // The CANONICAL installer is the standard's own package — `npx axp.org.ai
+    // skill install`; this subcommand is the verifier-side mirror (same bytes).
+    //   skill install   copy into ~/.claude/skills/axp/SKILL.md (idempotent)
+    //   skill --check   drift check: exit 0 iff installed == shipped
+    //   skill --print   shipped skill to stdout
+    const sub = rest[0]
+    if (flags.has('print') || sub === 'print') {
+      process.stdout.write(skillText())
+      return 0
+    }
+    if (flags.has('check') || sub === 'check') {
+      const s = checkSkill()
+      if (!s.installed) {
+        console.error(`autonomous-qa: skill "${SKILL_NAME}" not installed at ${s.dest} — run: npx autonomous-qa skill install`)
+        return 1
+      }
+      if (!s.inSync) {
+        console.error(`autonomous-qa: skill "${SKILL_NAME}" at ${s.dest} DRIFTED from the shipped copy — run: npx autonomous-qa skill install`)
+        return 1
+      }
+      console.log(`autonomous-qa: skill "${SKILL_NAME}" in sync at ${s.dest}`)
+      return 0
+    }
+    if (sub === 'install') {
+      const s = installSkill()
+      console.log(`autonomous-qa: skill "${SKILL_NAME}" installed → ${s.dest}`)
+      return 0
+    }
+    return die('skill needs a mode: `skill install`, `skill --check`, or `skill --print`')
   }
 
   if (cmd === 'spec-digest') {
@@ -437,6 +472,9 @@ function usage(): string {
   npx autonomous-qa gate --estate <config.json>       run the pinned gate across a SET of surfaces
       [--seed <n>] [--reporter ...]                   ONE scoreboard; EXITS NON-ZERO if any required surface fails
   npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite
+  npx autonomous-qa skill install                     install the AXP skill → ~/.claude/skills/axp/
+      [--check drift vs shipped | --print to stdout]  (verifier-side mirror of the canonical
+                                                       installer: npx axp.org.ai skill install)
   npx autonomous-qa rejudge                           re-judge a JSON report from stdin
   npx autonomous-qa mcp                               MCP server (stdio)
 
