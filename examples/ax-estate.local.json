@@ -1,0 +1,21 @@
+{
+  "$comment": "PRE-DEPLOY (local) AX estate gate — page.ax and apps.ax are 522/403 deployed and CANNOT be graded against a public URL, so they are graded in-process / against a local wrangler dev server BEFORE deploy. Stand each dev worker up first, then: node dist/cli/index.js gate --estate examples/ax-estate.local.json. The `allowPrivate` opt-in (local-only, per-entry) is what lets the gate reach a localhost dev server; a remote target can never flip it on (the SSRF invariant, src/local.ts). Programmatic callers can instead pass an in-process Worker `{ fetch }` handler directly to runEstateGate() — no dev server at all (see test/gate.test.ts).",
+  "entries": [
+    {
+      "surface": "page.ax",
+      "target": "http://127.0.0.1:8787",
+      "spec": "ax/ax-hi2-page-ax.spec.json",
+      "required": true,
+      "allowPrivate": true,
+      "note": "wrangler dev --port 8787 --var STRIPE_STUB:1"
+    },
+    {
+      "surface": "apps.ax",
+      "target": "http://127.0.0.1:8790",
+      "spec": "ax/ax-e6b.2-apps-ax.spec.json",
+      "required": true,
+      "allowPrivate": true,
+      "note": "wrangler dev --port 8790 --var STRIPE_STUB:1 --var INTERPRETER_DEV_HOST_OVERRIDE:1"
+    }
+  ]
+}

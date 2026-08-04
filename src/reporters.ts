@@ -20,13 +20,13 @@
  * surface — this file never touches the network.
  */
 
-import type { CheckResult, EvidenceBundle, VerificationReport, Verdict } from './types.js'
+import type { CheckResult, ContractDiffReport, EvidenceBundle, VerificationReport, Verdict } from './types.js'
 import type { PinnedReport, SuiteReport } from './pinned.js'
 import type { DataDrivenReport } from './dataset.js'
 import { VERIFIER_VERSION } from './verify.js'
 
 /** Any report a CLI gate/advisory run can produce. Discriminated by `$type`. */
-export type AnyRunReport = PinnedReport | SuiteReport | DataDrivenReport | VerificationReport
+export type AnyRunReport = PinnedReport | SuiteReport | DataDrivenReport | VerificationReport | ContractDiffReport
 
 /** A testcase status. `error` = the iteration/probe could not run at all. */
 export type CaseStatus = 'pass' | 'fail' | 'skip' | 'error'
@@ -84,6 +84,16 @@ export interface ReporterModel {
  *       (SSRF, unreachable) which lands as `passed: false` — exits non-zero.
  *   VerificationReport (advisory grade)
  *     → `grade === 'F' ? 1 : 0`. Advisory grading is not a pinned gate.
+ *   ContractDiffReport
+ *     → NON-ZERO iff the live surface broke the published contract (`breaking
+ *       > 0`) — additive-only drift is not a gate failure — OR NOTHING was
+ *       actually verified (`openapiValid === false` — an un-diffable / wrong-
+ *       shape spec — or `operationsProbed === 0` — every declared operation
+ *       was unprobeable/absent). `breaking` is trivially 0 whenever zero
+ *       operations were probed, so gating on `breaking > 0` alone would exit
+ *       0/PASSED on a run that verified NOTHING — the CI gate's own silent
+ *       green. Fail closed: a contract-diff that verified nothing is never a
+ *       pass.
  *
  * A digest-pin mismatch or an unreachable/refused target throws BEFORE a report
  * exists; the CLI catch converts that throw to a non-zero exit. Both paths are
@@ -97,6 +107,15 @@ export function exitCodeFor(report: AnyRunReport): number {
       return report.passed ? 0 : 1
     case 'VerificationReport':
       return report.grade === 'F' ? 1 : 0
+    case 'ContractDiffReport':
+      // The contract-diff CI gate (ax-gyh): NON-ZERO iff the live surface broke
+      // the published contract. Additive-only drift (live has MORE than
+      // declared) is NOT a gate failure — a client written to the contract is
+      // unaffected. But a gate that verified ZERO operations (no valid OpenAPI
+      // to diff against, or every declared operation was unprobeable/absent)
+      // must NEVER exit 0 — "nothing was probed" is not "nothing is broken".
+      if (!report.openapiValid || report.operationsProbed === 0) return 1
+      return report.breaking > 0 ? 1 : 0
   }
 }
 
@@ -181,6 +200,33 @@ export function toReporterModel(report: AnyRunReport): ReporterModel {
       })
       suites.push({ name: suiteName, cases })
     }
+  } else if (report.$type === 'ContractDiffReport') {
+    // contract-diff run (ax-gyh): one testcase per declared GET-safe operation.
+    // A probed op with ≥1 breaking deviation FAILs; a clean/additive-only op
+    // PASSes; an unprobed (budget-reserved) op is SKIPped. Undeclared-but-
+    // present endpoints are additive-only — reported as skipped, never a
+    // failure — so the failure count equals the breaking-operation count.
+    name = `${report.target} (contract-diff)`
+    target = report.target
+    verifiedAt = ''
+    seed = 0
+    const cls = 'contract-diff'
+    const cases: ReporterTestCase[] = report.perOperation.map((o) => {
+      const breaking = o.deviations.filter((d) => d.classification === 'breaking')
+      const id = `${o.method} ${o.path}`
+      if (!o.probed) {
+        return { id, name: `${id} [unprobed]`, classname: cls, status: 'skip', detail: 'not live-probed (budget reserved for higher-value probes)', timeMs: 0 }
+      }
+      if (breaking.length > 0) {
+        return { id, name: id, classname: cls, status: 'fail', detail: breaking.map((d) => d.detail).join('; '), timeMs: 0 }
+      }
+      const additive = o.deviations.filter((d) => d.classification === 'additive')
+      return { id, name: id, classname: cls, status: 'pass', detail: additive.length ? `${additive.length} additive deviation(s)` : '', timeMs: 0 }
+    })
+    for (const d of report.undeclaredButPresent) {
+      cases.push({ id: `${d.method} ${d.path}`, name: `${d.method} ${d.path} [undeclared]`, classname: cls, status: 'skip', detail: d.detail, timeMs: 0 })
+    }
+    suites.push({ name: cls, cases })
   } else {
     // VerificationReport — advisory grade run.
     const times = roleTimes(report.evidence)
@@ -213,7 +259,7 @@ export function toReporterModel(report: AnyRunReport): ReporterModel {
     kind: report.$type,
     name,
     target,
-    mode: report.mode,
+    mode: 'mode' in report ? report.mode : 'contract-diff',
     verifiedAt,
     seed,
     digest,

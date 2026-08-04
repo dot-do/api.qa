@@ -42,7 +42,7 @@ export interface ObserverOpts {
   allowPrivate?: boolean
 }
 
-const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin']
+const HEADER_ALLOWLIST = ['link', 'retry-after', 'www-authenticate', 'access-control-allow-origin', 'x-vercel-ai-ui-message-stream']
 
 /** Max redirect hops the observer will manually follow (each re-validated). */
 const MAX_REDIRECT_HOPS = 3
@@ -64,7 +64,12 @@ export class Observer {
   constructor(opts: ObserverOpts = {}) {
     this.opts = {
       fetcher: opts.fetcher ?? ((url, init) => fetch(url, init)),
-      budget: opts.budget ?? 24,
+      // 32 (was 24): the AXP Clause 3 conneg plan added up to 7 fixed probes
+      // (3 root client-class profiles, ≤3 Link-advertised face addresses, the
+      // card-declared pricing document). The bump preserves the starvation-fix
+      // invariant that fixed high-value probes never drain the budget out from
+      // under the MCP/402/AAP passes or the capped contract-diff tail.
+      budget: opts.budget ?? 32,
       delayMs: opts.delayMs ?? 150,
       timeoutMs: opts.timeoutMs ?? 10_000,
       maxBodyBytes: opts.maxBodyBytes ?? 262_144,
@@ -77,11 +82,20 @@ export class Observer {
     return this.opts.budget - this.used
   }
 
-  /** Fetch once, record Evidence, return it. Never throws. */
+  /**
+   * Fetch once, record Evidence, return it. Never throws.
+   *
+   * `init.headers` — extra request headers for CLIENT-CLASS simulation
+   * (AXP Clause 3 / Appendix A.7 conneg probes): `Sec-Fetch-*` to present as a
+   * browser navigation, `User-Agent` to present as a known agent. The probe's
+   * ROLE names the profile, so the judge never needs to read them back; they
+   * are lowercased and merged after `accept`/`content-type` (which they never
+   * override).
+   */
   async observe(
     role: string,
     url: string,
-    init: { method?: string; accept?: string; body?: unknown } = {},
+    init: { method?: string; accept?: string; body?: unknown; headers?: Record<string, string> } = {},
   ): Promise<Evidence> {
     const method = (init.method ?? 'GET').toUpperCase()
     // STRUCTURAL SSRF BACKSTOP (DESIGN.md attack #9): re-validate our OWN
@@ -113,14 +127,20 @@ export class Observer {
     }
 
     const started = Date.now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
     try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
       const headers: Record<string, string> = { accept: init.accept ?? '*/*' }
       let body: string | undefined
       if (init.body !== undefined) {
         body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
         headers['content-type'] = 'application/json'
+      }
+      // Client-class simulation headers (conneg probes). accept/content-type
+      // above always win — a caller cannot silently fork the negotiated face.
+      for (const [k, v] of Object.entries(init.headers ?? {})) {
+        const key = k.toLowerCase()
+        if (key !== 'accept' && key !== 'content-type') headers[key] = v
       }
       // SSRF (DESIGN.md attack #9): NEVER let native `fetch` auto-follow a
       // redirect — a hostile-but-legal same-origin GET probe can 3xx to
@@ -167,8 +187,18 @@ export class Observer {
         hop += 1
         currentUrl = nextUrl
       }
-      clearTimeout(timer)
+      // Keep the abort timer ARMED across the body read (ax-gf2 slow-loris fix).
+      // Previously `clearTimeout(timer)` fired HERE, before readCapped streamed
+      // the body — so a server that returned 200 headers then slow-lorised /
+      // dripped the body held the probe open past timeoutMs (the AbortController),
+      // bounded only by maxBodyBytes. With the timer still armed, the
+      // AbortController fires DURING a slow body drip and aborts the underlying
+      // stream, so total connect+headers+body time is bounded by timeoutMs.
+      // readCapped surfaces the abort as a clean rejection (caught below and
+      // recorded as a timeout error) — no hang, no unhandled rejection — and the
+      // maxBodyBytes cap still applies to a fast body.
       const text = await this.readCapped(res)
+      clearTimeout(timer)
       const kept: Record<string, string> = {}
       for (const h of HEADER_ALLOWLIST) {
         const v = res.headers.get(h)
@@ -179,6 +209,7 @@ export class Observer {
         res.status, res.headers.get('content-type'), kept, text, Date.now() - started,
       )
     } catch (err) {
+      clearTimeout(timer)
       return this.record(
         role, url, method, init.accept, null, null, {}, null, Date.now() - started,
         err instanceof Error ? `${err.name}: ${err.message}` : String(err),
@@ -186,10 +217,172 @@ export class Observer {
     }
   }
 
+  /**
+   * SSRF-safe JSON-RPC POST for the MCP registry LIVE-remote handshake
+   * (ax-e6b.38): the ONE place the verifier sends a non-GET request. It exists
+   * so api.qa can perform the MCP `initialize` → `tools/list` handshake against
+   * a server.json-declared remote — non-mutating MCP protocol reads — to
+   * confirm the remote genuinely resolves and advertises tools (not merely
+   * "declared"). It is DELIBERATELY narrow, and keeps every SSRF backstop the
+   * read-only `observe` has, PLUS it NEVER follows a redirect at all:
+   *
+   *   - the initial host is re-validated against the private/loopback/link-
+   *     local/metadata block (same structural backstop as `observe`); a
+   *     private initial target is refused WITHOUT sending a byte (unless the
+   *     dev/CLI `allowPrivate` escape hatch is set, which the deployed Worker
+   *     never sets);
+   *   - `redirect:'manual'` — a 3xx is recorded verbatim and its `Location` is
+   *     NEVER fetched, so a hostile remote cannot 3xx the POST to
+   *     169.254.169.254 and have us hop there (the read-only observe follows
+   *     same-origin redirects; a write must follow NONE);
+   *   - the caller (discovery) additionally gates the remote URL through
+   *     `isPublicHttpsOffOriginAllowed` (https, public host, no private IP) —
+   *     the same narrow off-origin allowance the RFC 9728 authorization server
+   *     uses, because a registry remote MAY legitimately be hosted off the
+   *     target's own origin;
+   *   - bounded body, per-request timeout, and it draws from the same shared
+   *     politeness budget.
+   *
+   * The `mcp-session-id` response header (MCP streamable-http assigns it on
+   * `initialize`; the follow-up `tools/list` must echo it) is captured into the
+   * kept headers so the JUDGE can thread it — WITHOUT widening the global header
+   * allowlist that every other role's Evidence carries.
+   */
+  async observeMcp(
+    role: string,
+    url: string,
+    jsonRpc: unknown,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<Evidence> {
+    const method = 'POST'
+    const accept = 'application/json, text/event-stream'
+    const initialHost = (() => { try { return new URL(url).hostname } catch { return null } })()
+    if (!this.opts.allowPrivate && initialHost !== null && isPrivateHost(initialHost)) {
+      return this.record(role, url, method, accept, null, null, {}, null, 0,
+        `blocked: refusing private/metadata MCP remote (SSRF): ${url}`)
+    }
+    if (this.used >= this.opts.budget) {
+      return this.record(role, url, method, accept, null, null, {}, null, 0, BUDGET_EXHAUSTED_ERROR)
+    }
+    this.used += 1
+    if (this.used > 1 && this.opts.delayMs > 0) {
+      await new Promise((r) => setTimeout(r, this.opts.delayMs))
+    }
+    const started = Date.now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs)
+    try {
+      const headers: Record<string, string> = {
+        accept,
+        'content-type': 'application/json',
+        ...extraHeaders,
+      }
+      // redirect:'manual' — a write is NEVER redirect-followed (SSRF): the 3xx
+      // is recorded, its Location is never fetched.
+      const res = await this.opts.fetcher(url, {
+        method,
+        headers,
+        body: JSON.stringify(jsonRpc),
+        signal: controller.signal,
+        redirect: 'manual',
+      })
+      // Timer stays ARMED across the body read (ax-gf2): a slow-lorised / dripped
+      // MCP response body cannot hold this probe past timeoutMs either.
+      const text = await this.readCapped(res)
+      clearTimeout(timer)
+      const kept: Record<string, string> = {}
+      for (const h of HEADER_ALLOWLIST) {
+        const v = res.headers.get(h)
+        if (v) kept[h] = v
+      }
+      // MCP streamable-http session id — kept ONLY on the handshake evidence so
+      // the follow-up tools/list can echo it; not added to HEADER_ALLOWLIST.
+      const sid = res.headers.get('mcp-session-id')
+      if (sid) kept['mcp-session-id'] = sid
+      return this.record(role, url, method, accept, res.status, res.headers.get('content-type'), kept, text, Date.now() - started)
+    } catch (err) {
+      clearTimeout(timer)
+      return this.record(role, url, method, accept, null, null, {}, null, Date.now() - started,
+        err instanceof Error ? `${err.name}: ${err.message}` : String(err))
+    }
+  }
+
+  /**
+   * Read a response body up to `maxBodyBytes`, WITHOUT ever buffering more
+   * than that many bytes in memory — regardless of how large the target's
+   * response actually is (a shared-code memory-DoS fix: `await res.text()`
+   * used to buffer the ENTIRE body before slicing, so a malicious target
+   * streaming a huge/unbounded body could exhaust memory on every single
+   * api.qa fetch call site, since every role's evidence goes through here).
+   *
+   * Two layers, neither trusting the other:
+   *   1. A declared `Content-Length` that ALREADY exceeds the cap is rejected
+   *      before reading a single byte of the body (the fast, cheap path — no
+   *      point starting a read we know must be truncated).
+   *   2. Regardless of what `Content-Length` says (absent, wrong, or a
+   *      chunked transfer with no length at all), the body is read via a
+   *      STREAMING reader that accumulates chunks only up to the cap, then
+   *      cancels the underlying stream — so peak memory is bounded by
+   *      `maxBodyBytes` no matter how much data the target tries to send.
+   *
+   * Normal (non-oversized) bodies are read in full and decoded as UTF-8,
+   * preserving prior behavior for every legitimate target.
+   */
   private async readCapped(res: Response): Promise<string> {
-    const text = await res.text()
-    if (text.length <= this.opts.maxBodyBytes) return text
-    return text.slice(0, this.opts.maxBodyBytes)
+    const maxBytes = this.opts.maxBodyBytes
+    const declaredLength = res.headers.get('content-length')
+    if (declaredLength !== null) {
+      const declared = Number(declaredLength)
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        try { await res.body?.cancel() } catch { /* best-effort — connection may already be closed */ }
+        return ''
+      }
+    }
+
+    const body = res.body
+    if (!body || typeof (body as { getReader?: unknown }).getReader !== 'function') {
+      // No streamable body on this Response implementation (some test/mock
+      // Response constructions) — fall back to a single bounded read.
+      const text = await res.text()
+      return text.length <= maxBytes ? text : text.slice(0, maxBytes)
+    }
+
+    const reader = body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    let truncated = false
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value || value.byteLength === 0) continue
+        const remaining = maxBytes - total
+        if (value.byteLength >= remaining) {
+          if (remaining > 0) {
+            chunks.push(value.subarray(0, remaining))
+            total += remaining
+          }
+          truncated = true
+          break
+        }
+        chunks.push(value)
+        total += value.byteLength
+      }
+      if (truncated) {
+        // Stop pulling the rest of the stream — never drain a body past the cap.
+        try { await reader.cancel() } catch { /* best-effort */ }
+      }
+    } finally {
+      try { reader.releaseLock() } catch { /* already released by cancel() in some runtimes */ }
+    }
+
+    const buf = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      buf.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return new TextDecoder('utf-8').decode(buf)
   }
 
   private record(

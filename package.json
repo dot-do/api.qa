@@ -1,6 +1,6 @@
 {
   "name": "autonomous-qa",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The external third-party verifier for agent-first APIs. Discovery from published machine surfaces, contract-derived deterministic checks, attested public grade reports. Reference client for the hosted service at https://api.qa.",
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,7 @@
   ],
   "files": [
     "dist",
+    "skill",
     "README.md",
     "DESIGN.md",
     "LICENSE"
@@ -28,6 +29,25 @@
   },
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./vitest": {
+      "types": "./dist/src/vitest.d.ts",
+      "import": "./dist/src/vitest.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "vitest": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",

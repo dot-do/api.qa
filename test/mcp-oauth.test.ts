@@ -51,6 +51,7 @@ interface McpFixtureOpts {
   asWithS256?: boolean // include code_challenge_methods_supported: ['S256']
   asWithRegistration?: boolean // include registration_endpoint
   unauth?: RouteOut // response to GET {mcpUrl}
+  unauthPost?: RouteOut // response to the unauthenticated POST initialize at {mcpUrl} (ax-q4t)
 }
 
 function jsonOut(body: unknown, status = 200): RouteOut {
@@ -95,7 +96,7 @@ function mcpRoutes(opts: McpFixtureOpts = {}): RouteTable {
   routes[`GET ${TARGET}/.well-known/agents.json`] = () => jsonOut(agentsCard(opts))
 
   if (!opts.stdioOnly) {
-    // (d) unauthenticated probe of the MCP endpoint.
+    // (d) unauthenticated GET probe of the MCP endpoint.
     routes[`GET ${mcpUrl}`] = () =>
       opts.unauth ?? {
         status: 401,
@@ -105,6 +106,12 @@ function mcpRoutes(opts: McpFixtureOpts = {}): RouteTable {
           'www-authenticate': `Bearer resource_metadata="${new URL(mcpUrl).origin}/.well-known/oauth-protected-resource"`,
         },
       }
+
+    // (d-ii, ax-q4t) unauthenticated POST-initialize probe — only reached when the
+    // GET gives no clear keyless/protected signal (e.g. a POST-only server 405s GET).
+    if (opts.unauthPost) {
+      routes[`POST ${mcpUrl}`] = () => opts.unauthPost!
+    }
 
     // (a) protected-resource metadata at the MCP origin.
     const prKey = `GET ${new URL(mcpUrl).origin}/.well-known/oauth-protected-resource`
@@ -131,11 +138,13 @@ function originSafe(url: string): string {
 }
 
 /** A fetcher over an absolute-url route table that records every call. */
-function multiFetcher(routes: RouteTable): { fetcher: Fetcher; calls: string[] } {
+function multiFetcher(routes: RouteTable): { fetcher: Fetcher; calls: string[]; methodCalls: string[] } {
   const calls: string[] = []
+  const methodCalls: string[] = [] // `METHOD url`, so GET vs POST can be told apart
   const fetcher: Fetcher = async (url, init) => {
     calls.push(url)
     const method = (init?.method ?? 'GET').toUpperCase()
+    methodCalls.push(`${method} ${url}`)
     const handler = routes[`${method} ${url}`]
     if (!handler) {
       return new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
@@ -146,14 +155,14 @@ function multiFetcher(routes: RouteTable): { fetcher: Fetcher; calls: string[] }
       headers: { 'content-type': out.contentType ?? 'text/plain', ...(out.headers ?? {}) },
     })
   }
-  return { fetcher, calls }
+  return { fetcher, calls, methodCalls }
 }
 
 async function judge(opts: McpFixtureOpts = {}) {
-  const { fetcher, calls } = multiFetcher(mcpRoutes(opts))
+  const { fetcher, calls, methodCalls } = multiFetcher(mcpRoutes(opts))
   const observer = new Observer({ fetcher, delayMs: 0 })
   const bundle = await observeTarget(TARGET, observer, 42)
-  return { bundle, checks: runChecks(bundle), calls, observer }
+  return { bundle, checks: runChecks(bundle), calls, methodCalls, observer }
 }
 
 function verdictOf(checks: CheckResult[], id: string) {
@@ -271,13 +280,6 @@ describe('non-conformant MCP targets fail the specific check', () => {
     expect(verdictOf(checks, 'mcp-pkce')).toBe('pass')
   })
 
-  it('unauthenticated MCP without WWW-Authenticate → mcp-www-authenticate fails', async () => {
-    const { checks } = await judge({
-      unauth: { status: 200, contentType: 'application/json', body: '{"ok":true}' },
-    })
-    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
-  })
-
   it('401 without a WWW-Authenticate header → mcp-www-authenticate fails', async () => {
     const { checks } = await judge({
       unauth: { status: 401, contentType: 'application/json', body: '{"error":"unauthorized"}' },
@@ -297,6 +299,290 @@ describe('non-conformant MCP targets fail the specific check', () => {
     })
     expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
     expect(detailOf(checks, 'mcp-www-authenticate')).toMatch(/resource_metadata/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// KEYLESS remote MCP (AXP Clause 7, the No-ask Zone) — every MCP-OAuth check
+// SKIPS exactly like stdio. A keyless-first-value HTTP MCP is a VALID choice
+// (a public read-only tool needs no auth; .ax's own surfaces are keyless-first)
+// and must NOT be penalized/capped for lacking OAuth. The critical invariant:
+// keyless (2xx unauth, no challenge) = skip; protected-but-broken = still fail.
+// ---------------------------------------------------------------------------
+
+describe('keyless remote MCP (No-ask Zone) skips the OAuth checks (not fail, no cap)', () => {
+  const KEYLESS: McpFixtureOpts = {
+    // An unauthenticated initialize/request SUCCEEDS with no auth challenge.
+    unauth: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' },
+    // A genuine keyless server publishes NO OAuth well-knowns.
+    protectedResource: null,
+    asMetadata: null,
+  }
+
+  it('(a) keyless remote MCP (200 unauth, no OAuth well-knowns) → all six checks SKIP, none fail', async () => {
+    const { checks } = await judge(KEYLESS)
+    for (const id of MCP_CHECK_IDS) {
+      expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+    }
+    // The skip is informational and names the No-ask Zone — not a silent skip.
+    expect(detailOf(checks, 'mcp-oauth-protected-resource')).toMatch(/keyless|No-ask Zone/i)
+    // AX-6 presence still passes — a keyless remote MCP is a real, declared MCP.
+    expect(verdictOf(checks, 'mcp-declared')).toBe('pass')
+  })
+
+  it('mcp-www-authenticate SKIPS for a keyless server (it legitimately returns 200, no 401)', async () => {
+    const { checks } = await judge(KEYLESS)
+    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('skip')
+    expect(detailOf(checks, 'mcp-www-authenticate')).toMatch(/keyless|No-ask Zone/i)
+  })
+
+  it('keyless is PROBE-decided: a 200 unauth is keyless even if OAuth well-knowns happen to be served', async () => {
+    // Even with the default well-knowns present, an unauthenticated 200 means the
+    // server operates without auth — keyless is decided by PROBING the endpoint.
+    const { checks } = await judge({ unauth: { status: 200, contentType: 'application/json', body: '{"ok":true}' } })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+  })
+
+  it('INVARIANT: a 401 WITHOUT a WWW-Authenticate is PROTECTED-but-broken, NOT keyless → still FAILS', async () => {
+    // The positive-2xx requirement keeps the invariant: a challenge status (401/
+    // 403) is never read as keyless, so a protected-but-broken server cannot
+    // escape into a skip — it still fails the OAuth conformance it needs.
+    const { checks } = await judge({
+      unauth: { status: 401, contentType: 'application/json', body: '{"error":"unauthorized"}' },
+    })
+    expect(verdictOf(checks, 'mcp-www-authenticate')).toBe('fail')
+    // The keyless skip did not swallow the failure — protected still applies.
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).not.toBe('skip')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ax-q4t: POST-only streamable-HTTP MCP. A spec-legal server with no server-
+// initiated SSE answers the unauthenticated GET with 405 (correct) yet answers a
+// real JSON-RPC initialize over unauthenticated POST. The GET alone is neither a
+// clear keyless (2xx) nor a clear protected (401/403) signal, so the decision
+// falls to the unauthenticated POST-initialize probe. This is the apps.ax case:
+// initialize/tools/list/tools/call all succeed over unauthenticated POST, so the
+// surface is genuinely keyless+usable and must NOT be OAuth-capped.
+// ---------------------------------------------------------------------------
+
+describe('ax-q4t: GET 405 + unauthenticated POST initialize decides keyless vs protected', () => {
+  // A well-formed JSON-RPC initialize RESULT — a real MCP server answering.
+  const INIT_RESULT: RouteOut = {
+    status: 200,
+    contentType: 'application/json',
+    body: '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"apps.ax","version":"1.0.0"},"capabilities":{"tools":{}}}}',
+  }
+  const GET_405: RouteOut = { status: 405, contentType: 'application/json', body: '{"error":"method not allowed — use POST"}' }
+
+  it('(a) GET 405 + POST initialize 2xx JSON-RPC result → KEYLESS, all six MCP-OAuth checks SKIP (was: fail/cap)', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: INIT_RESULT,
+      // A genuine keyless server publishes NO OAuth well-knowns.
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) {
+      expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+    }
+    // The skip is informational and names the No-ask Zone + POST-only signal.
+    expect(detailOf(checks, 'mcp-oauth-protected-resource')).toMatch(/keyless|No-ask Zone/i)
+    expect(detailOf(checks, 'mcp-oauth-protected-resource')).toMatch(/POST-only|POST initialize/i)
+    // AX-6 presence still passes — a keyless POST-only remote MCP is a real MCP.
+    expect(verdictOf(checks, 'mcp-declared')).toBe('pass')
+  })
+
+  it('(a) SSE-framed initialize result over POST is also read as keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: {
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n\n',
+      },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+  })
+
+  it('(b) GET 405 + POST initialize 401 → PROTECTED, MCP-OAuth checks APPLY (not SKIP)', async () => {
+    // A protected POST-only server challenges the unauthenticated POST too. It is
+    // NOT keyless — every OAuth sibling still applies, and a protected-but-broken
+    // OAuth (here: no well-knowns) still FAILS.
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 401, contentType: 'application/json', body: '{"error":"unauthorized"}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).toBe('fail')
+  })
+
+  it('(b) GET 405 + POST initialize 403 with WWW-Authenticate → PROTECTED, checks APPLY', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: {
+        status: 403,
+        contentType: 'application/json',
+        body: '{"error":"forbidden"}',
+        headers: { 'www-authenticate': 'Bearer realm="mcp"' },
+      },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).not.toBe('skip')
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).toBe('fail')
+  })
+
+  it('(c) GET 405 + POST initialize 500 → NOT keyless, no free SKIP (graded as before)', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 500, contentType: 'application/json', body: '{"error":"boom"}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    // A broken/non-conformant endpoint is not a usable keyless MCP — it must not
+    // be granted a free SKIP; the OAuth grade applies and fails on the missing
+    // well-knowns.
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).toBe('fail')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx but a JSON-RPC ERROR → NOT keyless (not a real handshake)', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: {
+        status: 200,
+        contentType: 'application/json',
+        body: '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"invalid"}}',
+      },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx but non-JSON garbage → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'text/html', body: '<html>not an MCP server</html>' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  // (LOW gate finding) A degenerate/broken unauthenticated POST initialize —
+  // result: null, a primitive result, or an object missing the REQUIRED
+  // protocolVersion field — is NOT a genuine keyless MCP handshake. Without this
+  // shape check, a broken server that never returns a usable initialize result
+  // would earn a free SKIP on all six mcp-oauth checks instead of being graded.
+  it('(c) GET 405 + POST initialize 2xx with result: null → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":null}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).toBe('fail')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with a PRIMITIVE result ("ok") → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":"ok"}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with an EMPTY object result ({}) → NOT keyless (no protocolVersion)', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(c) GET 405 + POST initialize 2xx with an object result but NO protocolVersion → NOT keyless', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{"foo":1}}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).not.toBe('skip')
+  })
+
+  it('(a) GET 405 + POST initialize 2xx WITH protocolVersion (the genuine apps.ax case) → KEYLESS, SKIP', async () => {
+    const { checks } = await judge({
+      unauth: GET_405,
+      unauthPost: INIT_RESULT,
+      protectedResource: null,
+      asMetadata: null,
+    })
+    for (const id of MCP_CHECK_IDS) expect(verdictOf(checks, id), `${id}: ${detailOf(checks, id)}`).toBe('skip')
+  })
+
+  // The unauthenticated POST-initialize probe records evidence under this exact
+  // role — a precise signal of whether the ax-q4t probe fired (distinct from the
+  // MCP-UI/registry handshake POSTs to the same url).
+  const UNAUTH_INIT_ROLE = 'probe:mcp:unauthenticated-initialize'
+  const probedUnauthInit = (bundle: Awaited<ReturnType<typeof judge>>['bundle']) =>
+    bundle.items.some((e) => e.role === UNAUTH_INIT_ROLE)
+
+  it('the POST probe is only issued when the GET is undecided (GET 2xx never triggers it)', async () => {
+    const { bundle } = await judge({
+      unauth: { status: 200, contentType: 'application/json', body: '{"jsonrpc":"2.0","id":1,"result":{}}' },
+      protectedResource: null,
+      asMetadata: null,
+    })
+    // A clear keyless GET means no unauthenticated POST initialize probe is issued.
+    expect(probedUnauthInit(bundle)).toBe(false)
+  })
+
+  it('a GET 401 challenge short-circuits to PROTECTED with no POST probe', async () => {
+    const { checks, bundle } = await judge({
+      unauth: {
+        status: 401,
+        contentType: 'application/json',
+        body: '{"error":"unauthorized"}',
+        headers: { 'www-authenticate': 'Bearer realm="mcp"' },
+      },
+    })
+    // The protected GET decides it — the unauthenticated POST probe is not issued.
+    expect(probedUnauthInit(bundle)).toBe(false)
+    expect(verdictOf(checks, 'mcp-oauth-protected-resource')).not.toBe('skip')
+  })
+
+  it('the POST probe IS issued when the GET 405s (undecided)', async () => {
+    const { bundle, methodCalls } = await judge({
+      unauth: GET_405,
+      unauthPost: INIT_RESULT,
+      protectedResource: null,
+      asMetadata: null,
+    })
+    expect(probedUnauthInit(bundle)).toBe(true)
+    expect(methodCalls).toContain(`GET ${TARGET}/mcp`)
+    expect(methodCalls).toContain(`POST ${TARGET}/mcp`)
+  })
+
+  it('SSRF: an off-origin MCP url is never GET- or POST-probed (whole block dropped)', async () => {
+    const { methodCalls, bundle } = await judge({
+      mcpUrl: 'https://evil.example/mcp',
+      unauthPost: INIT_RESULT,
+    })
+    // The off-origin mcpUrl fails the same-origin gate — neither the GET nor the
+    // POST initialize probe is ever sent to it, and no unauth-init evidence exists.
+    expect(methodCalls.some((u) => u.includes('evil.example'))).toBe(false)
+    expect(probedUnauthInit(bundle)).toBe(false)
   })
 })
 

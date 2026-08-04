@@ -924,6 +924,21 @@ describe('endpoint capture + chaining', () => {
     expect(report.passed, JSON.stringify(report.requirements, null, 2)).toBe(true)
   })
 
+  // Vacuous-pass guard: `results.every(...)` over an EMPTY array is `true`, so
+  // a PinnedSpec with zero requirements must be rejected at parse — otherwise
+  // it would ALWAYS report passed:true, even against a totally broken target,
+  // which is exactly the silent-faked-success class this verifier exists to
+  // prevent.
+  it('rejects a PinnedSpec with an EMPTY requirements array (refuses to vacuously pass)', async () => {
+    const { fetcher, fetched } = crudFetcher()
+    const spec = probeSpec([])
+    await expect(
+      verifyPinnedSpec(GOOD, spec, { fetcher, delayMs: 0, seed: 1, mode: 'local' }),
+    ).rejects.toThrow(/no requirements verifies nothing.*refusing to vacuously pass/is)
+    // Rejected BEFORE any probe fires — never a silent green.
+    expect(fetched.length).toBe(0)
+  })
+
   it('a spec with DUPLICATE requirement ids is rejected up front with a naming error', async () => {
     const { fetcher, fetched } = crudFetcher()
     const spec = probeSpec([
@@ -1221,7 +1236,7 @@ describe('probe-manifest check', () => {
     expect(c.detail).toMatch(/no non-empty "param"/)
   })
 
-  it('fails a METERED card (declares monetization.offers) with no monetization.probe (the 402 boundary would go unverified)', async () => {
+  it('fails a METERED card that declares a probe manifest but no monetization.probe (the 402 boundary would go unverified)', async () => {
     const routes = withProbes(goodTargetRoutes(), {
       keyless: { url: '/api/status' },
       pricing: { url: '/api/status' },
@@ -1238,12 +1253,18 @@ describe('probe-manifest check', () => {
       'GET /.well-known/agents.json': () => ({
         status: 200, contentType: 'application/json', body: JSON.stringify(card),
       }),
+      // The declared pricing surface OBSERVES metered — the monetization.probe
+      // demand is gated on the observed model (AXP A.5, metered only).
+      'GET /api/status': () => ({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ model: 'metered', hardCeiling: 5 }),
+      }),
     }))
     expect(c.verdict).toBe('fail')
     expect(c.detail).toMatch(/monetization\.probe/)
   })
 
-  it('PASSES a free-shaped card (no monetization, no overCeiling) — those are metered-only surfaces (ax-5v1)', async () => {
+  it('a FREE card without overCeiling or monetization.probe PASSES (metered demands are appliesWhen-gated on the observed model)', async () => {
     const routes = withProbes(goodTargetRoutes(), {
       keyless: { url: '/api/status' },
       pricing: { url: '/api/status' },
@@ -1258,8 +1279,12 @@ describe('probe-manifest check', () => {
       'GET /.well-known/agents.json': () => ({
         status: 200, contentType: 'application/json', body: JSON.stringify(card),
       }),
+      'GET /api/status': () => ({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ model: 'free' }),
+      }),
     }))
     expect(c.verdict, c.detail).toBe('pass')
+    expect(c.detail).toMatch(/observed pricing model: free/)
   })
 
   it('fragment-only duplicates do not inflate channel cardinality, and fragment overlap is still overlap', async () => {
@@ -1284,7 +1309,9 @@ describe('probe-manifest check', () => {
     expect(c.detail).toMatch(/probes\.knownEmpty declares 1 distinct/)
     expect(c.detail).toMatch(/probes\.pricing declares 0 distinct/)
     expect(c.detail).toMatch(/probes\.knownForbidden declares 0 distinct/)
-    // overCeiling is metered-only — its absence is NOT a manifest-structure failure.
-    expect(c.detail).not.toMatch(/probes\.overCeiling declares 0 distinct/)
+    // overCeiling is NOT demanded here: with no observable pricing model the
+    // metered-only channel carries no requirement (the pinned pricing-declared
+    // probe is what fails a target whose pricing surface answers no document).
+    expect(c.detail).not.toMatch(/probes\.overCeiling/)
   })
 })

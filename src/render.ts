@@ -4,7 +4,7 @@
  * (browsers), and the raw JSON report (Accept: application/json).
  */
 
-import type { VerificationReport } from './types.js'
+import type { ContractDiffReport, VerificationReport } from './types.js'
 import type { PinnedReport, SuiteReport } from './pinned.js'
 import type { DataDrivenReport } from './dataset.js'
 
@@ -82,6 +82,46 @@ export function suiteMarkdown(r: SuiteReport): string {
     ),
     '',
   ]
+  return lines.join('\n')
+}
+
+/**
+ * contract-diff run (ax-gyh): the published-vs-live contract diff as a CI
+ * gate. PASSED iff there are zero BREAKING deviations; additive-only drift
+ * still passes. One row per declared GET-safe operation, plus a deviation list.
+ */
+export function contractDiffMarkdown(r: ContractDiffReport): string {
+  const host = r.target.replace(/^https?:\/\//, '')
+  const passed = r.breaking === 0
+  const lines: string[] = [
+    `# api.qa contract-diff — ${host}`,
+    '',
+    `> **${passed ? 'PASSED' : 'FAILED'}** · ${r.breaking} breaking · ${r.additive} additive · ${r.operationsProbed}/${r.operationsDeclared} operation(s) probed`,
+    '',
+  ]
+  if (!r.openapiValid) {
+    lines.push('No valid OpenAPI contract to diff against the live surface.', '')
+    return lines.join('\n')
+  }
+  lines.push(
+    '| operation | probed | live | breaking | additive |',
+    '| --- | --- | --- | --- | --- |',
+    ...r.perOperation.map((o) => {
+      const b = o.deviations.filter((d) => d.classification === 'breaking').length
+      const a = o.deviations.filter((d) => d.classification === 'additive').length
+      return `| \`${o.method} ${o.path}\` | ${o.probed ? 'yes' : 'no'} | ${o.liveStatus ?? '—'} | ${b} | ${a} |`
+    }),
+    '',
+  )
+  if (r.deviations.length > 0) {
+    lines.push('## Deviations', '')
+    for (const d of r.deviations) {
+      lines.push(`- **${d.classification}** (${d.kind}) — ${d.detail.replace(/\n/g, ' ')}`)
+    }
+    lines.push('')
+  } else {
+    lines.push('Clean: every probed operation matches its declared status/content-type/schema.', '')
+  }
   return lines.join('\n')
 }
 

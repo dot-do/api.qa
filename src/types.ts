@@ -318,14 +318,34 @@ export interface EndpointExpect {
   paths?: Array<{
     path: string
     equals?: unknown
-    /** The resolved value must be strictly equal to one of these (closed enum). */
-    oneOf?: unknown[]
     exists?: boolean
+    /**
+     * Closed-vocabulary membership: the value at `path` must deep-equal ONE of
+     * these values (e.g. AXP's pricing `model` ∈ ["free","metered"]). A missing
+     * path or a value outside the set is a failure.
+     */
+    oneOf?: unknown[]
     gte?: number
     lte?: number
     gt?: number
     lt?: number
   }>
+}
+
+/**
+ * Conditional applicability for `probe` / `check` requirements: the requirement
+ * applies only when the value at `path` inside the FIRST declared probe of
+ * channel `fromProbe` (as OBSERVED in this run — entry index 0) deep-equals
+ * `equals`. A non-applicable requirement passes as "not applicable" (this is
+ * how a free-model API passes AXP's metering requirements). FAIL-CLOSED rule:
+ * when the source probe was not observed, is not JSON, or the path does not
+ * resolve, the requirement APPLIES — applicability can only be proven by the
+ * observed value, never by its absence.
+ */
+export interface AppliesWhen {
+  fromProbe: string
+  path: string
+  equals: unknown
 }
 
 export type PinnedRequirement =
@@ -387,23 +407,16 @@ export type PinnedRequirement =
        * `param` member; the verifier sets that query parameter to this value.
        * Object form derives the value from another channel's observed JSON
        * body — the VERIFIER, never the manifest, owns the amount. `multiply`
-       * is a fixed factor; `multiplyRange: [lo, hi]` derives a SEED-RANDOMIZED
-       * factor from the run seed (recorded in the report, so replayable), so the
-       * exact over-ceiling amount is NOT precomputable from the declared ceiling
-       * — a lookup-table target cannot pre-answer it (ax-0v2).
+       * scales by a fixed factor; `multiplyRange: [lo, hi]` scales by a
+       * SEED-RANDOMIZED factor drawn deterministically from the run seed within
+       * [lo, hi] — so the exact probed amount is not precomputable from the
+       * declared ceiling (AXP Clause 5), yet fully replayable from the report's
+       * seed. When both are present, `multiply` wins (the fixed pin is
+       * stricter).
        */
       paramValue?: number | { fromProbe: string; path: string; multiply?: number; multiplyRange?: [number, number] }
-      /**
-       * Conditional applicability. When present, this requirement is judged
-       * ONLY if another channel's observed body reports `path === equals`;
-       * otherwise the requirement is NOT APPLICABLE and passes without a
-       * probe being declared or fetched (e.g. hard-ceiling metering probes
-       * apply only when `probes.pricing` reports `model: "metered"`, so a
-       * free API is admissible without declaring an over-ceiling operation).
-       * Fail-closed: if applicability cannot be resolved (source unreadable /
-       * path absent), the requirement APPLIES.
-       */
-      appliesWhen?: { fromProbe: string; path: string; equals: unknown }
+      /** Conditional applicability (see AppliesWhen). Absent = always applies. */
+      appliesWhen?: AppliesWhen
       /**
        * When true, every declared entry's pathname must ALSO be observed
        * answering `200` with a top-level `type: "OK"` JSON envelope somewhere
@@ -431,13 +444,12 @@ export type PinnedRequirement =
       check: string
       must: 'pass'
       /**
-       * Conditional applicability (same contract as the probe variant): judge
-       * this check ONLY when another channel's observed body reports
-       * `path === equals`; otherwise NOT APPLICABLE and passes (e.g. offers-402
-       * applies only when probes.pricing reports model:"metered"). Fail-closed:
-       * unresolvable applicability means the check APPLIES.
+       * Conditional applicability (see AppliesWhen): e.g. AXP pins
+       * `check-offers-402` with `appliesWhen {fromProbe:'pricing', path:'model',
+       * equals:'metered'}` so a free-model target passes it as not applicable
+       * instead of being wrongly failed. Absent = always applies.
        */
-      appliesWhen?: { fromProbe: string; path: string; equals: unknown }
+      appliesWhen?: AppliesWhen
     }
 
 export interface PinnedSpec {

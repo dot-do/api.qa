@@ -7,6 +7,7 @@ import {
   MAX_MOCK_SPEC_BYTES,
 } from '../src/mock.js'
 import { contractDiff, resolveSchema } from '../src/contract.js'
+import { startMockServer } from '../src/mock-server.js'
 import { validateSchema } from '../src/schema.js'
 import { ROLE } from '../src/discovery.js'
 import { createApp } from '../src/worker.js'
@@ -650,5 +651,61 @@ describe('POST /mock abuse-surface bounds (MED fix)', () => {
     // does not count against the cap even while at capacity.
     const again = await post(specFor(1))
     expect(again.status).toBe(200)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ax-gyh — the local deterministic MOCK SERVER CLI. A real loopback HTTP
+// server stood up from a spec: declared operations serve deterministic,
+// schema-conformant bodies; an undeclared path 404s; no outbound fetch.
+// ---------------------------------------------------------------------------
+
+describe('mock server CLI verb (ax-gyh)', () => {
+  it('serves deterministic, schema-conformant responses on the port; undeclared 404s', async () => {
+    const started = await startMockServer(SPEC, 0, { seed: DEFAULT_MOCK_SEED })
+    try {
+      const base = `http://127.0.0.1:${started.port}`
+      // Declared GET /widgets → 200 JSON that conforms to its declared schema.
+      const res = await fetch(`${base}/widgets`, { headers: { accept: 'application/json' } })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('content-type')).toMatch(/json/)
+      const body = await res.json()
+      const schema = (SPEC.paths['/widgets'].get.responses['200'].content['application/json'].schema) as unknown as MiniSchema
+      // Resolve $ref against the spec root, then validate the served body.
+      const resolved = resolveSchema(schema, ROOT)!
+      expect(validateSchema(body, resolved)).toEqual([])
+
+      // Determinism: a second identical request is byte-identical.
+      const res2 = await fetch(`${base}/widgets`, { headers: { accept: 'application/json' } })
+      expect(await res2.text()).toBe(JSON.stringify(body))
+
+      // Declared example served verbatim on /health.
+      const health = await fetch(`${base}/health`)
+      expect(health.status).toBe(200)
+      expect(await health.json()).toEqual({ ok: true, region: 'us-east-1' })
+
+      // Undeclared path 404s with a JSON miss.
+      const miss = await fetch(`${base}/not-declared`)
+      expect(miss.status).toBe(404)
+      expect(((await miss.json()) as { error: string }).error).toMatch(/mock declares no GET \/not-declared/)
+    } finally {
+      await started.close()
+    }
+  })
+
+  it('a distinct seed produces a distinct-but-still-conformant body (determinism per seed)', async () => {
+    const a = await startMockServer(SPEC, 0, { seed: 1 })
+    const b = await startMockServer(SPEC, 0, { seed: 7 })
+    try {
+      const ba = await (await fetch(`http://127.0.0.1:${a.port}/widgets`)).text()
+      const bb = await (await fetch(`http://127.0.0.1:${b.port}/widgets`)).text()
+      // Both conform; the seed drives the non-fixed choices deterministically.
+      const resolved = resolveSchema(SPEC.paths['/widgets'].get.responses['200'].content['application/json'].schema as unknown as MiniSchema, ROOT)!
+      expect(validateSchema(JSON.parse(ba), resolved)).toEqual([])
+      expect(validateSchema(JSON.parse(bb), resolved)).toEqual([])
+    } finally {
+      await a.close()
+      await b.close()
+    }
   })
 })

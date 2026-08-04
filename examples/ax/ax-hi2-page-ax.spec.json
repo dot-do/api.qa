@@ -1,0 +1,26 @@
+{
+  "$type": "PinnedSpec",
+  "name": "ax-hi2-page-ax-v1",
+  "version": "2",
+  "description": "Acceptance contract for ax-hi2 (page.ax, the agent-first publish surface), minted BEFORE implementation per ADR-0008; v2 re-pins the persist boundary onto the ratified outcome algebra (ADR 0019, ax-37n.23). Contract fixed here: slugs are content-addressed (first 12 hex chars of sha256 of the raw request body), POST / returns JSON {url, slug}, GET /:slug content-negotiates (markdown default; ?format=html override), POST /:slug/persist answers 402 with a typed OFFER minted from declared pricing ({type: 'OFFER', id, title, price, checkoutUrl}; Stripe stub mode acceptable for local acceptance; live key is an owner-queue item), and the surface publishes llms.txt + a valid OpenAPI description. Byte-consistency, Accept-header negotiation, YAML-LD/persist-me body content, and the 429 rate limit are asserted in the repo's Worker seam tests (JSON-only assertions here). Run against a local dev server: node scripts/... then npx autonomous-qa verify http://127.0.0.1:8787 --spec docs/acceptance/ax-hi2.spec.json --expect-digest <pin>",
+  "requirements": [
+    { "id": "llms-txt-published", "kind": "surface", "surface": "llms.txt", "must": "present" },
+    { "id": "openapi-published", "kind": "surface", "surface": "openapi", "must": "valid" },
+    { "id": "publish-returns-canonical-url", "kind": "endpoint", "method": "POST", "path": "/",
+      "body": "# page.ax acceptance probe\n\nPublished by the api.qa pinned acceptance run.\n",
+      "expect": { "status": [200, 201], "contentTypeIncludes": "application/json",
+        "schema": { "type": "object", "required": ["url", "slug"], "properties": { "url": { "type": "string" }, "slug": { "type": "string" } } },
+        "paths": [ { "path": "slug", "equals": "1587ef97046f" } ] } },
+    { "id": "read-defaults-to-markdown", "kind": "endpoint", "method": "GET", "path": "/1587ef97046f",
+      "expect": { "status": 200, "contentTypeIncludes": "text/markdown" } },
+    { "id": "format-html-override", "kind": "endpoint", "method": "GET", "path": "/1587ef97046f?format=html",
+      "expect": { "status": 200, "contentTypeIncludes": "text/html" } },
+    { "id": "format-md-override", "kind": "endpoint", "method": "GET", "path": "/1587ef97046f?format=md",
+      "expect": { "status": 200, "contentTypeIncludes": "text/markdown" } },
+    { "id": "persist-answers-typed-offer", "kind": "endpoint", "method": "POST", "path": "/1587ef97046f/persist",
+      "expect": { "status": 402, "contentTypeIncludes": "application/json",
+        "paths": [ { "path": "type", "equals": "OFFER" }, { "path": "id", "exists": true }, { "path": "price", "exists": true }, { "path": "checkoutUrl", "exists": true } ] } },
+    { "id": "missing-slug-typed-404", "kind": "endpoint", "method": "GET", "path": "/000000000000",
+      "expect": { "status": 404 } }
+  ]
+}

@@ -150,6 +150,45 @@ describe('CLI exit codes (spawned, real process status)', () => {
   })
 })
 
+describe('dev verb — in-process pre-deploy grading (spawned, real process status)', () => {
+  const passing = join(repoRoot, 'examples', 'example-worker.mjs')
+  const failing = join(repoRoot, 'examples', 'broken-worker.mjs')
+
+  it('dev <conforming entry> → exit 0 (grade A+, mounted in-process)', () => {
+    const r = run(['dev', passing])
+    expect(r.status, r.stdout + r.stderr).toBe(0)
+    expect(r.stdout).toMatch(/A\+/)
+  })
+
+  it('dev <non-conforming entry> → exit 1 (grade F)', () => {
+    const r = run(['dev', failing])
+    expect(r.status).toBe(1)
+  })
+
+  it('dev <non-conforming entry> --spec → exit 1 (pinned gate fails)', () => {
+    const r = run(['dev', failing, '--spec', spec])
+    expect(r.status).toBe(1)
+  })
+
+  it('dev <conforming entry> --json → exit 0 and emits a JSON report', () => {
+    const r = run(['dev', passing, '--json'])
+    expect(r.status).toBe(0)
+    const report = JSON.parse(r.stdout) as { grade: string; mode: string; attested: boolean }
+    expect(report.grade).toBe('A+')
+    expect(report.mode).toBe('local')
+    expect(report.attested).toBe(false)
+  })
+
+  it('dev with no entry → exit 1 (usage)', () => {
+    expect(run(['dev']).status).toBe(1)
+  })
+
+  it('dev <entry with no fetch export> → exit 1 (clear error)', () => {
+    const r = run(['dev', join(repoRoot, 'package.json')])
+    expect(r.status).toBe(1)
+  })
+})
+
 describe('GitHub Action workflow is well-formed', () => {
   const wfPath = join(repoRoot, '.github', 'workflows', 'api-qa-example.yml')
   const yaml = readFileSync(wfPath, 'utf8')

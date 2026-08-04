@@ -3,6 +3,15 @@
 export * from './types.js'
 export { verifyTarget, rejudge, VERIFIER_VERSION, type VerifyTargetOpts } from './verify.js'
 export {
+  grade,
+  gradePinned,
+  type GradeTarget,
+  type GradeOpts,
+  type GradePinnedOpts,
+  type FetchHandler,
+  type FetchHandlerFn,
+} from './local.js'
+export {
   verifyPinnedSpec,
   parsePinnedSpec,
   validateRequirements,
@@ -24,6 +33,13 @@ export {
 export { runChecks } from './checks.js'
 export { contractDiff, enumerateOperations } from './contract.js'
 export { axScoreOf, gradeOf } from './grade.js'
+export {
+  runEstateGate,
+  formatScoreboard,
+  type GateEntry,
+  type GateRow,
+  type GateResult,
+} from './gate.js'
 export {
   attestReport,
   verifyAttestation,

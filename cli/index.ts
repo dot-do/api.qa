@@ -5,8 +5,14 @@
  *   npx autonomous-qa <domain|url>                       grade a target (advisory, unsigned)
  *   npx autonomous-qa verify <target> --spec <file>      pinned-spec mode (the hill-climb gate)
  *       [--expect-digest <sha256>] [--seed <n>] [--json]
+ *   npx autonomous-qa dev <entry.js|localhost-url>       grade a surface PRE-DEPLOY, in-process
+ *       [--spec <file>] [--expect-digest <sha256>] [--json]   (Worker entry mounted in memory,
+ *                                                              or a running local dev server by URL)
  *   npx autonomous-qa suite <file> --env <name>          reusable suite/collection mode
  *       [--iteration-data <dataset>] [--target <t>] [--expect-digest <sha256>]
+ *   npx autonomous-qa contract-diff <spec> <target>      did this deploy break the published contract?
+ *       [--json] [--reporter ...]                         (exit NON-ZERO on any breaking op diff)
+ *   npx autonomous-qa mock <spec> --port <n>             local deterministic mock server from a spec
  *   npx autonomous-qa spec-digest <file>                 print the sha256 pin for a spec
  *   npx autonomous-qa rejudge                            re-judge a JSON report from stdin
  *   npx autonomous-qa mcp                                MCP server (stdio)
@@ -27,11 +33,19 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { verifyTarget, rejudge } from '../src/verify.js'
+import { grade, gradePinned, type FetchHandler, type GradeTarget } from '../src/local.js'
+import { isUrl, isLocalTarget, isPrivateUrlHost } from './target.js'
+import { skillText, checkSkill, installSkill, SKILL_NAME } from './skill.js'
 import { verifyPinnedSpec, verifySuite } from '../src/pinned.js'
+import { runEstateGate, formatScoreboard, type GateEntry } from '../src/gate.js'
 import { parseDataset, verifySuiteDataDriven } from '../src/dataset.js'
-import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown } from '../src/render.js'
+import { reportMarkdown, pinnedMarkdown, suiteMarkdown, dataDrivenMarkdown, contractDiffMarkdown } from '../src/render.js'
+import { runContractDiff } from '../src/contract-cli.js'
+import { startMockServer } from '../src/mock-server.js'
+import { DEFAULT_MOCK_SEED } from '../src/mock.js'
 import {
   exitCodeFor,
   junitXml,
@@ -132,6 +146,40 @@ async function main(): Promise<number> {
     return 0
   }
 
+  if (cmd === 'skill') {
+    // skill — distribute the AXP skill (canonical source: the axp.org.ai repo
+    // `skill/SKILL.md`; this package ships a byte-identical, test-pinned copy).
+    // The CANONICAL installer is the standard's own package — `npx axp.org.ai
+    // skill install`; this subcommand is the verifier-side mirror (same bytes).
+    //   skill install   copy into ~/.claude/skills/axp/SKILL.md (idempotent)
+    //   skill --check   drift check: exit 0 iff installed == shipped
+    //   skill --print   shipped skill to stdout
+    const sub = rest[0]
+    if (flags.has('print') || sub === 'print') {
+      process.stdout.write(skillText())
+      return 0
+    }
+    if (flags.has('check') || sub === 'check') {
+      const s = checkSkill()
+      if (!s.installed) {
+        console.error(`autonomous-qa: skill "${SKILL_NAME}" not installed at ${s.dest} — run: npx autonomous-qa skill install`)
+        return 1
+      }
+      if (!s.inSync) {
+        console.error(`autonomous-qa: skill "${SKILL_NAME}" at ${s.dest} DRIFTED from the shipped copy — run: npx autonomous-qa skill install`)
+        return 1
+      }
+      console.log(`autonomous-qa: skill "${SKILL_NAME}" in sync at ${s.dest}`)
+      return 0
+    }
+    if (sub === 'install') {
+      const s = installSkill()
+      console.log(`autonomous-qa: skill "${SKILL_NAME}" installed → ${s.dest}`)
+      return 0
+    }
+    return die('skill needs a mode: `skill install`, `skill --check`, or `skill --print`')
+  }
+
   if (cmd === 'spec-digest') {
     const file = rest[0]
     if (!file) return die('spec-digest needs a file path')
@@ -198,6 +246,161 @@ async function main(): Promise<number> {
     return emit(report, suiteMarkdown(report), flags)
   }
 
+  if (cmd === 'contract-diff') {
+    // contract-diff <openapi-spec> <target> (ax-gyh): the highest-value CI gate
+    // — "did this deploy break the published contract?". The spec is LOCAL (a
+    // file, the published contract); the target is FETCHED live through the
+    // SSRF-gated Observer (runContractDiff — no new un-gated fetch). Exit
+    // NON-ZERO on ANY breaking operation diff (exitCodeFor over the report).
+    const specFile = rest[0]
+    const target = rest[1] ?? flags.get('target')
+    if (!specFile || !target) return die('contract-diff needs <openapi-spec> <target>')
+    const specText = readFileSync(specFile, 'utf8')
+    // A localhost/private target URL opts into the private-host allowance the
+    // same anchored-hostname way `dev <url>` does — never inferred from a
+    // remote target (the SSRF invariant).
+    const allowPrivate = isUrl(target) && isPrivateUrlHost(target)
+    const report = await runContractDiff(specText, target, {
+      seed,
+      allowPrivate,
+      delayMs: isLocalTarget(target) ? 0 : 150,
+    })
+    // A gate that verified NOTHING must never exit 0/PASSED (the CLI's own
+    // silent-green fix): `breaking` is trivially 0 whenever no operation was
+    // probed, so an un-diffable spec (wrong file, lost `paths`, unrecognized
+    // shape) or a spec whose every declared operation is unprobeable would
+    // otherwise print a clean PASSED report. die() loudly instead of emitting
+    // a "clean" report; exitCodeFor() below is ALSO fixed (defense in depth
+    // for any other caller of the raw report).
+    if (!report.openapiValid) {
+      return die(`contract-diff: ${specFile} has no valid OpenAPI contract to diff — refusing to report a clean pass`)
+    }
+    if (report.operationsProbed === 0) {
+      return die(
+        `contract-diff: zero probeable operations in ${specFile} against ${target} — refusing to report a clean pass`,
+      )
+    }
+    return emit(report, contractDiffMarkdown(report), flags)
+  }
+
+  if (cmd === 'mock') {
+    // mock <spec> --port <n> (ax-gyh): stand up a LOCAL deterministic mock HTTP
+    // server from a published OpenAPI spec, so the offline loop `mock -> run
+    // suite against it -> teardown` works in a network-isolated pipeline. The
+    // mock only SERVES locally generated responses (no outbound fetch, no SSRF
+    // surface). Long-running: it serves until the process is signalled.
+    const specFile = rest[0]
+    const portRaw = flags.get('port')
+    if (!specFile || !portRaw || portRaw === 'true') return die('mock needs <spec> and --port <n>')
+    const port = Number(portRaw)
+    if (!Number.isInteger(port) || port < 0 || port > 65535) return die(`mock: invalid --port "${portRaw}" (expected 0–65535)`)
+    const specText = readFileSync(specFile, 'utf8')
+    let doc: unknown
+    try {
+      doc = JSON.parse(specText)
+    } catch (err) {
+      return die(`mock: spec is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    const started = await startMockServer(doc, port, seed !== undefined ? { seed } : {})
+    console.error(
+      `autonomous-qa: deterministic mock for ${specFile} → http://127.0.0.1:${started.port} ` +
+        `(seed ${seed ?? DEFAULT_MOCK_SEED}); serves declared operations, 404s the rest. Ctrl-C to stop.`,
+    )
+    const stop = (): void => {
+      void started.close().finally(() => process.exit(0))
+    }
+    process.once('SIGINT', stop)
+    process.once('SIGTERM', stop)
+    // Serve until signalled — never resolve, so the process stays alive.
+    return new Promise<number>(() => {})
+  }
+
+  if (cmd === 'dev') {
+    const entry = rest[0]
+    if (!entry) return die('dev needs an entry module path or a localhost URL')
+    const specFile = flags.get('spec')
+    // Mount the surface in-process (a Worker entry module) OR grade a running
+    // dev server by URL. A localhost/private URL is the ONE place `dev` opts
+    // into the private-host allowance — local only, never inferred from a
+    // remote target (the SSRF invariant lives in src/local.ts).
+    //
+    // SSRF: the opt-in MUST be anchored to the PARSED HOSTNAME, never a
+    // substring test over the whole URL string — `isLocalTarget` (cli/
+    // target.ts) is a loose, unanchored `/localhost|127\.0\.0\.1|\[::1\]/`
+    // match used ONLY as a cosmetic delay-throttle heuristic elsewhere in this
+    // file. Reusing it here would let a PUBLIC url that merely embeds that
+    // substring in its path, query, or subdomain (e.g.
+    // `http://127.0.0.1.attacker.com/`, or `http://public.example/?x=localhost`)
+    // flip `allowPrivate` on for a run against a real public origin, disabling
+    // the private-host backstop it was never meant to disable. `isPrivateUrlHost`
+    // instead parses the URL and checks `isPrivateHost` against the HOSTNAME
+    // ONLY (the same function the core SSRF gate in src/http.ts enforces with),
+    // so a public host can never trigger the allowance no matter what its
+    // path/query/subdomain contains.
+    let target: GradeTarget
+    let allowPrivate = false
+    if (isUrl(entry)) {
+      target = entry
+      allowPrivate = isPrivateUrlHost(entry)
+    } else {
+      target = await loadHandler(entry)
+    }
+    const gradeOpts = { seed, delayMs: 0, allowPrivate }
+    if (specFile) {
+      const specText = readFileSync(specFile, 'utf8')
+      const report = await gradePinned(target, specText, {
+        ...gradeOpts,
+        expectedDigest: flags.get('expect-digest'),
+      })
+      return emit(report, pinnedMarkdown(report), flags)
+    }
+    const report = await grade(target, gradeOpts)
+    return emit(report, reportMarkdown(report), flags)
+  }
+
+  if (cmd === 'gate') {
+    // gate --estate <config.json> (ax-laf): run the pinned gate across a SET of
+    // surfaces and turn the whole estate into ONE pass/fail + a scoreboard. The
+    // exit code is NON-ZERO iff any REQUIRED surface failed its pinned spec or
+    // errored — the estate-wide silent-green guard. Reuses gradePinned() /
+    // grade() per entry (src/gate.ts); grading is never reimplemented here.
+    const configFile = flags.get('estate') ?? rest[0]
+    if (!configFile) return die('gate needs an estate config: --estate <config.json>')
+    let config: { entries?: unknown }
+    try {
+      config = JSON.parse(readFileSync(configFile, 'utf8')) as { entries?: unknown }
+    } catch (err) {
+      return die(`gate: could not read estate config "${configFile}": ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!Array.isArray(config.entries) || config.entries.length === 0) {
+      return die(`gate: estate config "${configFile}" has no entries[]`)
+    }
+    // Spec paths in the config are resolved relative to the config file's dir.
+    const baseDir = dirname(resolve(configFile))
+    const entries: GateEntry[] = config.entries.map((raw, i) => {
+      const e = raw as Record<string, unknown>
+      const surface = typeof e.surface === 'string' ? e.surface : `entry-${i}`
+      const target = e.target
+      if (typeof target !== 'string') {
+        throw new Error(`gate: entry ${surface} has no string "target" (a URL; in-process handlers use the programmatic runEstateGate())`)
+      }
+      const specText = typeof e.spec === 'string' ? readFileSync(resolve(baseDir, e.spec), 'utf8') : undefined
+      return {
+        surface,
+        target,
+        specText,
+        required: e.required !== false,
+        allowPrivate: e.allowPrivate === true || (isUrl(target) && isPrivateUrlHost(target)),
+        expectedDigest: typeof e.expectDigest === 'string' ? e.expectDigest : undefined,
+        seed,
+        note: typeof e.note === 'string' ? e.note : undefined,
+      }
+    })
+    const result = await runEstateGate(entries)
+    console.log(formatScoreboard(result))
+    return result.exitCode
+  }
+
   // Default: grade a target (advisory). exitCodeFor() only fails on grade F,
   // so a bare `autonomous-qa <target>` is silent-green for grades A-D even
   // with failing checks — a footgun if a CI pipeline gates on it. Warn every
@@ -213,8 +416,34 @@ async function main(): Promise<number> {
   return emit(report, reportMarkdown(report), flags)
 }
 
-function isLocalTarget(target: string): boolean {
-  return /localhost|127\.0\.0\.1|\[::1\]/.test(target)
+/**
+ * Import an entry MODULE and resolve its Worker-style handler — a default
+ * export that is a `{ fetch }` object or a bare `(request) => Response`, or a
+ * named `fetch` export (the module namespace itself). Throws a clear,
+ * actionable error when the module exports no usable handler (fall back to
+ * `api.qa dev <localhost-url>` against a running dev server). Kept
+ * dependency-light: a single dynamic `import()`, no bundler, no loader.
+ */
+async function loadHandler(entry: string): Promise<FetchHandler> {
+  const href = pathToFileURL(resolve(process.cwd(), entry)).href
+  let mod: Record<string, unknown>
+  try {
+    mod = (await import(href)) as Record<string, unknown>
+  } catch (err) {
+    throw new Error(
+      `dev: could not import entry "${entry}": ${err instanceof Error ? err.message : String(err)}\n` +
+        '(if the entry cannot be imported in-process, run `api.qa dev <localhost-url>` against a running dev server instead)',
+    )
+  }
+  const candidate = (mod.default ?? mod) as unknown
+  if (typeof candidate === 'function') return candidate as FetchHandler
+  if (candidate && typeof (candidate as { fetch?: unknown }).fetch === 'function') {
+    return candidate as FetchHandler
+  }
+  throw new Error(
+    `dev: entry "${entry}" exports no fetch handler — expected a default export that is a ` +
+      'Worker `{ fetch(request, env, ctx) }` or a bare `(request) => Response`, or a named `fetch` export.',
+  )
 }
 
 function die(message: string): number {
@@ -228,11 +457,24 @@ function usage(): string {
   npx autonomous-qa <domain|url>                      grade a target (advisory, unsigned)
   npx autonomous-qa verify <target> --spec <file>     pinned-spec mode
       [--expect-digest <sha256>] [--seed <n>]
+  npx autonomous-qa dev <entry.js|localhost-url>      grade a surface PRE-DEPLOY, in-process
+      [--spec <file>] [--expect-digest <sha256>]      mount a Worker entry module in memory
+      [--seed <n>] [--json]                           (or grade a running local dev server by URL)
   npx autonomous-qa suite <file> --env <name>         reusable suite/collection mode
       [--iteration-data <dataset.csv|.json>]          run once per dataset row (data-driven)
       [--target <target>] [--expect-digest <sha256>] [--seed <n>]
       (target defaults to the selected environment's baseUrl var)
+  npx autonomous-qa contract-diff <spec> <target>    did this deploy break the published contract?
+      [--json] [--reporter ...] [--seed <n>]          EXITS NON-ZERO on any breaking operation diff
+      (spec is the published OpenAPI file; target is fetched live, SSRF-gated)
+  npx autonomous-qa mock <spec> --port <n>            local deterministic mock server from an OpenAPI spec
+      [--seed <n>]                                    serves declared operations; undeclared paths 404
+  npx autonomous-qa gate --estate <config.json>       run the pinned gate across a SET of surfaces
+      [--seed <n>] [--reporter ...]                   ONE scoreboard; EXITS NON-ZERO if any required surface fails
   npx autonomous-qa spec-digest <file>                print the sha256 pin for a spec/suite
+  npx autonomous-qa skill install                     install the AXP skill → ~/.claude/skills/axp/
+      [--check drift vs shipped | --print to stdout]  (verifier-side mirror of the canonical
+                                                       installer: npx axp.org.ai skill install)
   npx autonomous-qa rejudge                           re-judge a JSON report from stdin
   npx autonomous-qa mcp                               MCP server (stdio)
 
@@ -250,9 +492,13 @@ function usage(): string {
 }
 
 main().then(
-  (code) => process.exit(code),
+  // process.exitCode, never process.exit(): a piped stdout flushes
+  // asynchronously, and exit() drops whatever the pipe hasn't accepted yet —
+  // a report larger than the pipe buffer would reach CI truncated. Setting
+  // exitCode lets Node drain stdio, then exit with the same status.
+  (code) => { process.exitCode = code },
   (err) => {
     console.error(`autonomous-qa: ${err instanceof Error ? err.message : err}`)
-    process.exit(1)
+    process.exitCode = 1
   },
 )
