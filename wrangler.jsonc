@@ -9,6 +9,17 @@
 // predated that deploy and was stale — this file now pins the intended,
 // production-safe shape. Provision the two resource IDs below before the next
 // `wrangler deploy`; nothing here deploys on its own.
+//
+// HOW TO DEPLOY (2026-08-04 guardrails, after the 2026-08-01 stale-branch
+// clobber: a deploy from `content/agent-first-storybrand` silently replaced
+// main's deployed UI — Workers deploys are whole-bundle, last-write-wins):
+//   - Preferred: push to main → .github/workflows/deploy.yml deploys from CI
+//     (once the CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets are set).
+//   - Manual:    bash scripts/deploy.sh — refuses off-main / stale / dirty
+//     checkouts, warns when the other deployer shipped last, and stamps
+//     --message "<short-sha> <branch>" so deployment history is attributable.
+//   - Never run bare `npx wrangler deploy` — it leaves Message empty and
+//     skips every check above. Tests: scripts/test-deploy.sh.
 {
   "name": "api-qa",
   "main": "src/worker.ts",

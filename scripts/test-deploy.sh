@@ -110,7 +110,7 @@ make_sandbox() {
   echo "export default {}" > "$CLONE/worker.js"
   git -C "$CLONE" add worker.js
   git -C "$CLONE" commit -qm "initial"
-  git -C "$CLONE" push -q -u origin main 2>/dev/null
+  git -C "$CLONE" push -q -u origin main >/dev/null 2>&1
   mkdir -p "$CLONE/scripts"
   cp "$DEPLOY_SH" "$CLONE/scripts/deploy.sh"
 

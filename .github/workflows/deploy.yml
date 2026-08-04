@@ -1,0 +1,63 @@
+name: deploy api.qa
+
+# Deploy-on-main for the api-qa Worker — the PREFERRED deploy path.
+#
+# Why (the 2026-08-01 incident): two people deploy this Worker manually from
+# their own machines. Workers deploys are whole-bundle and last-write-wins, so
+# a deploy from a stale branch silently replaced main's deployed UI redesign.
+# Deploying from CI on every push to main makes origin/main the single source
+# of deployed truth, and stamps every deployment with an attributable message.
+#
+# One-time setup (repo admin) — until then every deploy-path step here SKIPS
+# cleanly, so merging this file changes nothing on its own:
+#   gh secret set CLOUDFLARE_API_TOKEN   # Cloudflare API token with Workers Scripts:Edit
+#   gh secret set CLOUDFLARE_ACCOUNT_ID  # account id shown by `npx wrangler whoami`
+#
+# Manual fallback: bash scripts/deploy.sh (same message convention, local guardrails).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two deploys race; a later push queues behind the current deploy.
+concurrency:
+  group: deploy-api-qa
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    name: Deploy api-qa Worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: npm ci
+
+      - name: Test (gates the deploy)
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: npm test
+
+      - name: Deploy
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: npx --yes wrangler@4 deploy --message "${GITHUB_SHA::7} main (github-actions)"
+
+      - name: Note when unconfigured
+        if: env.CLOUDFLARE_API_TOKEN == ''
+        run: echo "CLOUDFLARE_API_TOKEN secret not set — deploy skipped (see the header comment for one-time setup)."
