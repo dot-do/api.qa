@@ -17,6 +17,11 @@
  */
 
 import type { PinnedRequirement, Suite } from './types.js'
+import {
+  OPTIONAL_DECLARED_INTERFACES,
+  OPTIONAL_INTERFACE_PATH_RE,
+  eligibleOptionalChecks,
+} from './optional-interfaces.js'
 
 
 /**
@@ -132,6 +137,166 @@ export function validateRequirements(requirements: PinnedRequirement[]): void {
           'id makes that key ambiguous). Rename the requirement.',
       )
     }
+  }
+
+  // THE EVASION GUARD. See optional-interfaces.ts for why it exists.
+  for (const req of doc.requirements) validateAppliesWhen(req)
+}
+
+/**
+ * THE EVASION GUARD — five rules, all THROWN at parse.
+ *
+ * `appliesWhen` is the one place in a PinnedSpec where a requirement can decide
+ * NOT to judge the target. The `cardDeclares` arm makes that decision from a
+ * key the TARGET writes. So it is only safe if the set of requirements that can
+ * reach it is fixed by the VERIFIER, not by the spec — otherwise any MUST
+ * clause becomes optional by omission and the standard quietly stops being one.
+ *
+ * This runs inside `validateRequirements`, which runs inside BOTH
+ * `parsePinnedSpec` and `parseSuite` — i.e. before `verifyPinnedSpec` fires a
+ * single probe. A spec that tries to gate an always-required check does not get
+ * a lenient verdict; it gets NO verdict, loudly, with the offending requirement
+ * named. There is no reviewer in the loop, which is what makes this ENFORCED
+ * rather than documented.
+ *
+ * The rules also give FORWARD protection the pre-union verifier could not have:
+ * an `appliesWhen` in a shape this verifier does not understand throws instead
+ * of silently degrading into "unobservable → applies → armed check skips →
+ * requirement fails", which would fail every conforming target for the wrong
+ * reason.
+ */
+function validateAppliesWhen(req: PinnedRequirement): void {
+  const raw = (req as { appliesWhen?: unknown }).appliesWhen
+  if (raw === undefined) return
+  const id = (req as { id: string }).id
+  const kind = (req as { kind?: unknown }).kind
+  const where = `requirement "${id}"`
+
+  // Rule 2a: only `probe` and `check` requirements have ever consulted
+  // `appliesWhen`. On `surface` / `ax-floor` / `endpoint` it was silently
+  // ignored — a conditional-looking clause that conditions nothing is a
+  // false statement in a contract document. Make it explicit and throw.
+  if (kind !== 'probe' && kind !== 'check') {
+    throw new Error(
+      `${where} (kind:'${String(kind)}') carries an \`appliesWhen\`, which only kind:'probe' and ` +
+        "kind:'check' requirements evaluate. On this kind it would be silently ignored — a " +
+        'conditional-looking clause that conditions nothing. Remove it, or change the kind.',
+    )
+  }
+
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(
+      `${where} carries an \`appliesWhen\` that is not a JSON object (got ` +
+        `${raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw}). It must be exactly ` +
+        'one of { fromProbe, path, equals } or { cardDeclares }.',
+    )
+  }
+  const aw = raw as Record<string, unknown>
+  const has = (k: string) => Object.prototype.hasOwnProperty.call(aw, k)
+
+  // Rule 1: SHAPE TOTALITY. Exactly one arm. Both, neither, or a mixed shape is
+  // a spec this verifier cannot evaluate — and the union discriminates on key
+  // PRESENCE (no `source:` tag, so the standard's verbatim probe block stays
+  // byte-identical), which is only total because this rule rejects everything
+  // else at parse.
+  const fromProbeArm = has('fromProbe')
+  const cardArm = has('cardDeclares')
+  if (fromProbeArm === cardArm) {
+    throw new Error(
+      `${where} carries an \`appliesWhen\` with ${fromProbeArm ? 'BOTH' : 'NEITHER'} \`fromProbe\` ` +
+        'and `cardDeclares`. Exactly one arm is legal: { fromProbe, path, equals } judges an ' +
+        'OBSERVED VALUE and fails closed when it cannot be observed; { cardDeclares } judges a ' +
+        'CARD DECLARATION and is not applicable when the key is absent. They are different in kind, ' +
+        'so a requirement must say which one it means.',
+    )
+  }
+
+  if (cardArm) {
+    // Rule 2b: KIND RESTRICTION. `cardDeclares` is legal only on kind:'check'.
+    // This is what makes behavioural probe requirements — the ones that pin
+    // wire behaviour for always-required clauses — categorically un-gatable by
+    // any card key, with no registry lookup involved at all.
+    if (kind !== 'check') {
+      throw new Error(
+        `${where} is a kind:'probe' requirement carrying \`appliesWhen.cardDeclares\`. The ` +
+          "card-declaration arm is legal ONLY on kind:'check'. A behavioural probe requirement " +
+          'pins what the wire must do for an always-required clause; letting a card key switch one ' +
+          'off would let a target opt out of that clause by omission. An OPTIONAL capability that ' +
+          'needs behavioural probing gets a CHECK that does the probing.',
+      )
+    }
+    if (has('path') || has('equals')) {
+      throw new Error(
+        `${where} mixes \`cardDeclares\` with \`${has('path') ? 'path' : 'equals'}\`. The ` +
+          'card-declaration arm tests PRESENCE only — there is deliberately no value test, because ' +
+          'a present-but-unexpected value would have to mean either "not applicable" or "malformed" ' +
+          'and two independent implementations would resolve that differently.',
+      )
+    }
+    const cardDeclares = aw.cardDeclares
+    // Rule 5: PATH GRAMMAR. Deliberately redundant with rule 4 — it holds even
+    // if the registry is later mis-edited, and it forbids `cardDeclares:
+    // 'probes'`, which would gate an optional check on the AXP opt-in signal
+    // itself rather than on its own interface key.
+    if (typeof cardDeclares !== 'string' || !OPTIONAL_INTERFACE_PATH_RE.test(cardDeclares)) {
+      throw new Error(
+        `${where} carries \`appliesWhen.cardDeclares\` = ${JSON.stringify(cardDeclares)}, which is ` +
+          `not a legal optional-interface card path. It must match ${String(OPTIONAL_INTERFACE_PATH_RE)} ` +
+          '— exactly two segments, the first literally "interfaces", e.g. "interfaces.digitalLink". ' +
+          'An optional interface is declared as a member of `interfaces`, nowhere else.',
+      )
+    }
+    const check = (req as { check?: unknown }).check
+    // Rule 3: ALLOWLIST MEMBERSHIP. The registry is keyed by CHECK id — a
+    // string api.qa owns and a spec author cannot mint — not by requirement id,
+    // which the author chooses freely.
+    if (typeof check !== 'string' || !Object.prototype.hasOwnProperty.call(OPTIONAL_DECLARED_INTERFACES, check)) {
+      throw new Error(
+        `${where} tries to make check ${JSON.stringify(check)} conditional on the card declaration ` +
+          `${JSON.stringify(cardDeclares)}, but that check is NOT an api.qa optional-declared ` +
+          'interface. A requirement can only be skipped by omission when the capability it verifies ' +
+          'is ADDITIVE — otherwise the clause it binds stops being a MUST the moment a target leaves ' +
+          `a key out. Eligible checks: ${eligibleOptionalChecks().map((c) => `"${c}"`).join(', ')}. ` +
+          `Pin ${JSON.stringify(check)} WITHOUT \`appliesWhen\` if you mean to demand it of everyone.`,
+      )
+    }
+    // Rule 4: PATH BINDING. Blocks cross-wiring — arming one optional check
+    // with a DIFFERENT optional interface's key, which would let a card skip a
+    // check by declaring something unrelated.
+    const bound = OPTIONAL_DECLARED_INTERFACES[check]!
+    if (cardDeclares !== bound) {
+      throw new Error(
+        `${where} arms check "${check}" with \`cardDeclares\` = ${JSON.stringify(cardDeclares)}, but ` +
+          `api.qa binds that check to ${JSON.stringify(bound)}. A check is armed by ITS OWN ` +
+          'interface declaration; cross-wiring would let a card skip one capability by declaring ' +
+          'another.',
+      )
+    }
+    return
+  }
+
+  // The OBSERVED-VALUE arm. Behaviour is unchanged; this only rejects shapes
+  // the evaluator could not have judged coherently anyway (a non-string source
+  // or path silently resolves to "unobservable → applies", which reads as a
+  // target failure when it is really a spec defect).
+  if (typeof aw.fromProbe !== 'string' || aw.fromProbe.length === 0) {
+    throw new Error(
+      `${where} carries \`appliesWhen.fromProbe\` = ${JSON.stringify(aw.fromProbe)} — it must be a ` +
+        'non-empty string naming a probe channel this spec also declares a requirement for.',
+    )
+  }
+  if (typeof aw.path !== 'string' || aw.path.length === 0) {
+    throw new Error(
+      `${where} carries \`appliesWhen.path\` = ${JSON.stringify(aw.path)} — the observed-value arm ` +
+        'needs a non-empty dot-path into the source probe body.',
+    )
+  }
+  if (!has('equals')) {
+    throw new Error(
+      `${where} carries \`appliesWhen.fromProbe\`/\`path\` with no \`equals\`. The observed-value arm ` +
+        'applies the requirement only when the observed value deep-equals a PINNED value; without ' +
+        'one there is nothing to compare against.',
+    )
   }
 }
 

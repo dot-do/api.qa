@@ -48,6 +48,10 @@ import {
 // check both need it, and both live in modules THIS one imports, so keeping it
 // here would close an import cycle. Re-exported so this module's public API is
 // unchanged for `dataset.ts`, `worker.ts`, `index.ts` and the tests.
+// The EVASION GUARD (`validateAppliesWhen`) travels WITH `validateRequirements`
+// into that module: it is a document-layer rule, and it must run for a
+// card-declared Suite exactly as it runs for a ratified PinnedSpec. Splitting
+// them would leave the suite door unguarded.
 import { parseSuite, validateRequirements } from './suite-doc.js'
 export { parseSuite, validateRequirements }
 import type {
@@ -238,6 +242,7 @@ export async function verifyPinnedSpec(
       probePlans.set(req.id, {
         declared: [], entryProblems: new Map(), finalUrls: new Map(),
         notApplicable: applicability.reason,
+        notApplicableMark: applicability.notApplicable,
       })
       continue
     }
@@ -392,25 +397,36 @@ export async function verifyPinnedSpec(
       // check-offers-402 instead of being wrongly failed on it.
       const applicability = evaluateAppliesWhen(req.appliesWhen, probeReqs, fullBundle.items)
       if (!applicability.applies) {
+        // `verdict` STAYS 'pass' — `passed` is every(v === 'pass'), and a fourth
+        // Verdict member would flip every free-model target passing today. The
+        // STRUCTURED `notApplicable` marker is how an agent tells "passed
+        // because verified" from "passed because never applicable" without
+        // string-matching prose. The CI reporters map it to a JUnit <skipped/>.
         results.push({
           id: req.id, title: `check ${req.check} must ${req.must}`, verdict: 'pass',
-          detail: `${applicability.reason} — passes as not applicable`,
-          evidence: [],
+          detail: applicability.detail ?? `${applicability.reason} — passes as not applicable`,
+          evidence: applicability.notApplicable?.reason === 'not-declared' ? [ROLE.agentsJson] : [],
+          ...(applicability.notApplicable && { notApplicable: applicability.notApplicable }),
         })
         continue
       }
       // Bind a MUST clause to a SPECIFIC api.qa check, not the coarse floor.
       const c = surfaceChecks.find((sc) => sc.id === req.check)
       const verdict: Verdict = c?.verdict === 'pass' ? 'pass' : 'fail'
+      // A card-declaration gate that could not READ the card applied this
+      // requirement by fail-closed rule, not because the interface was declared.
+      // Say so: the armed check's own skip line would otherwise report the key
+      // as "absent" when the truth is the card was unreadable.
+      const failClosedNote = applicability.failClosed ? ` — NOTE: ${applicability.reason}` : ''
       results.push({
         id: req.id, title: `check ${req.check} must ${req.must}`,
         verdict,
         detail:
-          c === undefined
+          (c === undefined
             ? `unknown check "${req.check}" — not produced by api.qa runChecks; cannot pass`
             : c.verdict === 'pass'
               ? `check ${req.check} passed: ${c.detail}`
-              : `check ${req.check} verdict '${c.verdict}' (must be 'pass'): ${c.detail}`,
+              : `check ${req.check} verdict '${c.verdict}' (must be 'pass'): ${c.detail}`) + failClosedNote,
         evidence: c?.evidence ?? [],
       })
     } else if (req.kind === 'endpoint') {
@@ -445,6 +461,7 @@ export async function verifyPinnedSpec(
           id: req.id, title: `probe ${req.probe}`, verdict: 'pass',
           detail: `${plan.notApplicable} — passes as not applicable`,
           evidence: [],
+          ...(plan.notApplicableMark && { notApplicable: plan.notApplicableMark }),
         })
         continue
       }
@@ -730,23 +747,183 @@ interface ProbePlan {
    * the judge reports a PASS with this reason.
    */
   notApplicable?: string
+  /**
+   * The STRUCTURED form of the same fact, carried into the requirement result
+   * so an agent does not have to string-match `notApplicable` prose. Always the
+   * `observed-value` arm here: `cardDeclares` is refused on kind:'probe' at
+   * parse (see validateAppliesWhen).
+   */
+  notApplicableMark?: CheckResult['notApplicable']
 }
 
 /**
- * Evaluate an `appliesWhen` condition against the recorded evidence: the value
- * at `path` inside the FIRST spec requirement probing channel `fromProbe`
- * (entry-0 evidence) must deep-equal `equals` for the requirement to apply.
- * FAIL-CLOSED: an unobserved source, a non-JSON body, or an unresolvable path
- * means the requirement APPLIES — not-applicable must be PROVEN by the
- * observed value. Pure over (requirements, items): the observe phase and the
- * judge run the identical derivation and agree by construction.
+ * Three-way result of reading an optional-interface declaration off the card.
+ *
+ * THREE, not two, and that is the point: `readPath` (schema.ts) collapses "the
+ * key is absent" and "an intermediate is not an object" into the same
+ * `{ found: false }`, and those two states have OPPOSITE verdicts here. A
+ * well-formed card that omits the key means NOT APPLICABLE; a card whose
+ * `interfaces` member is the string "none" means the card is malformed and the
+ * requirement APPLIES. Reusing `readPath` would silently hand an evasion the
+ * same verdict as a conformance.
+ */
+export type CardDeclarationState =
+  | { state: 'declared'; value: unknown }
+  /** The card was read and well-formed; the final key is not present. */
+  | { state: 'absent' }
+  /** Card missing / non-2xx / non-JSON / not an object / bad intermediate. */
+  | { state: 'unreadable'; why: string }
+
+/**
+ * Read an optional-interface declaration (`interfaces.<key>`) out of the
+ * recorded capability card.
+ *
+ * PURE over the recorded evidence. It reads `ROLE.agentsJson` from the bundle —
+ * the same evidence item every other card-reading check judges from — so the
+ * observe phase and the judge phase agree by construction, and a replay of a
+ * stored bundle re-judges identically without re-fetching.
+ *
+ * The verdict table this implements, and the argument for it:
+ *
+ *   card not fetched / non-2xx / network error / body not JSON  → unreadable
+ *   body parses but is not a plain JSON object                  → unreadable
+ *   an INTERMEDIATE segment exists but is not a plain object     → unreadable
+ *   card well-formed, final key ABSENT                          → absent
+ *   final key PRESENT with ANY value ({}, null, false, 0, "", []) → declared
+ *
+ * Every `unreadable` row collapses back to the fail-closed posture at the call
+ * site, because in those rows THERE IS NO STATEMENT TO READ: absence IN a
+ * retrieved document is a datum, absence OF the document is not. Only the
+ * `absent` row is a deliberate statement of "I do not offer this", and only it
+ * earns a skip.
+ *
+ * Presence uses `hasOwnProperty`, not truthiness — matching how the card parser
+ * already arms `interfaces.digitalLink`. In JSON there is no `undefined`, so a
+ * `null` value is DECLARED (and a defective declaration, which the armed check
+ * then fails). That is what stops "declare it as false and get a free skip".
+ *
+ * An ABSENT intermediate (a card with no `interfaces` member at all) is treated
+ * as `absent`, not `unreadable`: the final key is not present in a document that
+ * WAS read, which is the same statement as omitting the key. A card with no
+ * `interfaces` at all already fails the always-required card checks on its own.
+ */
+export function readCardDeclaration(items: Evidence[], path: string): CardDeclarationState {
+  const ev = items.find((e) => e.role === ROLE.agentsJson)
+  if (!ev) return { state: 'unreadable', why: 'the capability card was never fetched in this run' }
+  if (ev.status === null) {
+    return { state: 'unreadable', why: `fetching the capability card failed (${ev.error ?? 'unknown error'})` }
+  }
+  if (ev.status < 200 || ev.status >= 300) {
+    return { state: 'unreadable', why: `GET ${ev.url} answered ${ev.status}` }
+  }
+  const doc = parseJsonBody(ev)
+  if (doc === undefined) {
+    return { state: 'unreadable', why: `${ev.url} answered ${ev.status} but its body did not parse as JSON` }
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    return {
+      state: 'unreadable',
+      why: `${ev.url} parsed as ${doc === null ? 'null' : Array.isArray(doc) ? 'a JSON array' : `a JSON ${typeof doc}`}, not a JSON object`,
+    }
+  }
+  const segments = path.split('.')
+  let cursor: Record<string, unknown> = doc as Record<string, unknown>
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i]!
+    if (!Object.prototype.hasOwnProperty.call(cursor, seg)) return { state: 'absent' }
+    const next = cursor[seg]
+    if (next === null || typeof next !== 'object' || Array.isArray(next)) {
+      return {
+        state: 'unreadable',
+        why: `the card's \`${segments.slice(0, i + 1).join('.')}\` is ${next === null ? 'null' : Array.isArray(next) ? 'an array' : `a ${typeof next}`}, not an object — the declaration cannot be read from a malformed card`,
+      }
+    }
+    cursor = next as Record<string, unknown>
+  }
+  const last = segments[segments.length - 1]!
+  if (!Object.prototype.hasOwnProperty.call(cursor, last)) return { state: 'absent' }
+  return { state: 'declared', value: cursor[last] }
+}
+
+/**
+ * Evaluate an `appliesWhen` condition against the recorded evidence. Two arms,
+ * and they are asymmetric ON PURPOSE — see the block comment on AppliesWhen and
+ * optional-interfaces.ts.
+ *
+ *   fromProbe    — the value at `path` inside the FIRST spec requirement
+ *                  probing channel `fromProbe` (entry-0 evidence) must
+ *                  deep-equal `equals` for the requirement to apply.
+ *                  FAIL-CLOSED: an unobserved source, a non-JSON body, or an
+ *                  unresolvable path means the requirement APPLIES —
+ *                  not-applicable must be PROVEN by the observed value. A
+ *                  missing probe response is an OBSERVATION FAILURE: the
+ *                  verifier asked and got no answer, so it cannot distinguish
+ *                  "does not apply to me" from "I am broken" or "I am evading".
+ *                  Absence of evidence is not evidence.
+ *
+ *   cardDeclares — the requirement applies iff the capability card DECLARES the
+ *                  named optional interface. Here THE CARD IS THE ANSWER: a
+ *                  card that was fetched, parsed and found well-formed and that
+ *                  omits the key has affirmatively said "I do not offer this",
+ *                  and that statement is a datum the verifier is entitled to
+ *                  believe. Every case where the card itself could not be read
+ *                  collapses back into the fromProbe posture — applies, fail
+ *                  closed — because in those cases there is no statement to
+ *                  read. A present-but-empty value is a CLAIM, not an absence:
+ *                  it ARMS the requirement, and the armed check judges (and
+ *                  fails) the defective declaration.
+ *
+ * Pure over (requirements, items): the observe phase and the judge run the
+ * identical derivation and agree by construction.
  */
 function evaluateAppliesWhen(
   aw: AppliesWhen | undefined,
   probeReqs: Array<Extract<PinnedRequirement, { kind: 'probe' }>>,
   items: Evidence[],
-): { applies: boolean; reason: string } {
+): {
+  applies: boolean
+  reason: string
+  detail?: string
+  notApplicable?: CheckResult['notApplicable']
+  /** The requirement applies only because its source could not be read. */
+  failClosed?: boolean
+} {
   if (aw === undefined) return { applies: true, reason: '' }
+
+  if (aw.cardDeclares !== undefined) {
+    const cardPath = aw.cardDeclares
+    const st = readCardDeclaration(items, cardPath)
+    if (st.state === 'unreadable') {
+      return {
+        applies: true,
+        // `failClosed` is surfaced in the requirement detail. Without it the
+        // reader sees only the armed check's own skip line — "interfaces.
+        // digitalLink absent" — which is FALSE and misleading when the truth is
+        // that the card could not be read at all. The verdict is the same
+        // either way; the diagnosis is not.
+        failClosed: true,
+        reason:
+          `appliesWhen source \`${cardPath}\` could not be read from the capability card ` +
+          `(${st.why}) — requirement APPLIES (fail closed). A card that cannot be read has made no ` +
+          'statement about what it offers; only an omission INSIDE a readable card is one.',
+      }
+    }
+    if (st.state === 'absent') {
+      return {
+        applies: false,
+        reason: `not applicable: the capability card declares no \`${cardPath}\``,
+        detail:
+          `not applicable: the capability card declares no \`${cardPath}\` — the optional interface ` +
+          'is not claimed, so this requirement is not judged (omission is conformance)',
+        notApplicable: { reason: 'not-declared', source: cardPath },
+      }
+    }
+    return {
+      applies: true,
+      reason: `the capability card declares \`${cardPath}\` (${JSON.stringify(st.value) ?? 'undefined'})`,
+    }
+  }
+
   const srcReq = probeReqs.find((r) => r.probe === aw.fromProbe)
   const ev = srcReq ? items.find((e) => e.role === `pinned:${srcReq.id}:0`) : undefined
   let body: unknown
@@ -764,6 +941,7 @@ function evaluateAppliesWhen(
   return {
     applies: false,
     reason: `not applicable: probes.${aw.fromProbe} ${aw.path} = ${JSON.stringify(r.value)} (requirement applies only when it equals ${JSON.stringify(aw.equals)})`,
+    notApplicable: { reason: 'observed-value', source: `probes.${aw.fromProbe} ${aw.path}` },
   }
 }
 

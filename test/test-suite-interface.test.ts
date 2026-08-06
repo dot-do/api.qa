@@ -30,7 +30,7 @@ import { runChecks } from '../src/checks.js'
 import { axScoreOf, gradeOf } from '../src/grade.js'
 import { sha256HexSync } from '../src/sha256-sync.js'
 import { MAX_SUITE_REQUIREMENTS, SUITE_RUNNER } from '../src/test-suite.js'
-import { OPTIONAL_DECLARED_INTERFACES, OPTIONAL_INTERFACE_PATH } from '../src/optional-interfaces.js'
+import { OPTIONAL_DECLARED_INTERFACES, OPTIONAL_INTERFACE_PATH_RE } from '../src/optional-interfaces.js'
 import type { CheckResult } from '../src/types.js'
 import { GOOD, goodTargetRoutes, makeFetcher, withOverrides, type Routes } from './helpers.js'
 
@@ -551,7 +551,7 @@ describe('the optional-interface registry', () => {
 
   it('every registered path matches the two-segment grammar', () => {
     for (const [check, path] of Object.entries(OPTIONAL_DECLARED_INTERFACES)) {
-      expect(OPTIONAL_INTERFACE_PATH.test(path), `${check} -> ${path}`).toBe(true)
+      expect(OPTIONAL_INTERFACE_PATH_RE.test(path), `${check} -> ${path}`).toBe(true)
     }
   })
 
