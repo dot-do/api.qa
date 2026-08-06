@@ -3,7 +3,7 @@ name: api.qa gate (example)
 # Gate a pipeline on a PINNED reusable suite, the way you would gate on Newman.
 #
 # WHAT MAKES THIS A GATE (not a rubber stamp):
-#   - `npx autonomous-qa suite ... --expect-digest <pin>` refuses to run unless
+#   - `autonomous-qa suite ... --expect-digest <pin>` refuses to run unless
 #     the suite text hashes to the ratified pin, then exits NON-ZERO if ANY probe
 #     (or, with --iteration-data, ANY iteration) fails or the target is
 #     unreachable/refused. The job step inherits that exit code, so a regression
@@ -12,8 +12,40 @@ name: api.qa gate (example)
 #     fail) so the failure detail survives even when the gate goes red.
 #
 # Copy this into your OWN repo, then set:
-#   - API_QA_TARGET   the deployed URL to verify (repo/environment variable)
-#   - the suite file + its pinned digest (mint once: `npx autonomous-qa spec-digest <suite>`)
+#   - API_QA_TARGET        the deployed URL to verify (repo/environment variable)
+#   - API_QA_SUITE_DIGEST  the suite pin (mint once: `npx autonomous-qa spec-digest <suite>`)
+#   ...and in YOUR repo, invoke the published CLI instead of the local build:
+#       npx --yes autonomous-qa suite <suite.json> --env prod ...
+#
+# ── Why this file is CONFIGURED-ONLY, and why it builds the CLI (2026-08-06, #4)
+#
+# It had been red on `main` for 11 consecutive runs, for three stacked reasons.
+# All three are fixed here; recording them so they are not reintroduced:
+#
+#   1. exit 127, `autonomous-qa: not found`. THIS repo is itself the package
+#      `autonomous-qa`, so inside this checkout `npx --yes autonomous-qa`
+#      resolves to the LOCAL package.json and its bin `dist/cli/index.js` —
+#      which is gitignored and absent in a fresh CI checkout. npx never
+#      consulted the registry, so the step died before probing anything.
+#      => here we `npm ci && npm run build` and run the LOCAL build on purpose:
+#         the verifier gates using the verifier it just built (dogfood). A repo
+#         that COPIES this file has no such collision and uses npx (see above).
+#
+#   2. `vars.API_QA_TARGET` / `vars.API_QA_SUITE_DIGEST` are not set in this
+#      repo — this file is documentation here, not this repo's own gate. With an
+#      empty target the suite fell back to its baked-in `prod` baseUrl
+#      (`https://apis.directory`), a THIRD-PARTY surface knowingly sitting at the
+#      AX floor. api.qa's `main` was therefore permanently red for someone
+#      else's non-conformance. The deploy-path convention already established in
+#      `deploy.yml` applies: when unconfigured, SKIP cleanly and say so.
+#      NOTE the anti-Goodhart line — the fix is to stop grading an unconfigured
+#      target, NOT to repoint the suite at something that happens to pass.
+#
+#   3. `dorny/test-reporter` defaults to `fail-on-empty: true`, so once (1)
+#      guaranteed no `reports/api-qa.junit.xml` was ever written, the publish
+#      step reported `No test report files were found` and failed on top of the
+#      real failure. A step that cannot pass is not a gate, it is noise that
+#      teaches everyone to ignore CI. It is now guarded on the file existing.
 
 on:
   push:
@@ -28,6 +60,9 @@ jobs:
   verify:
     name: Verify agent-first contract
     runs-on: ubuntu-latest
+    env:
+      API_QA_TARGET: ${{ vars.API_QA_TARGET }}
+      API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,19 +71,26 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+
+      # This repo IS `autonomous-qa`; gate with the build from this commit.
+      - name: Install and build the verifier
+        if: env.API_QA_TARGET != ''
+        run: |
+          npm ci
+          npm run build
 
       - name: Run the pinned api.qa suite (fails the check on regression)
+        if: env.API_QA_TARGET != ''
         run: |
-          npx --yes autonomous-qa suite examples/golden-scenario.suite.json \
+          mkdir -p reports
+          node dist/cli/index.js suite examples/golden-scenario.suite.json \
             --env prod \
             --target "${API_QA_TARGET}" \
             --expect-digest "${API_QA_SUITE_DIGEST}" \
             --reporter cli \
             --reporter junit --reporter-junit-out reports/api-qa.junit.xml \
             --reporter json --reporter-json-out reports/api-qa.json
-        env:
-          API_QA_TARGET: ${{ vars.API_QA_TARGET }}
-          API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST }}
 
       - name: Upload api.qa reports
         if: always()
@@ -56,12 +98,25 @@ jobs:
         with:
           name: api-qa-reports
           path: reports/
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
+      # Guarded twice on purpose: `fail-on-empty` defaults to TRUE, and the file
+      # is absent both when the gate is unconfigured and when the suite step
+      # died before writing it. Publishing is reporting — it must never be the
+      # thing that reddens a check.
       - name: Publish JUnit test report
-        if: always()
+        if: always() && hashFiles('reports/api-qa.junit.xml') != ''
         uses: dorny/test-reporter@v1
         with:
           name: api.qa results
           path: reports/api-qa.junit.xml
           reporter: java-junit
+          fail-on-empty: false
+
+      - name: Note when unconfigured
+        if: env.API_QA_TARGET == ''
+        run: |
+          echo "API_QA_TARGET is not set in this repo — the example gate is documentation here, so it SKIPPED."
+          echo "To make it gate for real, set the repo variables:"
+          echo "  gh variable set API_QA_TARGET       --repo <owner>/<repo> --body '<deployed url>'"
+          echo "  gh variable set API_QA_SUITE_DIGEST --repo <owner>/<repo> --body \"\$(npx autonomous-qa spec-digest <suite.json>)\""

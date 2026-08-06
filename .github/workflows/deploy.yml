@@ -10,10 +10,33 @@ name: deploy api.qa
 #
 # One-time setup (repo admin) — until then every deploy-path step here SKIPS
 # cleanly, so merging this file changes nothing on its own:
-#   gh secret set CLOUDFLARE_API_TOKEN   # Cloudflare API token with Workers Scripts:Edit
+#   gh secret set CLOUDFLARE_API_TOKEN   # Cloudflare API token, scopes below
 #   gh secret set CLOUDFLARE_ACCOUNT_ID  # account id shown by `npx wrangler whoami`
 #
 # Manual fallback: bash scripts/deploy.sh (same message convention, local guardrails).
+#
+# ── The 2026-08-06 red-for-4-runs failure (#4), and what it taught
+#
+#   ✘ [ERROR] A request to the Cloudflare API (/memberships) failed.
+#     Authentication failed (status: 400) [code: 9106]
+#
+# The run log showed `CLOUDFLARE_API_TOKEN: ***` but `CLOUDFLARE_ACCOUNT_ID:`
+# EMPTY. That combination is the whole story: wrangler calls `/memberships`
+# ONLY to work out which account to deploy into when no account id is
+# configured, and a token scoped for deploying Workers is NOT entitled to
+# enumerate a user's memberships — so a perfectly good deploy token still dies
+# on that call. Setting CLOUDFLARE_ACCOUNT_ID skips the call entirely.
+#
+# Hence: the guard below now requires BOTH values, and a token present without
+# an account id fails FAST with an actionable message instead of an opaque
+# Cloudflare error code.
+#
+# The token must carry, on the account that owns the `api-qa` Worker:
+#   - Account · Workers Scripts   : Edit   (upload the Worker + its DO classes)
+#   - Account · Workers KV Storage: Edit   (the REPORTS namespace binding)
+#   - Zone    · Workers Routes    : Edit   on the `api.qa` zone (custom domain)
+# `Account · Account Settings: Read` is NOT required once CLOUDFLARE_ACCOUNT_ID
+# is set, and is the permission whose absence produced the 9106 above.
 
 on:
   push:
@@ -46,16 +69,36 @@ jobs:
           node-version: '20'
           cache: npm
 
+      # A token WITHOUT an account id is the #4 failure mode: wrangler falls back
+      # to enumerating /memberships, which a Workers-scoped token cannot do, and
+      # the deploy dies on an opaque `code: 9106`. Refuse that combination here,
+      # loudly, rather than 40 seconds later in Cloudflare's voice.
+      - name: Preflight the Cloudflare credential
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: |
+          echo "::error title=CLOUDFLARE_ACCOUNT_ID is not set::CLOUDFLARE_API_TOKEN is configured but CLOUDFLARE_ACCOUNT_ID is empty."
+          echo "wrangler will fall back to the /memberships account-enumeration call, which a"
+          echo "Workers-scoped deploy token is not entitled to make — that is the 'code: 9106'"
+          echo "failure in issue #4. Set the account id that owns the api-qa Worker:"
+          echo "  gh secret set CLOUDFLARE_ACCOUNT_ID --repo dot-do/api.qa"
+          exit 1
+
       - name: Install dependencies
-        if: env.CLOUDFLARE_API_TOKEN != ''
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
         run: npm ci
 
       - name: Test (gates the deploy)
-        if: env.CLOUDFLARE_API_TOKEN != ''
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
         run: npm test
 
+      # --dry-run needs no credentials: it separates "the bundle is broken" from
+      # "the credential is broken", which #4 could not tell apart.
+      - name: Build the Worker bundle (no credentials needed)
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        run: npx --yes wrangler@4 deploy --dry-run
+
       - name: Deploy
-        if: env.CLOUDFLARE_API_TOKEN != ''
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
         run: npx --yes wrangler@4 deploy --message "${GITHUB_SHA::7} main (github-actions)"
 
       - name: Note when unconfigured
