@@ -652,10 +652,24 @@ describe('a not-applicable requirement is distinguishable from a pass and from a
     expect([violated.verdict, violated.notApplicable !== undefined]).toEqual(['fail', false])
   })
 
-  it('a NEVER-PRODUCED check is still a hard fail, never a not-applicable', async () => {
-    // `published-test-suite` is REGISTERED as eligible but api.qa does not
-    // produce it yet. Against a DECLARING card the requirement must fail
-    // loudly — a verifier too old for the spec it was handed says so.
+  /* ⚠ REWRITTEN AT THE `published-test-suite` MERGE, deliberately, and the
+     reason is recorded rather than the assertion just relaxed.
+
+     As written on afk/apiqa-optional-declared this case asserted
+     `detail` matched /unknown check/: `published-test-suite` was REGISTERED as
+     eligible but `runChecks` did not produce it, and the test documented that
+     hole — a spec pinning an unproducible check against a DECLARING card fails
+     loudly instead of skipping. afk/apiqa-testsuite-interface CLOSES the hole:
+     the check now exists, so the declaring card gets a real judgement and the
+     detail names a real defect (an unpinned suite) instead of a missing check.
+
+     The INVARIANT under test is unchanged and is what both halves below assert:
+     against a card that DECLARED the interface, a requirement api.qa cannot
+     pass is a HARD FAIL and never a not-applicable. Only the two routes to it
+     are now distinct, so both are exercised. */
+  it('a DECLARED-but-defective interface is a hard fail, never a not-applicable', async () => {
+    // The card declares `interfaces.testSuite` and the declaration is broken
+    // (no `digest`). A claim was made, so it is JUDGED — never excused.
     const spec = specText([
       { id: 'suite-req', kind: 'check', check: 'published-test-suite', must: 'pass',
         appliesWhen: { cardDeclares: 'interfaces.testSuite' } },
@@ -668,6 +682,23 @@ describe('a not-applicable requirement is distinguishable from a pass and from a
       delayMs: 0, seed: 7, mode: 'local',
     })
     const r = report.requirements.find((x) => x.id === 'suite-req')!
+    expect(r.verdict).toBe('fail')
+    expect(r.notApplicable).toBeUndefined()
+    expect(r.detail).toMatch(/digest/)
+  })
+
+  it('a NEVER-PRODUCED check is still a hard fail, never a not-applicable', async () => {
+    // A check id `runChecks` does not produce. It cannot be declaration-armed —
+    // the evasion guard refuses an unregistered check — so the only way to pin
+    // it is bare, and a bare pin over a check that never appears must fail
+    // loudly. That is what a verifier too old for the spec it was handed does.
+    const spec = specText([
+      { id: 'future-req', kind: 'check', check: 'a-check-from-the-future', must: 'pass' },
+    ])
+    const report = await verifyPinnedSpec(GOOD, spec, {
+      fetcher: makeFetcher(goodTargetRoutes()), delayMs: 0, seed: 7, mode: 'local',
+    })
+    const r = report.requirements.find((x) => x.id === 'future-req')!
     expect(r.verdict).toBe('fail')
     expect(r.notApplicable).toBeUndefined()
     expect(r.detail).toMatch(/unknown check/)

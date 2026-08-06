@@ -11,6 +11,16 @@
 import { Observer, isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { GS1_RESOLVER_WELL_KNOWN_PATH } from './gs1-resolver.js'
 import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
+// Card-declared test-suite gates + the shared expectation engine. Both are the
+// SAME code the judge (checks.ts) runs, so what is fetched and what it means
+// can never drift apart.
+import {
+  MAX_SUITE_REQUIREMENTS,
+  SUITE_DEADLINE_MS,
+  gateTestSuiteCard,
+  gateTestSuiteDocument,
+} from './test-suite.js'
+import { captureInto, judgeExpect, resolveEndpoint, type Bindings } from './expect.js'
 import type {
   ClaimedEndpoint,
   DiscoveryReport,
@@ -157,7 +167,31 @@ export const ROLE = {
    * and the digital-link-resolver check SKIPs.
    */
   gs1Resolver: 'surface:gs1resolver',
+  // ── Published test suite (OPTIONAL, target-DECLARED) ─────────────────────
+  /**
+   * GET of the card-declared Suite DOCUMENT (`interfaces.testSuite.url`).
+   * Same-origin SSRF-gated. Recorded ONLY when the card DECLARES the interface:
+   * a card that omits `interfaces.testSuite` records nothing, spends no budget,
+   * and the published-test-suite check SKIPs.
+   */
+  testSuite: 'surface:testsuite',
 } as const
+
+/**
+ * ⚠ ROLE-COLLISION GUARD for a card-declared suite run.
+ *
+ * A suite sub-run naturally records its requirements under `pinned:<id>` and
+ * `pinned:<id>:<i>` — which are the PARENT's role keys for the admission spec's
+ * own requirements. Merged unprefixed, `items.find(e => e.role === 'pinned:x')`
+ * would resolve the WRONG evidence item: exactly the class of bug
+ * `validateRequirements`' derived-role-collision guard exists to prevent, but
+ * arriving through a door that guard does not watch (it validates ONE
+ * requirement list, and these are two).
+ *
+ * So every merged role is prefixed, yielding `suite:pinned:<id>:<i>`, and the
+ * merge ASSERTS that no prefixed role already exists in the parent.
+ */
+export const SUITE_ROLE_PREFIX = 'suite:'
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
   return bundle.items.find((e) => e.role === role)
@@ -298,6 +332,19 @@ export interface AgentsClaims {
    * the verification.
    */
   digitalLink?: DigitalLinkClaim
+  /**
+   * The target-declared PUBLISHED TEST SUITE interface (`interfaces.testSuite`)
+   * — an OPTIONAL capability, armed by its own card key exactly like
+   * `interfaces.digitalLink`. PRESENT ⇒ the card CLAIMS it publishes a
+   * digest-pinned api.qa Suite describing workflows it holds itself to, and the
+   * published-test-suite check is ARMED; ABSENT ⇒ the field is undefined,
+   * nothing is fetched, nothing is run, and that check SKIPs.
+   *
+   * A simple CRUD or lookup API that publishes no suite is FULLY CONFORMANT —
+   * that is the entire point of the interface being optional. Declaring it is
+   * what invites the verification.
+   */
+  testSuite?: TestSuiteClaim
 }
 
 /**
@@ -330,6 +377,63 @@ export interface DigitalLinkClaim {
   /** Card-declared `resolverRoot`, absolutized. Optional. */
   resolverRoot?: string
 }
+
+/**
+ * A card's `interfaces.testSuite` declaration, as parsed off the wire.
+ *
+ * Mirrors `DigitalLinkClaim` deliberately, `malformed` included: the key being
+ * PRESENT but not a plain object is a DEFECTIVE claim, never an absence. A card
+ * meaning "I publish no test suite" OMITS the key — that is fully conforming.
+ * Collapsing a present-but-defective value to "not declared" would hand a
+ * target a free skip for declaring the interface in a shape no verifier can
+ * check, which is the evasion this whole mechanism exists to prevent.
+ *
+ * WHAT IT POINTS AT: a published, digest-pinned api.qa **Suite** document — the
+ * artifact that already exists (`types.ts` `Suite`, `parseSuite`,
+ * `verifySuite`) — NOT an npm tarball of TypeScript/vitest tests. That
+ * rejection is load-bearing: api.qa would have to EXECUTE a stranger's code to
+ * reach a verdict, which would end the determinism contract (the verdict must
+ * be a pure function of an EvidenceBundle), make replay impossible, and let the
+ * judged party supply the judging code. A declarative Suite already expresses
+ * multi-step workflows — ordered requirements, `capture` chaining, `{{var}}`
+ * interpolation, named environments — and is already vitest-runnable BY THE
+ * TARGET in the target's own CI via `autonomous-qa/vitest`. The declarative
+ * artifact is the interoperable one; vitest is a runner for it, not a wire
+ * format.
+ */
+export interface TestSuiteClaim {
+  /** The `interfaces.testSuite` key was present on the card. Always true. */
+  declared: true
+  /** Present but not a plain JSON object — a defective declaration. */
+  malformed?: boolean
+  /** `typeof`-style name of the malformed value, for the failure message. */
+  malformedAs?: string
+  /** Suite location exactly as the card wrote it (relative or absolute). */
+  urlRaw?: string
+  /**
+   * Suite location to fetch, absolutized against the target origin. An ABSOLUTE
+   * off-origin value is PRESERVED verbatim (never rewritten to the target) so
+   * the same-origin gate DROPS it and the check FAILS the card for publishing
+   * another origin's suite.
+   */
+  url: string
+  /**
+   * `"sha256:<64 lowercase hex>"` over the suite document's exact bytes.
+   * REQUIRED — see the check for why a suite pin is not optional the way a
+   * Digital Link description file needs none.
+   */
+  digest?: string
+  /** Environment name to select. Defaults to `"public"`. */
+  environment: string
+  /** Suite dialect. Only `"api.qa/suite@1"` is defined. */
+  runner: string
+}
+
+/** The only suite dialect this verifier implements. */
+export const TEST_SUITE_RUNNER = 'api.qa/suite@1'
+
+/** Default environment selected when the card names none. */
+export const TEST_SUITE_DEFAULT_ENVIRONMENT = 'public'
 
 export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
   const out: AgentsClaims = { endpoints: [] }
@@ -413,6 +517,46 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
         malformed: true,
         malformedAs: dl === null ? 'null' : Array.isArray(dl) ? 'array' : typeof dl,
         wellKnown: absolutize(GS1_RESOLVER_WELL_KNOWN_PATH, origin),
+      }
+    }
+  }
+
+  // Published test-suite face (OPTIONAL, declaration-armed):
+  // interfaces.testSuite.{url,digest,environment,runner}. PRESENCE of the key
+  // is the whole declaration signal — `'testSuite' in interfaces`, not
+  // truthiness — so a present-but-defective value is recorded as MALFORMED and
+  // failed, never silently treated as absent. `url` is card-derived and
+  // therefore adversarial: absolutize it (a relative "/.well-known/axp/
+  // suite.json" resolves same-origin; an absolute foreign url is PRESERVED so
+  // the same-origin gate downstream drops it and the check fails the card for
+  // publishing another origin's suite), exactly like interfaces.digitalLink.
+  if (Object.prototype.hasOwnProperty.call(interfaces, 'testSuite')) {
+    const ts = interfaces.testSuite
+    if (ts !== null && typeof ts === 'object' && !Array.isArray(ts)) {
+      const t = ts as Record<string, unknown>
+      const urlRaw = str(t.url)
+      const digest = str(t.digest)
+      const environment = str(t.environment)
+      const runner = str(t.runner)
+      out.testSuite = {
+        declared: true,
+        ...(urlRaw !== undefined && { urlRaw }),
+        // A card that declares the interface with NO url has declared nothing
+        // fetchable. Absolutizing '' yields the origin root, which the check
+        // reports as a missing url rather than silently GETting `/`.
+        url: urlRaw !== undefined ? absolutize(urlRaw, origin) : '',
+        ...(digest !== undefined && { digest }),
+        environment: environment ?? TEST_SUITE_DEFAULT_ENVIRONMENT,
+        runner: runner ?? TEST_SUITE_RUNNER,
+      }
+    } else {
+      out.testSuite = {
+        declared: true,
+        malformed: true,
+        malformedAs: ts === null ? 'null' : Array.isArray(ts) ? 'array' : typeof ts,
+        url: '',
+        environment: TEST_SUITE_DEFAULT_ENVIRONMENT,
+        runner: TEST_SUITE_RUNNER,
       }
     }
   }
@@ -1277,6 +1421,96 @@ async function observeDigitalLink(origin: string, observer: Observer): Promise<v
   await observer.observe(ROLE.gs1Resolver, dl.wellKnown, { accept: 'application/json' })
 }
 
+/**
+ * Observe the card-declared PUBLISHED TEST SUITE: fetch the suite document,
+ * then RUN it.
+ *
+ * TARGET-DECLARED and OPTIONAL: only when agents.json carries
+ * `interfaces.testSuite` does anything happen — a card that omits the key
+ * records NOTHING, spends none of the politeness budget, and the
+ * published-test-suite check SKIPs. A simple CRUD API is fully conforming.
+ *
+ * WHY THE RUN HAPPENS HERE AND NOT IN THE CHECK. `runChecks(bundle)` is PURE —
+ * it judges recorded evidence and never fetches. So the suite is EXECUTED on
+ * the observe side, each exchange recorded under a namespaced role, and the
+ * judge re-derives the same requirement list and the same binding scope from
+ * the bundle and judges the recorded exchanges with the SHARED `judgeExpect`.
+ * Same bundle → same verdict, and a replay re-judges with no re-fetch. This
+ * mirrors `observeDigitalLink` exactly.
+ *
+ * ⚠ THE SUB-RUN IS DELIBERATELY NOT `verifySuite`. A card-declared suite is a
+ * stranger's document and is not entitled to what `verifySuite` grants an
+ * operator's own spec: it runs on its OWN Observer with `allowWrites: false`
+ * and a private budget (so it cannot starve the parent's fixed high-value
+ * probes), against the CARD'S OWN ORIGIN rather than the suite's `baseUrl`,
+ * under a wall-clock deadline. See `test-suite.ts` for the full boundary.
+ */
+async function observeTestSuite(origin: string, observer: Observer): Promise<void> {
+  const items = observer.items
+  const bundleView: EvidenceBundle = { target: origin, fetchedAt: '', seed: 0, items }
+  const agents = parseAgentsJson(parseJsonBody(findEvidence(bundleView, ROLE.agentsJson)), origin)
+  const claim = agents.testSuite
+  if (!claim) return // interface not declared — optional, nothing to verify
+
+  // Card-only gate. A malformed declaration, a missing/bad digest, an unknown
+  // runner or an off-origin url is judged from the card alone and never
+  // fetched; the check reports it from the same shared gate.
+  const gate = gateTestSuiteCard(claim, origin)
+  if (!gate.ok) return
+
+  const docEv = await observer.observe(ROLE.testSuite, gate.url, { accept: 'application/json' })
+  if (docEv.status === null || docEv.status < 200 || docEv.status >= 300 || docEv.body == null) return
+
+  const plan = gateTestSuiteDocument(claim, docEv.body, gate.digest)
+  if (!plan.ok) return // digest mismatch / ineligible shape — judged from the bundle, never run
+
+  // A PRIVATE observer for the sub-run. Three tightenings over the parent:
+  // read-only (a stranger's document may not direct a write), its own small
+  // budget (a long suite cannot drain the parent's politeness budget out from
+  // under the fixed probes), and `allowPrivate` inherited so a consented local
+  // target still works in dev without ever loosening the deployed posture.
+  const sub = observer.child({ allowWrites: false, budget: MAX_SUITE_REQUIREMENTS })
+
+  // The binding scope starts from the SELECTED ENVIRONMENT's vars, exactly as a
+  // `verifySuite` run does. A `baseUrl` among them cannot steer the run: the
+  // target is `origin`, and `resolveEndpoint` re-gates every resolved URL
+  // same-origin, so an off-origin interpolation fails closed WITHOUT a fetch.
+  const bindings: Bindings = { ...plan.vars }
+  const deadline = Date.now() + SUITE_DEADLINE_MS
+  for (const req of plan.requirements) {
+    if (Date.now() > deadline) break // the judge fails the run for the missing evidence
+    const resolved = resolveEndpoint(req, origin, bindings)
+    if (!resolved.ok) continue // judge re-derives the identical resolution failure
+    if (!isPubliclyRoutableSameOrigin(resolved.url, origin)) continue
+    // Belt-and-suspenders over the Observer's own read-only refusal and the
+    // document gate's declared-method check: never issue a non-safe method.
+    if (resolved.method !== 'GET' && resolved.method !== 'HEAD') continue
+    const ev = await sub.observe(`pinned:${req.id}`, resolved.url, {
+      method: resolved.method,
+      accept: 'application/json',
+    })
+    if (req.capture && judgeExpect(ev, resolved.expect).length === 0) {
+      captureInto(bindings, req.capture, ev)
+    }
+  }
+
+  // ⚠ MERGE UNDER A PREFIX. The sub-run recorded `pinned:<id>` — which is the
+  // PARENT's role-key space for the admission spec's own requirements. Merged
+  // raw, `find(role === 'pinned:x')` would resolve the wrong evidence item.
+  // Prefix every merged role, and REFUSE (loudly) if a prefixed role somehow
+  // already exists in the parent rather than silently shadowing it.
+  for (const ev of sub.items) {
+    const role = `${SUITE_ROLE_PREFIX}${ev.role}`
+    if (items.some((e) => e.role === role)) {
+      throw new Error(
+        `card-declared suite evidence role "${role}" already exists in the parent bundle — refusing to shadow it. ` +
+          'Suite evidence is namespaced under "suite:" precisely so it cannot collide with the admission run.',
+      )
+    }
+    items.push({ ...ev, role })
+  }
+}
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   const rootAgentEv = await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -1560,6 +1794,17 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //     contract-diff enumeration, so a fixed high-value probe is never starved
   //     by an endpoint-rich target — the same priority rule as 4b/4c/4d.
   await observeDigitalLink(origin, observer)
+
+  // 4f. Published test suite (OPTIONAL, target-declared): when the card
+  //     declares `interfaces.testSuite`, GET the digest-pinned Suite document
+  //     and RUN it — GET/HEAD only, on a private budget, against this origin —
+  //     so the published-test-suite judge can hold the surface to the workflows
+  //     it published about itself. Zero-overhead and zero-budget for the common
+  //     case (no declaration ⇒ no probe): a CRUD API that publishes no suite is
+  //     fully conforming. Ordered with the other fixed high-value probes,
+  //     BEFORE the unbounded contract-diff enumeration, and on its OWN observer
+  //     so a long suite can never starve them.
+  await observeTestSuite(origin, observer)
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
