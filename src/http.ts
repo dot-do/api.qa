@@ -83,6 +83,32 @@ export class Observer {
   }
 
   /**
+   * A SIBLING observer sharing this one's TRANSPORT configuration (fetcher,
+   * inter-request delay, per-request timeout, body byte cap, and the consented
+   * private-target escape hatch) but carrying its OWN budget and its own write
+   * posture.
+   *
+   * This exists for the card-declared test-suite sub-run, which must not
+   * inherit the parent's allowances. A pinned run sets `allowWrites: true`
+   * because "the target is yours"; a suite named by a stranger's card carries
+   * no such consent, and a long suite must not drain the politeness budget out
+   * from under the parent's fixed high-value probes. Sharing the FETCHER is the
+   * point — a mock/injected transport, and the deployed Worker's, must apply to
+   * the sub-run identically — while the budget and write posture are isolated.
+   */
+  child(overrides: Pick<ObserverOpts, 'budget' | 'allowWrites'>): Observer {
+    return new Observer({
+      fetcher: this.opts.fetcher,
+      delayMs: this.opts.delayMs,
+      timeoutMs: this.opts.timeoutMs,
+      maxBodyBytes: this.opts.maxBodyBytes,
+      allowPrivate: this.opts.allowPrivate,
+      budget: overrides.budget ?? this.opts.budget,
+      allowWrites: overrides.allowWrites ?? false,
+    })
+  }
+
+  /**
    * Fetch once, record Evidence, return it. Never throws.
    *
    * `init.headers` — extra request headers for CLIENT-CLASS simulation

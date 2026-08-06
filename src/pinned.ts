@@ -29,8 +29,27 @@ import { observeTarget, ROLE, parseAgentsJson, parseJsonBody, parseOpenapi } fro
 import { runChecks } from './checks.js'
 import { axScoreOf } from './grade.js'
 import { sha256Hex } from './digest.js'
-import { validateSchema, readPath } from './schema.js'
+import { readPath } from './schema.js'
 import { VERIFIER_VERSION } from './verify.js'
+// The expectation engine (interpolation, endpoint resolution, capture, the
+// expectation judge) lives in ./expect.js so the `published-test-suite` check
+// judges a card-declared suite with the IDENTICAL code path this module uses.
+// Extracted, never forked — two expectation judges that can drift is exactly
+// the failure that would make conformance depend on which door asked.
+import {
+  captureInto,
+  interpolateDeep,
+  judgeExpect,
+  resolveEndpoint,
+  type Bindings,
+} from './expect.js'
+// The pure document layer (requirement-list validation + Suite parsing) lives
+// in ./suite-doc.js: the observe and judge sides of the `published-test-suite`
+// check both need it, and both live in modules THIS one imports, so keeping it
+// here would close an import cycle. Re-exported so this module's public API is
+// unchanged for `dataset.ts`, `worker.ts`, `index.ts` and the tests.
+import { parseSuite, validateRequirements } from './suite-doc.js'
+export { parseSuite, validateRequirements }
 import type {
   AppliesWhen,
   CheckResult,
@@ -97,159 +116,6 @@ export function parsePinnedSpec(text: string): PinnedSpec {
   }
   validateRequirements(doc.requirements)
   return doc
-}
-
-/**
- * Validate an ordered requirement list — the id-uniqueness, derived-role-key
- * collision-freeness, and colon-in-id guards. Extracted so BOTH a PinnedSpec
- * and a reusable Suite (which is a PinnedSpec parameterized by an environment)
- * run the SAME checks over the SAME requirement shape — the suite format does
- * not fork the requirement contract, it reuses it.
- */
-export function validateRequirements(requirements: PinnedRequirement[]): void {
-  const doc = { requirements }
-  // VACUOUS-PASS GUARD. `passed: results.every(r => r.verdict === 'pass')` is
-  // `true` for an EMPTY array — an all() over nothing is vacuously true. A
-  // PinnedSpec (or Suite) with zero requirements would therefore ALWAYS report
-  // `passed: true` regardless of what the target does, including a totally
-  // broken worker: `expect(anyWorker).toConform({spec: emptySpec})` would pass
-  // every time. That is the exact class of silent-faked-success this verifier
-  // exists to catch, so refuse it categorically, LOUDLY, at parse — before any
-  // probe fires — rather than let an empty spec verify nothing while looking
-  // like a green report.
-  if (doc.requirements.length === 0) {
-    throw new Error(
-      'a PinnedSpec with no requirements verifies nothing; refusing to vacuously pass. ' +
-        'Add at least one requirement (or delete this spec/suite rather than pin an empty one).',
-    )
-  }
-  // Every requirement id MUST be a UNIQUE, NON-EMPTY STRING. The role key
-  // (`pinned:<id>`) is what observe records evidence under and what the judge
-  // looks up by `find(role === 'pinned:<id>')` (FIRST match). A PinnedSpec is
-  // EXTERNAL JSON parsed at runtime, so the `id: string` TS type is a
-  // compile-time fiction: a runtime id can be a number, boolean, null, missing,
-  // or the empty string. Any of those, or a duplicate, would let two
-  // requirements share one role — observe records under it by loop POSITION,
-  // the judge resolves BOTH to the first match — a self-contradictory report
-  // that re-opens the observe/judge divergence. Two numeric `1`s collapse to
-  // `pinned:1`; two missing ids to `pinned:undefined`. So reject any id that is
-  // not a unique non-empty string LOUDLY at parse, naming the offender — never
-  // `continue`-skip it. (Numeric `1` and string `"1"` both become the same
-  // role, so rejecting every non-string id also stops that cross-type
-  // collision.)
-  const seen = new Set<string>()
-  for (const req of doc.requirements) {
-    const id = (req as { id?: unknown }).id
-    if (typeof id !== 'string' || id.length === 0) {
-      throw new Error(
-        `invalid requirement id ${JSON.stringify(id)} in PinnedSpec — every requirement id must be ` +
-          'a unique NON-EMPTY STRING. This spec is external JSON: a numeric/boolean/null/missing/empty ' +
-          'id collapses to a shared role (pinned:<id>), making observe and the judge resolve different ' +
-          'requirements — refusing to verify something incoherent',
-      )
-    }
-    if (seen.has(id)) {
-      throw new Error(
-        `duplicate requirement id "${id}" in PinnedSpec — requirement ids must be unique ` +
-          '(observe indexes evidence by position, the judge by id; a repeat makes them disagree)',
-      )
-    }
-    seen.add(id)
-  }
-
-  // DERIVED-ROLE COLLISION GUARD. Raw-id uniqueness (above) is NOT enough: the
-  // role key a requirement records/is-judged under is DERIVED, not the raw id,
-  // and it is NON-INJECTIVE ACROSS KINDS:
-  //   endpoint id X → the single role key  `pinned:X`              (observe/judge
-  //                   both use `pinned:${id}`)
-  //   probe    id Y → the role-key NAMESPACE `pinned:Y:<i>` (one per manifest
-  //                   entry i), modeled here as the PREFIX `pinned:Y:`
-  //   surface / ax-floor / check → record NO `pinned:` role at all, so they can
-  //                   never collide on a derived role key.
-  // So endpoint "x:0" derives `pinned:x:0`, which is ALSO probe "x"'s entry-0
-  // role: both raw ids are distinct strings, the dup guard accepts the spec,
-  // then the judge's find(role === 'pinned:x:0') resolves BOTH requirements to
-  // the FIRST-recorded item — a probe judged against an endpoint's body (a
-  // false-FAIL, or a vacuous false-PASS: a conformance requirement that never
-  // judges the thing it names). Reject at parse if any two requirements' derived
-  // role keys can collide — an endpoint's point key falling inside a probe's
-  // namespace, or one probe namespace nested inside another.
-  const reservations: RoleReservation[] = []
-  for (const req of doc.requirements) {
-    const kind = (req as { kind?: unknown }).kind
-    const id = (req as { id: string }).id
-    if (kind === 'endpoint') reservations.push({ id, kind: 'endpoint', point: `pinned:${id}` })
-    else if (kind === 'probe') reservations.push({ id, kind: 'probe', prefix: `pinned:${id}:` })
-  }
-  for (let i = 0; i < reservations.length; i++) {
-    for (let j = i + 1; j < reservations.length; j++) {
-      const a = reservations[i]!
-      const b = reservations[j]!
-      const shared = roleKeysCollide(a, b)
-      if (shared !== undefined) {
-        throw new Error(
-          `derived role-key collision in PinnedSpec: requirement "${a.id}" (${a.kind}) and ` +
-            `requirement "${b.id}" (${b.kind}) both derive role key(s) under "${shared}". The role ` +
-            'key is DERIVED (endpoint → pinned:<id>, probe → pinned:<id>:<i>), not the raw id, so ' +
-            'two distinct raw ids can still share a role and make observe and the judge resolve ' +
-            'different requirements — refusing to verify something incoherent',
-        )
-      }
-    }
-  }
-
-  // Belt-and-suspenders: ':' is the role-key separator (`pinned:<id>[:<i>]`), so
-  // a colon INSIDE a raw id is the only way a derived role key can ever be
-  // ambiguous. The collision guard above already rejects the concrete colliding
-  // cases; this closes the whole class categorically — including ids like "a:b"
-  // that happen to collide with nothing yet still muddy role parsing.
-  for (const req of doc.requirements) {
-    const id = (req as { id: string }).id
-    if (id.includes(':')) {
-      throw new Error(
-        `requirement id "${id}" in PinnedSpec contains the ':' role-key separator — a requirement ` +
-          'id must not contain ":" (the derived role key is pinned:<id>[:<i>]; a colon in the raw ' +
-          'id makes that key ambiguous). Rename the requirement.',
-      )
-    }
-  }
-}
-
-/**
- * One requirement's reservation in the DERIVED role-key space. An `endpoint`
- * reserves a single POINT (`pinned:<id>`); a `probe` reserves a whole NAMESPACE
- * (`pinned:<id>:<i>` for every manifest entry i), modeled as the PREFIX
- * `pinned:<id>:`.
- */
-interface RoleReservation {
-  id: string
-  kind: 'endpoint' | 'probe'
-  point?: string
-  prefix?: string
-}
-
-/**
- * Return the shared role key (a descriptive string) if two reservations' derived
- * role-key spaces intersect, else undefined. A point falls inside a namespace
- * when it starts with the namespace prefix; two namespaces collide when one
- * prefix is a prefix of the other (nested). Two points can only match on an
- * identical raw id, which the dup guard already rejects.
- */
-function roleKeysCollide(a: RoleReservation, b: RoleReservation): string | undefined {
-  if (a.point !== undefined && b.point !== undefined) {
-    return a.point === b.point ? a.point : undefined
-  }
-  if (a.point !== undefined && b.prefix !== undefined) {
-    return a.point.startsWith(b.prefix) ? a.point : undefined
-  }
-  if (b.point !== undefined && a.prefix !== undefined) {
-    return b.point.startsWith(a.prefix) ? b.point : undefined
-  }
-  if (a.prefix !== undefined && b.prefix !== undefined) {
-    if (a.prefix.startsWith(b.prefix)) return `${a.prefix}<i>`
-    if (b.prefix.startsWith(a.prefix)) return `${b.prefix}<i>`
-  }
-  return undefined
 }
 
 export async function verifyPinnedSpec(
@@ -733,32 +599,6 @@ export interface VerifySuiteOpts extends ObserverOpts {
 }
 
 /**
- * Parse + validate a reusable Suite. Reuses `validateRequirements` (the SAME
- * id-uniqueness / derived-role-collision / colon guards a PinnedSpec runs) so
- * the suite format does not fork the requirement contract. Additionally checks
- * the `environments` map shape: each entry must be `{ vars: { ... } }`.
- */
-export function parseSuite(text: string): Suite {
-  const doc = JSON.parse(text) as Suite
-  if (doc.$type !== 'Suite' || !Array.isArray(doc.requirements)) {
-    throw new Error('not a Suite: expected {"$type":"Suite","environments":{...},"requirements":[...]}')
-  }
-  const envs = doc.environments as unknown
-  if (envs === null || typeof envs !== 'object' || Array.isArray(envs)) {
-    throw new Error('Suite.environments must be an object mapping env name -> { vars: { <k>: <v> } }')
-  }
-  for (const [name, env] of Object.entries(envs as Record<string, unknown>)) {
-    const vars = (env as { vars?: unknown } | null)?.vars
-    if (env === null || typeof env !== 'object' || Array.isArray(env) ||
-        vars === null || typeof vars !== 'object' || Array.isArray(vars)) {
-      throw new Error(`Suite environment "${name}" must be an object of the form { "vars": { <k>: <v> } }`)
-    }
-  }
-  validateRequirements(doc.requirements)
-  return doc
-}
-
-/**
  * Run a reusable Suite against a selected ENVIRONMENT. A Suite is a PinnedSpec
  * parameterized by the environment's vars, so this DELEGATES to
  * `verifyPinnedSpec` — the env vars pre-seed the binding scope (`initialBindings`)
@@ -974,226 +814,3 @@ function okPathnamesOf(bundle: EvidenceBundle): Set<string> {
   return out
 }
 
-// ---------------------------------------------------------------------------
-// Variable-capture + chaining (endpoint requirements)
-// ---------------------------------------------------------------------------
-
-/** Per-run capture scope: `varName -> value` extracted from a response body. */
-type Bindings = Record<string, unknown>
-
-type EndpointReq = Extract<PinnedRequirement, { kind: 'endpoint' }>
-
-/** `{{var}}` token — dot/word chars only (matches a capture var name). */
-const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g
-
-/** A string that is EXACTLY one `{{var}}` token, edge to edge (no surrounding text). */
-const WHOLE_VALUE_TOKEN = /^\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}$/
-
-/**
- * Interpolate every `{{var}}` in a string from the binding scope. A reference
- * to an unbound var is an ERROR (fail-closed) — the literal token is never
- * emitted onto the wire. Bound values render as their primitive text; a bound
- * object/array renders as compact JSON.
- *
- * This is the STRING-coercing path, used unconditionally for the URL path and
- * method (both are always strings on the wire) and for any partial/embedded
- * token (a token surrounded by other text, e.g. `/things/{{id}}`).
- */
-function interpolateString(s: string, bindings: Bindings): { value: string } | { error: string } {
-  let undef: string | undefined
-  const value = s.replace(VAR_TOKEN, (_m, name: string) => {
-    if (!Object.hasOwn(bindings, name)) {
-      undef ??= name
-      return ''
-    }
-    const v = bindings[name]
-    if (v === null || v === undefined) return ''
-    return typeof v === 'object' ? JSON.stringify(v) : String(v)
-  })
-  if (undef !== undefined) return { error: `undefined capture var {{${undef}}}` }
-  return { value }
-}
-
-/**
- * Interpolate a string leaf in a TYPED context (a JSON value inside `body` or
- * `expect` — e.g. `expect.paths[].equals`, an expected scalar, a body field).
- * When the ENTIRE string is a single whole-value `{{var}}` token, the RAW bound
- * value is substituted PRESERVING ITS TYPE (number / boolean / object / null),
- * so a captured numeric/boolean id chained into a typed compare or a JSON body
- * value is judged/serialized as the value it is — not falsely stringified to
- * `"1"` where `judgeExpect` would then mismatch `1`. Any other string (a
- * partial/embedded token, or plain text) falls through to string coercion.
- *
- * Surrounding whitespace is incidental ONLY for a NON-STRING binding: `'{{n}} '`
- * or `' {{n}} '` bound to a number/boolean/object/null is still a lone
- * whole-value token meant AS that value — whitespace cannot be part of the
- * intended literal — so it is TRIMMED before classification and the RAW typed
- * value is substituted (otherwise the trailing space would push it onto the
- * string-coercing path and silently false-FAIL a compliant numeric target,
- * `"1 "` vs `1`). But for a STRING binding the surrounding whitespace MAY be an
- * intended literal (`' {{tid}} '` with tid = 'hello' meaning the literal
- * ' hello '), so a string value keeps the string-coercing in-place path, which
- * substitutes the token where it sits and PRESERVES the surrounding whitespace.
- * (An edge-to-edge string token `'{{tid}}'` coerces to the identical raw string,
- * so it is unaffected either way.) A token adjacent to NON-whitespace text
- * (`'v{{n}}'`, `'{{a}}{{b}}'`) is genuine embedded interpolation and coerces.
- */
-function interpolateTypedString(s: string, bindings: Bindings): { value: unknown } | { error: string } {
-  const whole = WHOLE_VALUE_TOKEN.exec(s.trim())
-  if (whole) {
-    const name = whole[1]!
-    if (!Object.hasOwn(bindings, name)) return { error: `undefined capture var {{${name}}}` }
-    const v = bindings[name]
-    // Preserve TYPE (trimming incidental whitespace) only when whitespace cannot
-    // be part of an intended literal — i.e. the bound value is NON-STRING. A
-    // STRING binding falls through to the string-coercing path below, which
-    // preserves any surrounding whitespace in `s`.
-    if (typeof v !== 'string') return { value: v }
-  }
-  return interpolateString(s, bindings)
-}
-
-/** Deep-interpolate strings inside an arbitrary JSON value (body / expect). */
-function interpolateDeep(value: unknown, bindings: Bindings): { value: unknown } | { error: string } {
-  if (typeof value === 'string') return interpolateTypedString(value, bindings)
-  if (Array.isArray(value)) {
-    const out: unknown[] = []
-    for (const item of value) {
-      const r = interpolateDeep(item, bindings)
-      if ('error' in r) return r
-      out.push(r.value)
-    }
-    return { value: out }
-  }
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value)) {
-      const r = interpolateDeep(v, bindings)
-      if ('error' in r) return r
-      out[k] = r.value
-    }
-    return { value: out }
-  }
-  return { value }
-}
-
-type ResolvedEndpoint =
-  | { ok: true; method: string; url: string; body: unknown; expect: EndpointExpect }
-  | { ok: false; detail: string }
-
-/**
- * Resolve an endpoint requirement against the current binding scope: interpolate
- * method/path/body/expect, build the concrete URL, and RE-GATE it through the
- * SAME same-origin + publicly-routable + non-private check every pinned fetch
- * uses. Because a captured value is target-controlled, this gate is what stops a
- * malicious target from steering an interpolated path off-origin or at a
- * private/metadata address — such a resolution fails closed and is never
- * fetched. Deterministic in `bindings`, so observe and judge agree.
- */
-function resolveEndpoint(req: EndpointReq, origin: string, bindings: Bindings): ResolvedEndpoint {
-  const under = (detail: string): ResolvedEndpoint => ({
-    ok: false,
-    detail: `requirement ${req.id} references ${detail}`,
-  })
-  const m = interpolateString(req.method, bindings)
-  if ('error' in m) return under(m.error)
-  const p = interpolateString(req.path, bindings)
-  if ('error' in p) return under(p.error)
-  const b = interpolateDeep(req.body, bindings)
-  if ('error' in b) return under(b.error)
-  const e = interpolateDeep(req.expect, bindings)
-  if ('error' in e) return under(e.error)
-
-  let url: URL
-  try {
-    url = new URL(p.value, `${origin}/`)
-  } catch {
-    return { ok: false, detail: `requirement ${req.id} resolved to an unparseable url from path "${p.value}"` }
-  }
-  const resolvedUrl = url.toString()
-  if (!isPubliclyRoutableSameOrigin(resolvedUrl, origin)) {
-    return {
-      ok: false,
-      detail:
-        `requirement ${req.id} resolved to off-origin/private url ${resolvedUrl} ` +
-        '(a captured value must not steer the request off-origin) — refused, fail closed',
-    }
-  }
-  return { ok: true, method: m.value.toUpperCase(), url: resolvedUrl, body: b.value, expect: e.value as EndpointExpect }
-}
-
-/**
- * Extract each `capture` dot-path from an observed response body and bind it.
- * A path that does not resolve (or a non-JSON body) leaves the var UNBOUND, so a
- * downstream `{{var}}` reference fails closed rather than silently skipping.
- */
-function captureInto(bindings: Bindings, capture: Record<string, string>, ev: Evidence | undefined): void {
-  let body: unknown
-  try {
-    body = JSON.parse(ev?.body ?? '')
-  } catch {
-    return
-  }
-  for (const [varName, path] of Object.entries(capture)) {
-    const r = readPath(body, path)
-    if (r.found) bindings[varName] = r.value
-  }
-}
-
-/**
- * Judge one observed exchange against an expectation block. Pure; returns the
- * list of problems (empty = conforms). Shared by `endpoint` and `probe`
- * requirement kinds.
- */
-function judgeExpect(ev: Evidence | undefined, expect: EndpointExpect): string[] {
-  const problems: string[] = []
-  if (!ev || ev.status === null) {
-    problems.push(`fetch failed (${ev?.error ?? 'not observed'})`)
-    return problems
-  }
-  const wanted = expect.status === undefined ? [200] : Array.isArray(expect.status) ? expect.status : [expect.status]
-  if (!wanted.includes(ev.status)) problems.push(`status ${ev.status}, wanted ${wanted.join('|')}`)
-  if (expect.contentTypeIncludes && !(ev.contentType ?? '').includes(expect.contentTypeIncludes)) {
-    problems.push(`content-type ${ev.contentType}, wanted *${expect.contentTypeIncludes}*`)
-  }
-  if (expect.schema || expect.paths) {
-    let body: unknown
-    try { body = JSON.parse(ev.body ?? '') } catch { problems.push('body is not JSON') }
-    if (body !== undefined) {
-      if (expect.schema) {
-        for (const v of validateSchema(body, expect.schema)) problems.push(`${v.path} ${v.message}`)
-      }
-      for (const p of expect.paths ?? []) {
-        const r = readPath(body, p.path)
-        if (p.exists !== undefined && r.found !== p.exists) problems.push(`path ${p.path} ${p.exists ? 'missing' : 'unexpectedly present'}`)
-        if (p.equals !== undefined && (!r.found || JSON.stringify(r.value) !== JSON.stringify(p.equals))) {
-          problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted ${JSON.stringify(p.equals)}`)
-        }
-        // Closed-vocabulary membership (e.g. AXP pricing model ∈ [free, metered]).
-        if (p.oneOf !== undefined &&
-            (!r.found || !p.oneOf.some((v) => JSON.stringify(v) === JSON.stringify(r.value)))) {
-          problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted one of ${JSON.stringify(p.oneOf)}`)
-        }
-        // Numeric comparators — the pinned floor/ceiling. A comparator on a
-        // path that is absent or non-numeric is itself a failure (the target
-        // did not report the number the contract measures).
-        const comparators: Array<[keyof typeof p, string, (a: number, b: number) => boolean]> = [
-          ['gte', '>=', (a, b) => a >= b],
-          ['lte', '<=', (a, b) => a <= b],
-          ['gt', '>', (a, b) => a > b],
-          ['lt', '<', (a, b) => a < b],
-        ]
-        for (const [key, sym, cmp] of comparators) {
-          const bound = p[key] as number | undefined
-          if (bound === undefined) continue
-          if (!r.found || typeof r.value !== 'number') {
-            problems.push(`path ${p.path} = ${JSON.stringify(r.found ? r.value : undefined)}, wanted a number ${sym} ${bound}`)
-          } else if (!cmp(r.value, bound)) {
-            problems.push(`path ${p.path} = ${r.value}, wanted ${sym} ${bound}`)
-          }
-        }
-      }
-    }
-  }
-  return problems
-}

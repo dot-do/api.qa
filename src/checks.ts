@@ -31,8 +31,19 @@ import {
   resourceContentOf,
   externalUrlOf,
   isMcpUiMime,
+  SUITE_ROLE_PREFIX,
   type ServerJsonClaims,
 } from './discovery.js'
+// The card-declared test-suite gates and the shared expectation engine — the
+// SAME code the observe side ran, so what was fetched and what it means cannot
+// drift. `judgeExpect` in particular is imported, never re-implemented: a
+// second expectation judge would make conformance depend on which door asked.
+import {
+  MAX_SUITE_REQUIREMENTS,
+  gateTestSuiteCard,
+  gateTestSuiteDocument,
+} from './test-suite.js'
+import { captureInto, judgeExpect, resolveEndpoint, type Bindings } from './expect.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
 import {
@@ -874,6 +885,104 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         verdict: 'fail',
         detail: problems.slice(0, 6).join('; ') || 'the declared Digital Link interface could not be verified',
       }))
+  }
+
+  // ── published-test-suite (OPTIONAL, DECLARATION-ARMED) ────────────────────
+  //    The second optional interface, and the owner's motivating case: a
+  //    service COULD publish tests for more complex workflows, but a simple
+  //    CRUD or lookup API does not need that complexity and must not be
+  //    penalised for omitting them. So the check is armed by the card's OWN key
+  //    (`interfaces.testSuite`), NOT by the AXP opt-in signal, and a card that
+  //    omits the key SKIPs — omission is conformance.
+  //
+  //    WHAT IS VERIFIED — deliberately tier 3, "run it". A check that only
+  //    confirmed a file exists and hashes correctly would verify nothing about
+  //    the workflows this interface exists for, and a mechanism tested only on
+  //    the happy path is a mechanism nobody tested. The suite was EXECUTED
+  //    during observe (see observeTestSuite) under a tightened boundary; this
+  //    judge re-derives the identical requirement list and binding scope from
+  //    the bundle and re-judges the recorded exchanges with the SHARED
+  //    `judgeExpect` — so a replay reaches the same verdict without refetching.
+  //
+  //    axItem is undefined — an additive readiness dimension that moves no AX
+  //    point, exactly like digital-link-resolver.
+  {
+    const claim = agents.testSuite
+    const evidence: string[] = [ROLE.agentsJson, ROLE.testSuite]
+    let result: { verdict: Verdict; detail: string }
+
+    if (!claim) {
+      result = {
+        verdict: 'skip',
+        detail:
+          'no published test suite interface declared (agents.json `interfaces.testSuite` absent) — the interface is OPTIONAL and this card does not claim it, so nothing was fetched and nothing is judged; under a pinned must:pass this fails closed',
+      }
+    } else {
+      const cardGate = gateTestSuiteCard(claim, bundle.target)
+      if (!cardGate.ok) {
+        result = { verdict: 'fail', detail: cardGate.problem }
+      } else {
+        const docEv = findEvidence(bundle, ROLE.testSuite)
+        if (!ok(docEv) || docEv?.body == null) {
+          result = {
+            verdict: 'fail',
+            detail:
+              `GET ${cardGate.url} did not answer 2xx with a body — ${!docEv ? 'not fetched' : docEv.status === null ? `fetch failed (${docEv.error ?? 'unknown'})` : `status ${docEv.status}`}. ` +
+              'The card DECLARES a published test suite, so the suite document must be served.',
+          }
+        } else {
+          const plan = gateTestSuiteDocument(claim, docEv.body, cardGate.digest)
+          if (!plan.ok) {
+            result = { verdict: 'fail', detail: plan.problems.slice(0, 6).join('; ') }
+          } else {
+            // Re-derive the run PURELY from the bundle: same env vars, same
+            // requirement order, same capture-on-pass gate the observe side
+            // used, so the two scopes are identical by construction.
+            const bindings: Bindings = { ...plan.vars }
+            const problems: string[] = []
+            const pathnames = new Set<string>()
+            for (const req of plan.requirements) {
+              const resolved = resolveEndpoint(req, bundle.target, bindings)
+              if (!resolved.ok) {
+                problems.push(`"${req.id}": ${resolved.detail}`)
+                continue
+              }
+              const role = `${SUITE_ROLE_PREFIX}pinned:${req.id}`
+              evidence.push(role)
+              const ev = bundle.items.find((e) => e.role === role)
+              const ps = judgeExpect(ev, resolved.expect)
+              if (ps.length === 0) {
+                try { pathnames.add(new URL(resolved.url).pathname) } catch { /* resolved urls parse */ }
+                if (req.capture) captureInto(bindings, req.capture, ev)
+              } else {
+                problems.push(`"${req.id}" ${resolved.method} ${resolved.url}: ${ps.join('; ')}`)
+              }
+            }
+            result =
+              problems.length === 0
+                ? pass(
+                    `interfaces.testSuite declared; ${cardGate.url} → ${docEv!.status}, ${cardGate.digest.slice(0, 19)}… matches the card pin; ` +
+                      `suite "${plan.suite.name}"@${plan.suite.version}, environment "${claim.environment}", ` +
+                      `${plan.requirements.length} requirement(s) over ${pathnames.size} distinct pathname(s), all passed. ` +
+                      `Run GET/HEAD-only with writes disabled, budget <=${MAX_SUITE_REQUIREMENTS}, target pinned to the card origin. ` +
+                      'NOT judged: whether the suite is ambitious — api.qa verifies the surface keeps its OWN published promise, ' +
+                      'not that the promise is demanding.',
+                  )
+                : {
+                    verdict: 'fail',
+                    detail:
+                      `the surface violated its OWN published suite "${plan.suite.name}"@${plan.suite.version} ` +
+                      `(${cardGate.digest.slice(0, 19)}…, environment "${claim.environment}"): ` +
+                      problems.slice(0, 6).join('; '),
+                  }
+          }
+        }
+      }
+    }
+
+    checks.push(check('published-test-suite',
+      'a DECLARED test-suite interface publishes a digest-pinned suite the surface actually passes', undefined,
+      evidence, result))
   }
 
   // ── AXP structural checks (Clause 3 conneg + Clause 6 cross-linking) ──────
