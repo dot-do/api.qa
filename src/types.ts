@@ -122,6 +122,26 @@ export interface CheckResult {
    * VerificationReport so the diff is a monitorable signal, not just a verdict.
    */
   contractDiff?: ContractDiffReport
+  /**
+   * STRUCTURED not-applicable marker, set on a pinned REQUIREMENT result whose
+   * `appliesWhen` decided the requirement does not apply to this target.
+   *
+   * `verdict` deliberately STAYS `'pass'`. A PinnedSpec passes iff every
+   * requirement's verdict is `'pass'`; introducing a fourth `Verdict` member
+   * would flip every free-model target passing today to `passed: false`. This
+   * field is instead how an agent tells "passed because it was VERIFIED" from
+   * "passed because it was never APPLICABLE" — without parsing prose, which is
+   * not a contract. Absent on every ordinary verdict.
+   *
+   * The CI reporters map a marked requirement to a JUnit `<skipped/>`, which is
+   * the correct JUnit semantic for a test that did not run.
+   */
+  notApplicable?: {
+    /** Which `appliesWhen` arm decided it. */
+    reason: 'not-declared' | 'observed-value'
+    /** What was read: 'interfaces.digitalLink' | 'probes.pricing model'. */
+    source: string
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,19 +353,82 @@ export interface EndpointExpect {
 }
 
 /**
- * Conditional applicability for `probe` / `check` requirements: the requirement
- * applies only when the value at `path` inside the FIRST declared probe of
- * channel `fromProbe` (as OBSERVED in this run — entry index 0) deep-equals
- * `equals`. A non-applicable requirement passes as "not applicable" (this is
- * how a free-model API passes AXP's metering requirements). FAIL-CLOSED rule:
- * when the source probe was not observed, is not JSON, or the path does not
- * resolve, the requirement APPLIES — applicability can only be proven by the
- * observed value, never by its absence.
+ * Conditional applicability for `probe` / `check` requirements. EXACTLY ONE
+ * arm. The two arms differ in KIND, not degree, and the difference is the whole
+ * design:
+ *
+ *   `fromProbe`     — the requirement applies only when an OBSERVED VALUE says
+ *                     so. An unobservable source APPLIES the requirement
+ *                     (fail closed), because a missing probe response is an
+ *                     OBSERVATION FAILURE: the verifier asked and got no
+ *                     answer, so it cannot tell "does not apply to me" from
+ *                     "I am broken" or "I am evading".
+ *
+ *   `cardDeclares`  — the requirement applies only when the capability card
+ *                     DECLARES a named optional interface. An absent key means
+ *                     NOT APPLICABLE, because there the card IS the answer: a
+ *                     card that was fetched, parsed and found well-formed and
+ *                     that omits the key has affirmatively said "I do not offer
+ *                     this". Absence IN a retrieved document is a datum;
+ *                     absence OF the document is not — so every case where the
+ *                     card could not be read collapses back to fail-closed.
+ *
+ * A non-applicable requirement passes as "not applicable" and carries a
+ * STRUCTURED `CheckResult.notApplicable` marker, so an agent never has to
+ * string-match prose to tell a verified pass from an unjudged one.
  */
-export interface AppliesWhen {
+export type AppliesWhen = AppliesWhenFromProbe | AppliesWhenCardDeclares
+
+/**
+ * OBSERVED-VALUE arm. The requirement applies only when the value at `path`
+ * inside the FIRST declared probe of channel `fromProbe` (as OBSERVED in this
+ * run — entry index 0) deep-equals `equals`. This is how a free-model API
+ * passes AXP's metering requirements.
+ *
+ * FAIL-CLOSED: when the source probe was not observed, is not JSON, or the path
+ * does not resolve, the requirement APPLIES — applicability can only be PROVEN
+ * by the observed value, never by its absence.
+ *
+ * Legal on `kind: 'probe'` AND `kind: 'check'`. Semantics are byte-identical to
+ * the pre-union behaviour; nothing here changed.
+ */
+export interface AppliesWhenFromProbe {
   fromProbe: string
   path: string
   equals: unknown
+  cardDeclares?: never
+}
+
+/**
+ * CARD-DECLARATION arm. The requirement applies only when the capability card
+ * DECLARES the named optional interface — i.e. the dot-path resolves to a
+ * PRESENT member of a reachable, well-formed card.
+ *
+ * PRESENCE is the whole test. There is deliberately no `equals`: a
+ * present-but-unexpected value would have to mean either "not applicable" or
+ * "malformed", and two independent implementers would resolve that differently.
+ * A present-but-empty value (`{}`, `null`, `false`, `""`, `[]`) is a CLAIM, not
+ * an absence — it ARMS the requirement, and the armed check judges it (and
+ * fails it, if the declaration is defective). A card meaning "no" OMITS the key.
+ *
+ * There is also deliberately no `declared: false`. A negated form is an evasion
+ * primitive by construction — a MUST that switches off when you ADD a card key.
+ * Making it unrepresentable in the type is cheaper than forbidding it in prose.
+ *
+ * CONSTRAINTS, all enforced by THROWING in `validateRequirements` before any
+ * probe fires:
+ *   - legal ONLY on `kind: 'check'` (never on `kind: 'probe'`, which is what
+ *     makes behavioural probe requirements categorically un-gatable);
+ *   - `check` MUST be a key of the verifier's own
+ *     `OPTIONAL_DECLARED_INTERFACES` registry;
+ *   - `cardDeclares` MUST equal the exact path that registry binds to `check`;
+ *   - `cardDeclares` MUST match `/^interfaces\.[A-Za-z][A-Za-z0-9]*$/`.
+ */
+export interface AppliesWhenCardDeclares {
+  cardDeclares: string
+  fromProbe?: never
+  path?: never
+  equals?: never
 }
 
 export type PinnedRequirement =
@@ -415,8 +498,18 @@ export type PinnedRequirement =
        * stricter).
        */
       paramValue?: number | { fromProbe: string; path: string; multiply?: number; multiplyRange?: [number, number] }
-      /** Conditional applicability (see AppliesWhen). Absent = always applies. */
-      appliesWhen?: AppliesWhen
+      /**
+       * Conditional applicability, OBSERVED-VALUE arm ONLY (see AppliesWhen).
+       * Absent = always applies.
+       *
+       * A `probe` requirement may NEVER carry the `cardDeclares` arm — it is
+       * excluded here at compile time and thrown on at parse time. A behavioural
+       * probe requirement is how an always-required clause is verified against
+       * the wire; letting a card key switch one off would let a target opt out
+       * of that clause by omission. An optional capability that needs
+       * behavioural probing gets a CHECK that does the probing instead.
+       */
+      appliesWhen?: AppliesWhenFromProbe
       /**
        * When true, every declared entry's pathname must ALSO be observed
        * answering `200` with a top-level `type: "OK"` JSON envelope somewhere
