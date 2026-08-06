@@ -61,8 +61,10 @@ jobs:
     name: Verify agent-first contract
     runs-on: ubuntu-latest
     env:
-      API_QA_TARGET: ${{ vars.API_QA_TARGET }}
-      API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST }}
+      # TEMPORARY (reverted in the next commit): force the CONFIGURED path so CI
+      # proves build → suite → JUnit emit → publish actually works on a runner.
+      API_QA_TARGET: ${{ vars.API_QA_TARGET || 'https://apis.directory' }}
+      API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST || 'a0679c89153c90181ea3585c0ec3c7aa55a93b18aab8211a668bd117d366a68c' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
