@@ -27,6 +27,27 @@ specific attack.
 > and its *published contracts*, but changing either changes the evidence
 > digest, visibly, in the attested report.
 
+### Corollary: third-party constraint documents are vendored, never fetched
+
+Some checks judge a target against a standard *someone else* publishes — the
+first is `digital-link-resolver`, which holds a declared Digital Link interface
+to GS1's published resolver description-file schema
+(`https://ref.gs1.org/standards/resolver/description-file-schema`).
+
+Fetching that schema at verification time would add a **sixth input** to the
+invariant above — a document its publisher can edit at any moment, which no
+replay could reproduce — and `Observer.observe` refuses off-origin fetches
+anyway. So the published bytes are **vendored and digest-pinned**
+(`src/gs1-resolver.ts` carries the provenance record; `test/fixtures/` carries
+the bytes), the runtime constraint is a hand-written `MiniSchema` translation
+of them, and a test audits that translation against the vendored bytes keyword
+by keyword — in both directions, so neither a dropped constraint nor an
+invented one passes silently. Constraints the published schema states but the
+translation deliberately does not enforce (draft-07 `format`, which is an
+annotation; a member GS1 misplaced outside a keyword position) are enumerated
+with reasons and named in the check's own verdict text. A verifier that is
+stricter than the standard it cites is lying in the other direction.
+
 ### Attacks and mitigations
 
 | # | Attack | Mitigation | Status |

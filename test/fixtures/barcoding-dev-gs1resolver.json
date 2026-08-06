@@ -1,0 +1,44 @@
+{
+  "name": "barcoding.dev — the delegating door",
+  "resolverRoot": "https://barcoding.dev",
+  "supportedLinkType": [
+    {
+      "namespace": "https://gs1.org/voc/",
+      "prefix": "gs1:",
+      "profile": [
+        "gs1:defaultLink"
+      ]
+    }
+  ],
+  "supportedPrimaryKeys": [
+    "01",
+    "00",
+    "417"
+  ],
+  "extensions": {
+    "note": "non-GS1 keys served through the same door (P0-5d)",
+    "keys": [
+      "/vin/{vin}",
+      "/isbn/{isbn13}",
+      "/ndc/{ndc}",
+      "/usps-impb/{tracking}",
+      "/ups-1z/{tracking}"
+    ]
+  },
+  "conneg": {
+    "faces": [
+      "text/html",
+      "text/markdown",
+      "application/json",
+      "application/ld+json",
+      "application/linkset+json"
+    ],
+    "law": "extension > Accept > client-class defaults (Sec-Fetch for browsers)"
+  },
+  "delegation": "this property reads barcodes and serves the conformant standard surface; resolution — who and what alike — is id.org.ai's (vehicles via auto.dev, the vertical authority)",
+  "pins": {
+    "registry_sha256": "597c1c5e14adda3436e3ec14885963b06acad68bbede85fe36e52d58c4fa4571",
+    "ai_table_sha256": "8e243cf22e905241d1b2e6e1d4be3d31d965fc60e15470fc8e84e05872cbd99f",
+    "pinned": "2026-07-31"
+  }
+}
