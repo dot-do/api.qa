@@ -1,6 +1,6 @@
 {
   "name": "autonomous-qa",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "The external third-party verifier for agent-first APIs. Discovery from published machine surfaces, contract-derived deterministic checks, attested public grade reports. Reference client for the hosted service at https://api.qa.",
   "license": "MIT",
   "type": "module",

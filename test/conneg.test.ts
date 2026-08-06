@@ -24,92 +24,20 @@ import { axScoreOf, gradeOf } from '../src/grade.js'
 import { verifyPinnedSpec } from '../src/pinned.js'
 import { sha256Hex } from '../src/digest.js'
 import { GOOD, goodTargetRoutes, makeFetcher, withOverrides, type Routes } from './helpers.js'
+import {
+  LINKS, FACE_HTML, FACE_JSON, FACE_MD, connegRoot, axpReferenceRoutes, urlAwareFetcher,
+} from './axp-fixture.js'
 
 const AXP_SPEC_PATH = new URL('../examples/ax/apis-ax-standard.spec.json', import.meta.url)
 
 // ---------------------------------------------------------------------------
-// Fixture: good.example upgraded to the full AXP 0.4.0 bar — conneg law
-// (three faces, deterministic selection, Link alternates), typed envelopes on
-// one branching collection, a free Pricing Document, and the probe manifest.
+// Fixture: good.example upgraded to the full AXP bar — conneg law (three
+// faces, deterministic selection, Link alternates), typed envelopes on one
+// branching collection, a free Pricing Document, and the probe manifest.
+//
+// Moved to ./axp-fixture.ts so the optional-declared-interface suite verifies
+// against the SAME reference target instead of forking it. Unchanged here.
 // ---------------------------------------------------------------------------
-
-const LINKS =
-  '</index.html>; rel="alternate"; type="text/html", ' +
-  '</index.json>; rel="alternate"; type="application/ld+json", ' +
-  '</index.md>; rel="alternate"; type="text/markdown"'
-
-const FACE_HTML = () => ({
-  status: 200, contentType: 'text/html', headers: { link: LINKS },
-  body: '<!doctype html><html><body><h1>good.example</h1><p>the page face</p></body></html>',
-})
-const FACE_JSON = () => ({
-  status: 200, contentType: 'application/ld+json', headers: { link: LINKS },
-  body: JSON.stringify({ $context: 'https://schema.org.ai', $type: 'Service', name: 'good.example' }),
-})
-const FACE_MD = () => ({
-  status: 200, contentType: 'text/markdown', headers: { link: LINKS },
-  body: '# good.example\n\n> the token-cheap agent face, substantive enough to be real content.',
-})
-
-/** The AXP A.7.3 selection algorithm, as a route handler for `GET /`. */
-function connegRoot(req: { accept: string; headers?: Record<string, string> }) {
-  const h = req.headers ?? {}
-  if (req.accept.includes('text/html')) return FACE_HTML()
-  if (req.accept.includes('application/json') || req.accept.includes('application/ld+json')) return FACE_JSON()
-  if (req.accept.includes('text/markdown')) return FACE_MD()
-  if (h['sec-fetch-mode'] === 'navigate' || h['sec-fetch-dest'] === 'document') return FACE_HTML()
-  if (/claude-user|gptbot|claudebot|agent/i.test(h['user-agent'] ?? '')) return FACE_MD()
-  return FACE_JSON()
-}
-
-/** One branching collection (the api.lawyer /matters pattern): OK / EMPTY / BLOCKED. */
-function recordsRoute(url: string) {
-  const u = new URL(url, GOOD)
-  const scope = u.searchParams.get('scope')
-  if (scope === 'admin' || scope === 'internal') {
-    return { status: 403, contentType: 'application/json', body: JSON.stringify({ type: 'BLOCKED', reason: 'not permitted for your agent class' }) }
-  }
-  if (u.searchParams.get('filter') === 'none' || u.searchParams.get('tag') === 'none') {
-    return { status: 200, contentType: 'application/json', body: JSON.stringify({ type: 'EMPTY', results: [], message: 'no records match' }) }
-  }
-  return { status: 200, contentType: 'application/json', body: JSON.stringify({ type: 'OK', results: [{ id: 'r1' }] }) }
-}
-
-/**
- * The reference AXP target: goodTargetRoutes + the conneg law + the probe
- * manifest + the branching collection + a free Pricing Document.
- */
-function axpReferenceRoutes(pricing: Record<string, unknown> = { model: 'free' }): Routes {
-  const base = goodTargetRoutes()
-  const card = JSON.parse(
-    base['GET /.well-known/agents.json']!({ method: 'GET', accept: 'application/json' }).body!,
-  ) as Record<string, any>
-  card.llms = `${GOOD}/llms.txt`
-  card.interfaces.http.records = { method: 'GET', url: `${GOOD}/api/records`, auth: 'none' }
-  card.probes = {
-    keyless: { url: '/api/records' },
-    pricing: { url: '/pricing' },
-    knownEmpty: [{ url: '/api/records?filter=none' }, { url: '/api/records?tag=none' }],
-    knownForbidden: [{ url: '/api/records?scope=admin' }, { url: '/api/records?scope=internal' }],
-    ...(pricing.model === 'metered' ? { overCeiling: { url: '/api/records', param: 'spend' } } : {}),
-  }
-  const openapi = JSON.parse(base['GET /openapi.json']!({ method: 'GET', accept: 'application/json' }).body!) as Record<string, any>
-  openapi.paths['/api/records'] = { get: { responses: { '200': { description: 'records' } } } }
-  openapi.paths['/pricing'] = { get: { responses: { '200': { description: 'pricing document' } } } }
-
-  return withOverrides(base, {
-    'GET /': connegRoot,
-    'GET /index.html': () => FACE_HTML(),
-    'GET /index.json': () => FACE_JSON(),
-    'GET /index.md': () => FACE_MD(),
-    'GET /.well-known/agents.json': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(card) }),
-    'GET /openapi.json': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(openapi) }),
-    'GET /pricing': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(pricing) }),
-    // Plain-table route (no URL threading): the query-branching variants are
-    // exercised through urlAwareFetcher below.
-    'GET /api/records': () => recordsRoute('/api/records'),
-  })
-}
 
 async function judge(routes: Routes, seed = 7) {
   const observer = new Observer({ fetcher: makeFetcher(routes), delayMs: 0 })
@@ -134,27 +62,9 @@ const AXP_CHECK_IDS = [
   'card-interfaces-linked',
 ] as const
 
-// ---------------------------------------------------------------------------
-// Route-handler plumbing: recordsRoute needs the request URL. makeFetcher
-// hands handlers only method/accept/headers, so thread the url through a
-// tiny wrapper fetcher instead of widening the shared helper for one test.
-// ---------------------------------------------------------------------------
-
 // (recordsRoute defaults to the plain-OK branch when no url is threaded; the
 // query-branching is exercised through the pinned probes below, which fetch
-// concrete query URLs — see urlAwareFetcher.)
-
-function urlAwareFetcher(routes: Routes) {
-  const inner = makeFetcher(routes)
-  return async (url: string, init?: RequestInit) => {
-    const u = new URL(url)
-    if (u.pathname === '/api/records') {
-      const out = recordsRoute(url)
-      return new Response(out.body ?? '', { status: out.status, headers: { 'content-type': out.contentType ?? 'text/plain' } })
-    }
-    return inner(url, init)
-  }
-}
+// concrete query URLs — see urlAwareFetcher in ./axp-fixture.ts.)
 
 // ===========================================================================
 // The six AXP structural checks

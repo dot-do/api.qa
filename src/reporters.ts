@@ -137,12 +137,25 @@ function checkTime(check: CheckResult, times: Map<string, number>): number {
 }
 
 function caseFromCheck(c: CheckResult, classname: string, times: Map<string, number>): ReporterTestCase {
+  // NOT-APPLICABLE → JUnit `skip`, not `pass`.
+  //
+  // A requirement whose `appliesWhen` said it does not apply to this target was
+  // NEVER RUN. `<skipped/>` is the correct JUnit semantic for that, and it is
+  // what a CI reader needs: counting it as a pass tells a human that something
+  // was verified when nothing was.
+  //
+  // ⚠ INTENDED COUNT MOVE: this shifts such requirements out of the JUnit/summary
+  // `passed` total and into `skipped`. It is a REPORTING change only —
+  // `PinnedReport.passed` is untouched and the requirement's own `verdict` stays
+  // 'pass', so no target's admission changes. If you are bisecting a "passed
+  // count dropped" report, this is why, and it is deliberate.
+  const notApplicable = c.notApplicable !== undefined
   return {
     id: c.id,
     name: `${c.title} [${c.id}]`,
     classname,
-    status: c.verdict as CaseStatus,
-    detail: c.verdict === 'pass' ? '' : c.detail,
+    status: notApplicable ? 'skip' : (c.verdict as CaseStatus),
+    detail: notApplicable || c.verdict !== 'pass' ? c.detail : '',
     timeMs: checkTime(c, times),
   }
 }

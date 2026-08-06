@@ -17,11 +17,22 @@ export {
   validateRequirements,
   verifySuite,
   parseSuite,
+  readCardDeclaration,
   type PinnedReport,
   type VerifyPinnedOpts,
   type SuiteReport,
   type VerifySuiteOpts,
+  type CardDeclarationState,
 } from './pinned.js'
+// The optional-declared-interface registry is PUBLIC on purpose: a spec author
+// needs to know which checks may be declaration-armed BEFORE writing a spec
+// that throws, and an auditor needs to be able to read the closed list without
+// reading the source. Exporting it does not widen it — it is frozen.
+export {
+  OPTIONAL_DECLARED_INTERFACES,
+  OPTIONAL_INTERFACE_PATH_RE,
+  eligibleOptionalChecks,
+} from './optional-interfaces.js'
 export {
   observeTarget,
   deriveDiscovery,

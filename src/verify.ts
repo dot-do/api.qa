@@ -17,7 +17,25 @@ import type { VerificationReport } from './types.js'
 // conneg-client-class / conneg-alternates / conneg-forced-face), appliesWhen
 // gating on kind:check AND kind:probe, paramValue.multiplyRange,
 // expect.paths[].oneOf, metered-gated probe-manifest demands.
-export const VERIFIER_VERSION = '0.2.0'
+//
+// 0.3.0: THE OPTIONAL-DECLARED-INTERFACE MECHANISM. `appliesWhen` becomes a
+// two-arm union — the existing observed-value arm plus `cardDeclares`, which
+// arms a requirement on the PRESENCE of a named `interfaces.<key>` member of
+// the capability card. Skipping is restricted to a frozen, verifier-owned
+// registry of ADDITIVE capabilities (optional-interfaces.ts), enforced by
+// throwing in validateRequirements before any probe fires, so no
+// always-required clause can be opted out of by omission. Not-applicable
+// requirement results carry a structured `notApplicable` marker and report as a
+// JUnit `<skipped/>`. `digital-link-resolver` is registered, which is what makes
+// it pinnable.
+//
+// ⚠ VERSION ORDERING: a spec carrying `appliesWhen.cardDeclares` reaching a
+// verifier OLDER than 0.3.0 sees `aw.fromProbe === undefined`, finds no source
+// probe, applies the requirement fail-closed, and therefore fails EVERY
+// non-declaring target. That is the correct direction of failure — loud, never
+// a silent pass — but it is an outage, and it is why a spec must not pin a
+// declaration-armed requirement until 0.3.0 is deployed.
+export const VERIFIER_VERSION = '0.3.0'
 
 export interface VerifyTargetOpts extends ObserverOpts {
   /**

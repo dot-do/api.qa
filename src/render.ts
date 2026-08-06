@@ -10,6 +10,18 @@ import type { DataDrivenReport } from './dataset.js'
 
 const MARK: Record<string, string> = { pass: 'PASS', fail: 'FAIL', skip: 'skip' }
 
+/**
+ * A pinned REQUIREMENT has three readable outcomes, not two: judged-and-passed,
+ * judged-and-failed, and NEVER JUDGED because `appliesWhen` said the
+ * requirement does not apply to this target. The verdict of the third is 'pass'
+ * (see CheckResult.notApplicable for why that must not change), so a renderer
+ * that keys only on `verdict` shows an unverified requirement as a verified
+ * one. Key on the structured marker instead.
+ */
+function requirementMark(c: { verdict: string; notApplicable?: unknown }): string {
+  return c.notApplicable !== undefined ? 'n/a' : MARK[c.verdict]!
+}
+
 export function reportMarkdown(r: VerificationReport): string {
   const host = r.target.replace(/^https?:\/\//, '')
   const lines: string[] = [
@@ -54,15 +66,21 @@ export function reportMarkdown(r: VerificationReport): string {
 }
 
 export function pinnedMarkdown(r: PinnedReport): string {
+  const notApplicable = r.requirements.filter((c) => c.notApplicable !== undefined).length
+  const failed = r.requirements.filter((c) => c.verdict !== 'pass').length
+  const passed = r.requirements.length - notApplicable - failed
   const lines = [
     `# api.qa pinned-spec report — ${r.target.replace(/^https?:\/\//, '')}`,
     '',
     `> **${r.passed ? 'PASSED' : 'FAILED'}** against \`${r.spec.name}@${r.spec.version}\``,
     `> spec digest \`${r.spec.digest}\` · ${r.mode} mode · ${r.attested ? 'attested' : 'NOT attested (advisory)'}`,
+    // Three counts, never two: a not-applicable requirement was NOT verified,
+    // and folding it into "passed" would overstate what this run established.
+    `> ${passed} passed · ${notApplicable} not applicable · ${failed} failed`,
     '',
     '| requirement | verdict | detail |',
     '| --- | --- | --- |',
-    ...r.requirements.map((c) => `| ${c.title} (\`${c.id}\`) | ${MARK[c.verdict]} | ${c.detail.replace(/\|/g, '\\|')} |`),
+    ...r.requirements.map((c) => `| ${c.title} (\`${c.id}\`) | ${requirementMark(c)} | ${c.detail.replace(/\|/g, '\\|')} |`),
     '',
   ]
   return lines.join('\n')
@@ -78,7 +96,7 @@ export function suiteMarkdown(r: SuiteReport): string {
     '| # | probe | verdict | detail |',
     '| --- | --- | --- | --- |',
     ...r.requirements.map(
-      (c, i) => `| ${i + 1} | ${c.title} (\`${c.id}\`) | ${MARK[c.verdict]} | ${c.detail.replace(/\|/g, '\\|')} |`,
+      (c, i) => `| ${i + 1} | ${c.title} (\`${c.id}\`) | ${requirementMark(c)} | ${c.detail.replace(/\|/g, '\\|')} |`,
     ),
     '',
   ]
