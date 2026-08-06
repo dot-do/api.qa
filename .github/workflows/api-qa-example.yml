@@ -61,10 +61,8 @@ jobs:
     name: Verify agent-first contract
     runs-on: ubuntu-latest
     env:
-      # TEMPORARY (reverted in the next commit): force the CONFIGURED path so CI
-      # proves build → suite → JUnit emit → publish actually works on a runner.
-      API_QA_TARGET: ${{ vars.API_QA_TARGET || 'https://apis.directory' }}
-      API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST || 'a0679c89153c90181ea3585c0ec3c7aa55a93b18aab8211a668bd117d366a68c' }}
+      API_QA_TARGET: ${{ vars.API_QA_TARGET }}
+      API_QA_SUITE_DIGEST: ${{ vars.API_QA_SUITE_DIGEST }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -102,10 +100,18 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-      # Guarded twice on purpose: `fail-on-empty` defaults to TRUE, and the file
-      # is absent both when the gate is unconfigured and when the suite step
-      # died before writing it. Publishing is reporting — it must never be the
-      # thing that reddens a check.
+      # Publishing is REPORTING — it must never be the thing that decides the
+      # colour of this check. The suite step above is the gate and already
+      # carries the verdict in its exit code. Three separate ways this step used
+      # to (or would) redden a run independently of that verdict, all closed:
+      #   - `fail-on-empty` defaults to TRUE: the file is absent whenever the
+      #     gate is unconfigured, or when the suite step died before writing it.
+      #     That produced `No test report files were found` on every run.
+      #   - `fail-on-error` defaults to TRUE: the action RE-JUDGES the report and
+      #     fails the step whenever a testcase failed — double-counting a verdict
+      #     the suite step has already delivered. Measured on run 31096622566.
+      #   - a missing file is now also gated on by `hashFiles`, so the action is
+      #     never handed a path that does not exist.
       - name: Publish JUnit test report
         if: always() && hashFiles('reports/api-qa.junit.xml') != ''
         uses: dorny/test-reporter@v1
@@ -114,6 +120,7 @@ jobs:
           path: reports/api-qa.junit.xml
           reporter: java-junit
           fail-on-empty: false
+          fail-on-error: false
 
       - name: Note when unconfigured
         if: env.API_QA_TARGET == ''
