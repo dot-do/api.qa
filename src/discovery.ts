@@ -9,6 +9,7 @@
  */
 
 import { Observer, isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
+import { GS1_RESOLVER_WELL_KNOWN_PATH } from './gs1-resolver.js'
 import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
 import type {
   ClaimedEndpoint,
@@ -146,6 +147,16 @@ export const ROLE = {
    * Same-origin SSRF-gated. Absent ⇒ the parity check SKIPs (no twin to diff).
    */
   uiStreamTwin: 'probe:ui-message-stream-twin',
+  // ── GS1 Digital Link resolver (OPTIONAL, target-DECLARED) ────────────────
+  /**
+   * GET of the GS1 resolver description file — `/.well-known/gs1resolver` by
+   * default (RFC 8615, fixed by the GS1 resolver standard), or the location
+   * the card names in `interfaces.digitalLink.wellKnown`. Same-origin
+   * SSRF-gated. Recorded ONLY when the card DECLARES the interface: a card
+   * that omits `interfaces.digitalLink` records nothing, spends no budget,
+   * and the digital-link-resolver check SKIPs.
+   */
+  gs1Resolver: 'surface:gs1resolver',
 } as const
 
 export function findEvidence(bundle: EvidenceBundle, role: string): Evidence | undefined {
@@ -276,6 +287,48 @@ export interface AgentsClaims {
    * the target exposes no UI-message-stream face and the ui-stream-* checks SKIP.
    */
   uiStream?: { url?: string; twin?: string }
+  /**
+   * The target-declared GS1 Digital Link resolver interface
+   * (`interfaces.digitalLink`) — an OPTIONAL third interface beside
+   * `interfaces.http` and `interfaces.mcp`. PRESENT ⇒ the card CLAIMS the
+   * surface is a Digital Link resolver and the digital-link-resolver check is
+   * ARMED; ABSENT ⇒ the field is undefined, the well-known is never fetched,
+   * and that check SKIPs. A card that simply omits the key is fully
+   * conforming — the interface is optional, and declaring it is what invites
+   * the verification.
+   */
+  digitalLink?: DigitalLinkClaim
+}
+
+/**
+ * A card's `interfaces.digitalLink` declaration, as parsed off the wire.
+ *
+ * `malformed` is the load-bearing distinction: the key being PRESENT but not
+ * a plain object (a string, `true`, `null`, an array) is a DEFECTIVE claim,
+ * never an absence. Collapsing it to "not declared" would let a card claim
+ * the face in a shape no verifier can check and still SKIP — so it is
+ * surfaced and FAILED. A card meaning "no Digital Link interface" omits the
+ * key.
+ */
+export interface DigitalLinkClaim {
+  /** The `interfaces.digitalLink` key was present on the card. Always true. */
+  declared: true
+  /** Present but not a plain JSON object — a defective declaration. */
+  malformed?: boolean
+  /** `typeof`-style name of the malformed value, for the failure message. */
+  malformedAs?: string
+  /** Well-known location exactly as the card wrote it (relative or absolute). */
+  wellKnownRaw?: string
+  /**
+   * Well-known location to fetch, absolutized against the target origin.
+   * Defaults to the RFC 8615 path the GS1 standard fixes. An ABSOLUTE
+   * off-origin value is preserved verbatim (never rewritten to the target)
+   * so the same-origin gate can DROP it and the check can FAIL the card for
+   * claiming another origin's resolver.
+   */
+  wellKnown: string
+  /** Card-declared `resolverRoot`, absolutized. Optional. */
+  resolverRoot?: string
 }
 
 export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
@@ -329,6 +382,37 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
       out.uiStream = {
         url: url !== undefined ? absolutize(url, origin) : undefined,
         twin: twin !== undefined ? absolutize(twin, origin) : undefined,
+      }
+    }
+  }
+
+  // GS1 Digital Link resolver face (OPTIONAL third interface):
+  // interfaces.digitalLink.{wellKnown,resolverRoot}. PRESENCE of the key is
+  // the whole declaration signal — `'digitalLink' in interfaces`, not
+  // truthiness — so a present-but-defective value is recorded as MALFORMED and
+  // failed, never silently treated as absent. Both urls are card-derived and
+  // therefore adversarial: absolutize (a relative "/.well-known/gs1resolver"
+  // resolves same-origin; an absolute foreign url is PRESERVED so the
+  // same-origin gate downstream drops it and the check fails the card for
+  // claiming another origin's resolver), exactly like interfaces.mcp.url.
+  if (Object.prototype.hasOwnProperty.call(interfaces, 'digitalLink')) {
+    const dl = interfaces.digitalLink
+    if (dl !== null && typeof dl === 'object' && !Array.isArray(dl)) {
+      const d = dl as Record<string, unknown>
+      const wellKnownRaw = str(d.wellKnown)
+      const resolverRoot = str(d.resolverRoot)
+      out.digitalLink = {
+        declared: true,
+        ...(wellKnownRaw !== undefined && { wellKnownRaw }),
+        wellKnown: absolutize(wellKnownRaw ?? GS1_RESOLVER_WELL_KNOWN_PATH, origin),
+        ...(resolverRoot !== undefined && { resolverRoot: absolutize(resolverRoot, origin) }),
+      }
+    } else {
+      out.digitalLink = {
+        declared: true,
+        malformed: true,
+        malformedAs: dl === null ? 'null' : Array.isArray(dl) ? 'array' : typeof dl,
+        wellKnown: absolutize(GS1_RESOLVER_WELL_KNOWN_PATH, origin),
       }
     }
   }
@@ -1162,6 +1246,37 @@ async function observeUiStream(origin: string, observer: Observer): Promise<void
   }
 }
 
+/**
+ * Observe the GS1 Digital Link resolver description file. TARGET-DECLARED and
+ * OPTIONAL: only when agents.json carries `interfaces.digitalLink` do we fetch
+ * anything — a card that omits the key records NOTHING, spends none of the
+ * politeness budget, and the digital-link-resolver check SKIPs. That is the
+ * whole reason the interface can be optional without weakening the verifier.
+ *
+ * A MALFORMED declaration (`interfaces.digitalLink` present but not an object)
+ * is not fetched either: there is no location to trust. The check still FAILS
+ * it from the card alone — the claim is defective, not absent.
+ *
+ * The well-known location is CARD-DERIVED adversarial input, so it goes
+ * through the SAME shared same-origin + publicly-routable gate as the openapi
+ * / offer / mcp.url / uiMessageStream probes. An off-origin or private
+ * declared location is DROPPED and never fetched; the check then fails the
+ * card explicitly for claiming another origin's resolver, reading the declared
+ * string out of the bundle's own agents.json evidence rather than needing the
+ * fetch to have happened.
+ */
+async function observeDigitalLink(origin: string, observer: Observer): Promise<void> {
+  const items = observer.items
+  const bundleView: EvidenceBundle = { target: origin, fetchedAt: '', seed: 0, items }
+  const agentsEv = findEvidence(bundleView, ROLE.agentsJson)
+  const agents = parseAgentsJson(parseJsonBody(agentsEv), origin)
+  const dl = agents.digitalLink
+  if (!dl) return // interface not declared — optional, nothing to verify
+  if (dl.malformed) return // defective declaration — judged from the card, never fetched
+  if (!isPubliclyRoutableSameOrigin(dl.wellKnown, origin)) return // off-origin/private — dropped, the check fails it
+  await observer.observe(ROLE.gs1Resolver, dl.wellKnown, { accept: 'application/json' })
+}
+
 export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   const rootAgentEv = await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
@@ -1436,6 +1551,15 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //     targets (no interface ⇒ no probe). Same SSRF posture as every other
   //     card-derived probe (see observeUiStream).
   await observeUiStream(origin, observer)
+
+  // 4e. GS1 Digital Link resolver (OPTIONAL, target-declared): when the card
+  //     declares `interfaces.digitalLink`, GET the resolver description file so
+  //     the digital-link-resolver judge can hold the claim to GS1's published
+  //     description-file schema. Zero-overhead and zero-budget for the common
+  //     case (no declaration ⇒ no probe). Ordered here, BEFORE the unbounded
+  //     contract-diff enumeration, so a fixed high-value probe is never starved
+  //     by an endpoint-rich target — the same priority rule as 4b/4c/4d.
+  await observeDigitalLink(origin, observer)
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless

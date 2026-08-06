@@ -35,6 +35,13 @@ import {
 } from './discovery.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
+import {
+  GS1_DESCRIPTION_FILE_SCHEMA_SOURCE,
+  GS1_RESOLVER_WELL_KNOWN_PATH,
+  urlOriginOrUndefined,
+  renderGs1Violations,
+  validateGs1DescriptionFile,
+} from './gs1-resolver.js'
 import { contractDiff } from './contract.js'
 import type { CheckResult, Evidence, EvidenceBundle, MiniSchema, Verdict } from './types.js'
 
@@ -741,6 +748,132 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     checks.push(check('ui-stream-parity',
       "tool-output-available `output` is byte/JSON-consistent with the JSON twin (no divergence)", undefined,
       streamEvidence, judgeUiStreamParity(us)))
+  }
+
+  // ── GS1 Digital Link resolver — an OPTIONAL, card-DECLARED interface ──────
+  //    The GS1 resolver standard fixes a discovery indicator: a conformant
+  //    resolver SHALL serve a Resolver Description File at the RFC 8615
+  //    well-known `/.well-known/gs1resolver`, and "the presence or absence of
+  //    this file can be used to determine whether or not the URI points to a
+  //    service conformant to this standard".
+  //
+  //    DECLARATION-ARMED, exactly like the uiMessageStream face: the card
+  //    naming `interfaces.digitalLink` is the whole gate. A card that OMITS
+  //    the key SKIPs — no fetch, no budget, no verdict, and nothing that was
+  //    conforming yesterday starts failing. A card that DECLARES it is judged
+  //    STRICTLY, because a machine-readable claim a verifier will believe is
+  //    worse than a prose one: the well-known must be same-origin, answer 2xx
+  //    with JSON, and validate against GS1's PUBLISHED description-file schema
+  //    (vendored + digest-pinned in gs1-resolver.ts — never fetched at
+  //    verification time, which would put a third party inside the determinism
+  //    contract).
+  //
+  //    SCOPE, stated so the verdict is not read as more than it is: this check
+  //    verifies the DISCOVERY INDICATOR, not resolution behaviour. RFC 9264
+  //    linkset responses (`Accept: application/linkset+json` / `linkType=
+  //    linkset`), redirect semantics and Accept-Language are NOT covered here.
+  //    axItem is undefined — this is an additive readiness dimension and it
+  //    moves no AX point.
+  {
+    const dl = agents.digitalLink
+    const dlEvidence = [ROLE.agentsJson, ROLE.gs1Resolver]
+    const problems: string[] = []
+    let result: { verdict: Verdict; detail: string } | undefined
+    if (!dl) {
+      result = {
+        verdict: 'skip',
+        detail:
+          'no Digital Link interface declared (agents.json `interfaces.digitalLink` absent) — the interface is OPTIONAL and this card does not claim it, so nothing was fetched and nothing is judged; under a pinned must:pass this fails closed',
+      }
+    } else if (dl.malformed) {
+      result = {
+        verdict: 'fail',
+        detail:
+          `interfaces.digitalLink is present but is not a JSON object (got ${dl.malformedAs}) — the card claims a Digital Link resolver face in a shape no verifier can check. ` +
+          'Declare an object (optionally `{ "wellKnown": …, "resolverRoot": … }`), or OMIT the key entirely to declare no Digital Link interface — omitting it is fully conforming.',
+      }
+    } else {
+      const origin = bundle.target
+      const declaredOrigin = urlOriginOrUndefined(dl.wellKnown)
+      if (declaredOrigin === undefined) {
+        problems.push(
+          `card declares interfaces.digitalLink.wellKnown = ${JSON.stringify(dl.wellKnownRaw ?? dl.wellKnown)}, which does not resolve to a URL — refused without fetching`,
+        )
+      } else if (declaredOrigin !== origin) {
+        problems.push(
+          `card declares its Digital Link well-known at ${dl.wellKnown} (origin ${declaredOrigin}), which is NOT the target origin ${origin} — a card must not claim another origin's resolver; api.qa refused to fetch it`,
+        )
+      } else if (!isPubliclyRoutableSameOrigin(dl.wellKnown, origin)) {
+        problems.push(
+          `card declares its Digital Link well-known at ${dl.wellKnown}, which is not a publicly-routable target for ${origin} — refused without fetching (SSRF guard)`,
+        )
+      } else {
+        const ev = findEvidence(bundle, ROLE.gs1Resolver)
+        if (!ok(ev)) {
+          problems.push(
+            `GET ${dl.wellKnown} did not answer 2xx — ${!ev ? 'not fetched' : ev.status === null ? `fetch failed (${ev.error ?? 'unknown'})` : `status ${ev.status}`}. ` +
+              `The card DECLARES a Digital Link interface, so the GS1 resolver description file (RFC 8615 ${GS1_RESOLVER_WELL_KNOWN_PATH}) must be served`,
+          )
+        } else {
+          const ct = (ev!.contentType ?? '').toLowerCase()
+          if (!ct.includes('json')) {
+            problems.push(
+              `${dl.wellKnown} answered ${ev!.status} with content-type ${JSON.stringify(ev!.contentType ?? '(none)')} — the resolver description file is a JSON document and must be served with a JSON media type`,
+            )
+          }
+          const doc = parseJsonBody(ev)
+          if (doc === undefined) {
+            problems.push(`${dl.wellKnown} answered ${ev!.status} but its body did not parse as JSON`)
+          } else {
+            const violations = validateGs1DescriptionFile(doc)
+            if (violations.length > 0) {
+              problems.push(
+                `description file fails GS1's published description-file schema (${GS1_DESCRIPTION_FILE_SCHEMA_SOURCE.$id}) — ${renderGs1Violations(violations)}`,
+              )
+            } else {
+              // Schema-valid ⇒ resolverRoot is a present string. Two SEMANTIC
+              // rules beyond the schema, named as such: the served document
+              // must name the origin it was actually reached on (one Snippet
+              // on N hostnames still answers with the reached host), and the
+              // card's own resolverRoot, if it declares one, must agree.
+              const rr = (doc as Record<string, unknown>).resolverRoot as string
+              const rrOrigin = urlOriginOrUndefined(rr)
+              if (rrOrigin === undefined) {
+                problems.push(
+                  `resolverRoot ${JSON.stringify(rr)} is not an absolute URL — GS1 annotates it \`format: "uri"\`, which draft-07 leaves unenforced, but a resolverRoot naming no origin cannot be reconciled with the origin that served it`,
+                )
+              } else if (rrOrigin !== origin) {
+                problems.push(
+                  `resolverRoot names origin ${rrOrigin} but the description file was served from ${origin} — a resolver must name the host the caller actually reached`,
+                )
+              }
+              if (dl.resolverRoot !== undefined && trimTrailingSlash(dl.resolverRoot) !== trimTrailingSlash(rr)) {
+                problems.push(
+                  `card declares interfaces.digitalLink.resolverRoot ${JSON.stringify(dl.resolverRoot)} but the description file declares ${JSON.stringify(rr)} — the two claims disagree`,
+                )
+              }
+              if (problems.length === 0) {
+                const keys = (doc as Record<string, unknown>).supportedPrimaryKeys as string[]
+                result = pass(
+                  `interfaces.digitalLink declared; ${dl.wellKnown} → ${ev!.status} ${ev!.contentType}, valid against GS1's published description-file schema ` +
+                    `(${GS1_DESCRIPTION_FILE_SCHEMA_SOURCE.$id}, vendored at sha256:${GS1_DESCRIPTION_FILE_SCHEMA_SOURCE.sha256.slice(0, 12)}… fetched ${GS1_DESCRIPTION_FILE_SCHEMA_SOURCE.fetchedAt}, never fetched at verification time); ` +
+                    `resolverRoot ${rr} names the serving origin; supportedPrimaryKeys ${JSON.stringify(keys)}. ` +
+                    'NOT enforced: draft-07 `format: "uri"` (annotation-only) and `contact.hasTelephone` (misplaced in GS1\'s own schema). ' +
+                    'NOT covered: RFC 9264 linkset responses, redirect semantics — this check verifies the discovery indicator, not resolution behaviour.',
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+    checks.push(check('digital-link-resolver',
+      'a DECLARED Digital Link interface serves a schema-valid GS1 resolver description file at its well-known', undefined,
+      dlEvidence,
+      result ?? {
+        verdict: 'fail',
+        detail: problems.slice(0, 6).join('; ') || 'the declared Digital Link interface could not be verified',
+      }))
   }
 
   // ── AXP structural checks (Clause 3 conneg + Clause 6 cross-linking) ──────
@@ -3094,6 +3227,15 @@ function judgeUiStreamParity(us: UiStreamContext): { verdict: Verdict; detail: s
 
 function looksLikeHtml(body: string): boolean {
   return /^\s*(<!doctype html|<html|<head|<body)/i.test(body) || /<html[\s>]/i.test(body.slice(0, 1024))
+}
+
+/**
+ * Drop a single trailing slash so `https://x.example/` and `https://x.example`
+ * compare equal. Used only to reconcile two DECLARED resolverRoot strings —
+ * a trailing slash is not a disagreement worth failing a card over.
+ */
+function trimTrailingSlash(url: string): string {
+  return url.endsWith('/') ? url.slice(0, -1) : url
 }
 
 function pass(detail: string): { verdict: Verdict; detail: string } {
