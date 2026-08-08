@@ -40,7 +40,64 @@ export {
   parseAgentsJson,
   parseOpenapi,
   ROLE,
+  type ObserveTargetOpts,
+  type TestSuiteClaim,
 } from './discovery.js'
+// ── The `api.qa/vitest@1` executable dialect (AXP A.8.6) ────────────────────
+// The SHARED subset harness + the runner seam are public: the CLI's local
+// verb, a property's own CI, and the hosted verifier all run the ONE
+// implementation (A.8.6.2's normative parity), and adopters need the gates
+// and caps to publish artifacts that will verify.
+export {
+  VITEST_RUNNER,
+  EXEC_WALL_MS,
+  EXEC_CPU_MS,
+  EXEC_MAX_COMBINED,
+  EXEC_MAX_DOC_BYTES,
+  EXEC_MAX_MODULE_BYTES,
+  EXEC_MAX_OUTPUT_BYTES,
+  isFloorBlockedHost,
+  createGatedFetch,
+  validateDialectSource,
+  localExecRunner,
+  loadHarnessModule,
+  foldRunOutcome,
+  type ExecRunRequest,
+  type ExecRunOutcome,
+  type ExecRunIo,
+  type ExecSuiteRunner,
+  type ExecTestResult,
+  type GateViolation,
+} from './exec/dialect.js'
+export {
+  workerLoaderExecRunner,
+  unavailableExecRunner,
+  buildWorkerCode,
+  entrySource,
+  gatewayFetch,
+  createOutboundGateway,
+  HARNESS_VERSION,
+  EXEC_COMPATIBILITY_DATE,
+  GATEWAY_MARKER_HEADER,
+  GATEWAY_RECORD_UNREADABLE,
+  RUNNER_UNAVAILABLE_NO_BINDING,
+  RUNNER_UNAVAILABLE_NO_OUTBOUND,
+  type OutboundGatewayLike,
+  type WorkerLoaderLike,
+  type WorkerCodeLike,
+} from './exec/runner.js'
+export { VITEST_SUBSET_SOURCE } from './exec/vitest-subset-source.js'
+export {
+  gateVitestSuiteCard,
+  gateVitestSuiteDocument,
+  gateVitestModuleArtifact,
+  NATIVE_SERVING_BASE,
+  type VitestCardGate,
+  type VitestDocumentGate,
+  type VitestModuleGate,
+} from './test-suite.js'
+export { parseExecSuiteDocument } from './suite-doc.js'
+export { AXP_PINNED_SPEC } from './pinned.js'
 export { runChecks } from './checks.js'
 export { contractDiff, enumerateOperations } from './contract.js'
 export { axScoreOf, gradeOf } from './grade.js'

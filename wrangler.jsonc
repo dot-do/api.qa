@@ -53,6 +53,32 @@
     { "binding": "REPORTS", "id": "90eb42161ef045eb8b38b01cf87f985a" }
   ],
 
+  // ── api.qa/vitest@1 executable-suite runner (AXP A.8.6) — FLAG-HELD ──────
+  // The Dynamic Worker Loader binding is an OPEN-BETA, PAID-PLAN capability:
+  // enabling it on an unenrolled account breaks `wrangler deploy`, so the
+  // binding ships DOCUMENTED-BUT-DISABLED and the code feature-detects
+  // `env.SUITE_LOADER` (absent ⇒ a card declaring runner "api.qa/vitest@1"
+  // fails with a typed `runner-unavailable` reason — never a crash, never a
+  // silent pass; see src/exec/runner.ts). To provision, on an enrolled
+  // account, uncomment BOTH pieces:
+  //
+  //   "worker_loaders": [ { "binding": "SUITE_LOADER" } ],
+  //   // SUITE_OUTBOUND — the egress gateway (its fetch handler wraps
+  //   // `createOutboundGateway` from src/exec/runner.ts: the A.8.6.3 network
+  //   // floor, re-checked per redirect hop, PLUS the out-of-band
+  //   // `drainViolations` record the runner folds into the verdict so a
+  //   // caught refusal still fails the run). REQUIRED: without it the runner
+  //   // REFUSES to execute rather than let an isolate inherit this worker's
+  //   // own network access. Prefer a same-isolate loopback entrypoint
+  //   // (`ctx.exports.SuiteGateway`) over a separate worker, so
+  //   // `drainViolations` is actually drainable by the runner:
+  //   "services": [ { "binding": "SUITE_OUTBOUND", "service": "api-qa", "entrypoint": "SuiteGateway" } ],
+  //
+  // Isolate posture (enforced in src/exec/runner.ts, pinned by unit tests):
+  // env is ALWAYS {} (zero ambient authority — no SIGNING_KEY, no KV, no DOs,
+  // no loader recursion), globalOutbound is ALWAYS set, limits.cpuMs 60 000,
+  // parent-side wall breaker 300 000 ms — metered, billed, account-raisable.
+
   // Per-domain politeness Durable Object — one instance per domain
   // (idFromName(host)) enforces a global inter-probe interval across isolates,
   // so a fleet cannot probe-cannon a third party by fanning across the edge.

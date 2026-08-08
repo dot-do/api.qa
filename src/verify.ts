@@ -7,6 +7,7 @@
 
 import { Observer, normalizeTarget, type ObserverOpts } from './http.js'
 import { observeTarget, deriveDiscovery } from './discovery.js'
+import type { ExecSuiteRunner } from './exec/dialect.js'
 import { runChecks } from './checks.js'
 import { axScoreOf, gradeOf } from './grade.js'
 import { attestReport } from './attest.js'
@@ -48,6 +49,14 @@ export interface VerifyTargetOpts extends ObserverOpts {
   /** Held-out signing key. Only honored in remote mode. */
   signingKeys?: CryptoKeyPair
   allowPrivateTargets?: boolean
+  /**
+   * The `api.qa/vitest@1` execution seam (A.8.6). Deployed Worker: the Worker
+   * Loader runner, when provisioned. CLI: the shared-harness local runner.
+   * Absent: the typed `runner-unavailable` runner — a card declaring the
+   * executable dialect fails with the reason named, never a crash or a
+   * silent pass.
+   */
+  execRunner?: ExecSuiteRunner
 }
 
 export async function verifyTarget(target: string, opts: VerifyTargetOpts = {}): Promise<VerificationReport> {
@@ -61,7 +70,7 @@ export async function verifyTarget(target: string, opts: VerifyTargetOpts = {}):
   // fetched at a private address (the structural SSRF backstop). Same signal
   // normalizeTarget used above — the deployed Worker leaves it false.
   const observer = new Observer({ ...opts, allowPrivate })
-  const bundle = await observeTarget(normalized.origin, observer, seed)
+  const bundle = await observeTarget(normalized.origin, observer, seed, { execRunner: opts.execRunner })
   const discovery = await deriveDiscovery(bundle)
   const checks = runChecks(bundle)
   const axScore = axScoreOf(checks)

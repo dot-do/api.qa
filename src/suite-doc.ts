@@ -349,7 +349,13 @@ export function parseSuite(text: string): Suite {
   if (doc.$type !== 'Suite' || !Array.isArray(doc.requirements)) {
     throw new Error('not a Suite: expected {"$type":"Suite","environments":{...},"requirements":[...]}')
   }
-  const envs = doc.environments as unknown
+  validateEnvironments(doc.environments as unknown)
+  validateRequirements(doc.requirements)
+  return doc
+}
+
+/** The shared environments-map shape check — `parseSuite` and the vitest@1 parse agree by construction. */
+function validateEnvironments(envs: unknown): void {
   if (envs === null || typeof envs !== 'object' || Array.isArray(envs)) {
     throw new Error('Suite.environments must be an object mapping env name -> { vars: { <k>: <v> } }')
   }
@@ -359,7 +365,66 @@ export function parseSuite(text: string): Suite {
         vars === null || typeof vars !== 'object' || Array.isArray(vars)) {
       throw new Error(`Suite environment "${name}" must be an object of the form { "vars": { <k>: <v> } }`)
     }
+    const sandbox = (env as { sandbox?: unknown }).sandbox
+    if (sandbox !== undefined && typeof sandbox !== 'boolean') {
+      throw new Error(
+        `Suite environment "${name}" declares "sandbox": ${JSON.stringify(sandbox)} — the A.8.6.4 write-consent ` +
+          'flag must be a boolean. Consent is a pinned statement, not a truthy value.',
+      )
+    }
   }
-  validateRequirements(doc.requirements)
-  return doc
+}
+
+/**
+ * Parse + validate an `api.qa/vitest@1` SUITE DOCUMENT — the A.8.6.1
+ * ADDITIVE extension of the suite@1 grammar (the mdxld house pattern: code as
+ * string members of the same JSON-serializable, digest-pinned document).
+ *
+ * Same `$type: "Suite"` envelope, same `environments` map (plus the boolean
+ * `sandbox` consent flag), same `requirements` grammar where rows are present
+ * — extended by two root members:
+ *
+ *   `tests`  (REQUIRED) — ES module source in the A.8.6.2 subset. Absent,
+ *            empty, or not a string throws.
+ *   `module` (optional) — ES module source instantiated first; its exports
+ *            are importable by `tests` as `"suite:module"`.
+ *
+ * `requirements` MAY be absent or empty here (unlike suite@1): non-vacuity is
+ * judged over the UNION — at least one declarative row or one REGISTERED test
+ * — and registration counts exist only after the run, so the runner enforces
+ * it (foldRunOutcome), not this parse. Rows that ARE present get the full
+ * suite@1 guard set (`validateRequirements`), unchanged — the extension forks
+ * nothing.
+ */
+export function parseExecSuiteDocument(text: string): Suite {
+  const doc = JSON.parse(text) as Suite
+  if (doc.$type !== 'Suite') {
+    throw new Error(
+      'not a Suite: an api.qa/vitest@1 document is an ADDITIVE extension of the suite@1 grammar — expected ' +
+        '{"$type":"Suite","environments":{...},"tests":"<es module source>", ...}',
+    )
+  }
+  validateEnvironments(doc.environments as unknown)
+  const tests = (doc as { tests?: unknown }).tests
+  if (typeof tests !== 'string' || tests.length === 0) {
+    throw new Error(
+      'an api.qa/vitest@1 suite document MUST carry a non-empty string root member `tests` (ES module source ' +
+        'in the A.8.6.2 subset) — absent, empty, or non-string fails (A.8.6.1)',
+    )
+  }
+  const module = (doc as { module?: unknown }).module
+  if (module !== undefined && (typeof module !== 'string' || module.length === 0)) {
+    throw new Error(
+      'the api.qa/vitest@1 `module` root member, when present, must be a non-empty string of ES module source (A.8.6.1)',
+    )
+  }
+  const requirements = (doc as { requirements?: unknown }).requirements
+  if (requirements !== undefined && !Array.isArray(requirements)) {
+    throw new Error('Suite.requirements, when present, must be an array of requirement rows')
+  }
+  const rows = (requirements ?? []) as Suite['requirements']
+  // Rows keep the UNCHANGED suite@1 guard set; an empty list is legal here
+  // because the tests member can carry the whole non-vacuity burden.
+  if (rows.length > 0) validateRequirements(rows)
+  return { ...doc, requirements: rows }
 }

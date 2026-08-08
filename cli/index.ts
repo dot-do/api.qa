@@ -57,7 +57,9 @@ import {
 import { verifyAttestation } from '../src/attest.js'
 import { sha256Hex } from '../src/digest.js'
 import { runMcpServer } from '../src/mcp.js'
-import type { VerificationReport } from '../src/types.js'
+import { localExecRunner, type ExecRunOutcome } from '../src/exec/dialect.js'
+import { parseExecSuiteDocument } from '../src/suite-doc.js'
+import type { Suite, VerificationReport } from '../src/types.js'
 
 interface Flags {
   /** Last value wins (single-valued reads). */
@@ -244,6 +246,121 @@ async function main(): Promise<number> {
       delayMs: targetFlag && isLocalTarget(targetFlag) ? 0 : 150,
     })
     return emit(report, suiteMarkdown(report), flags)
+  }
+
+  if (cmd === 'vitest') {
+    // vitest <suite.json|module.mjs> — run an `api.qa/vitest@1` artifact
+    // LOCALLY through the SAME shared subset harness the hosted verifier
+    // executes (AXP A.8.6.2 parity is by construction: one module, byte-
+    // identical, never a reimplementation). Local runs are ADVISORY (never
+    // attested); the definition of done is the SAME digest passing hosted.
+    //
+    //   npx autonomous-qa vitest suite.json --target https://api.example
+    //       [--env <name>] [--expect-digest sha256:<64hex>] [--seed <n>] [--json]
+    //   npx autonomous-qa vitest dist/index.mjs --target https://api.example
+    //       [--export suite] [--expect-digest sha256:<64hex>]
+    //
+    // Artifact KIND follows the card rule (A.8.5): a path ending `.mjs` (or
+    // `--module`) is a module artifact; anything else is a suite document.
+    // The digest gate is FAIL-CLOSED: with --expect-digest, bytes that do not
+    // hash to the pin never instantiate.
+    const file = rest[0]
+    if (!file) return die('vitest needs an artifact: a suite document (.json) or a module (.mjs)')
+    const text = readFileSync(file, 'utf8')
+    const digest = `sha256:${await sha256Hex(text)}`
+    const expect = flags.get('expect-digest')
+    if (expect !== undefined && expect !== digest) {
+      console.error(
+        `autonomous-qa: vitest artifact digest mismatch: expected ${expect}, ${file} hashes to ${digest}. ` +
+          'NOTHING was instantiated (digest fail-closed, A.8.6.3).',
+      )
+      return 1
+    }
+    const isModule = flags.has('module') || /\.mjs$/i.test(file)
+    const envName = flags.get('env') ?? 'public'
+
+    let doc: Suite | undefined
+    if (!isModule) {
+      try {
+        doc = parseExecSuiteDocument(text)
+      } catch (err) {
+        console.error(`autonomous-qa: ${err instanceof Error ? err.message : String(err)}`)
+        return 1
+      }
+      if (!Object.hasOwn(doc.environments, envName)) {
+        return die(
+          `vitest: environment "${envName}" is not defined by the suite (it defines ${Object.keys(doc.environments).join(', ') || 'none'})`,
+        )
+      }
+    } else if (flags.has('env') && envName !== 'public') {
+      return die('vitest: a module artifact defines no environments — only the implicit "public" exists (A.8.6.4)')
+    }
+    const env = doc?.environments[envName]
+    const vars = { ...(env?.vars ?? {}) }
+    const target = flags.get('target') ?? (typeof vars.baseUrl === 'string' ? (vars.baseUrl as string) : undefined)
+    if (!target) return die('vitest needs a target: --target <origin> (or a string `baseUrl` var in the selected environment)')
+    const runSeed = seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0)
+
+    const outcome: ExecRunOutcome = await localExecRunner().run({
+      artifactKind: isModule ? 'module' : 'document',
+      testsSource: isModule ? text : doc!.tests!,
+      ...(doc?.module !== undefined && { moduleSource: doc.module }),
+      ...(flags.has('export') && { exportName: flags.get('export') }),
+      origin: new URL(/^https?:\/\//.test(target) ? target : `https://${target}`).origin,
+      vars,
+      environment: envName,
+      sandbox: env?.sandbox === true,
+      seed: runSeed,
+      declarativeRows: doc?.requirements.length ?? 0,
+      digest,
+    })
+
+    // Declarative rows (document form) keep unchanged suite@1 engine
+    // semantics — run them through the SAME verifySuite door the `suite` verb
+    // uses, folded into one exit code (A.8.6.5's one result set).
+    let rowsPassed = true
+    let rowLines: string[] = []
+    if (doc !== undefined && doc.requirements.length > 0) {
+      const rowSuite = JSON.stringify({
+        $type: 'Suite',
+        name: doc.name,
+        version: doc.version,
+        environments: doc.environments,
+        requirements: doc.requirements,
+      })
+      const rowReport = await verifySuite(rowSuite, envName, {
+        mode: 'local',
+        seed: runSeed,
+        target,
+        delayMs: isLocalTarget(target) ? 0 : 150,
+      })
+      rowsPassed = rowReport.passed
+      rowLines = rowReport.requirements.map(
+        (r) => `  ${r.verdict === 'pass' ? 'PASS' : 'FAIL'} row ${r.id}${r.verdict === 'pass' ? '' : ` — ${r.detail}`}`,
+      )
+    }
+
+    if (flags.get('json') === 'true') {
+      console.log(JSON.stringify({ runner: 'api.qa/vitest@1', digest, seed: runSeed, environment: envName, outcome, rowsPassed }, null, 2))
+    } else {
+      console.log(`# api.qa/vitest@1 — local run (advisory, never attested)`)
+      console.log(`artifact ${file} (${isModule ? 'module' : 'document'}), digest ${digest}`)
+      console.log(`target ${target}, environment "${envName}"${env?.sandbox === true ? ' (sandbox)' : ''}, seed ${runSeed}`)
+      for (const line of rowLines) console.log(line)
+      if (outcome.status === 'ran') {
+        for (const r of outcome.results) {
+          console.log(`  ${r.status === 'pass' ? 'PASS' : 'FAIL'} ${r.name} (${r.durationMs} ms)${r.reason ? ` — ${r.reason}` : ''}`)
+        }
+        console.log(
+          `${outcome.results.filter((r) => r.status === 'pass').length}/${outcome.registered} tests passed ` +
+            `(${outcome.elapsedWallMs} ms wall, limits ${outcome.appliedLimits.wallMs} ms wall / ${outcome.appliedLimits.cpuMs} ms CPU)`,
+        )
+      } else {
+        console.log(`RUN ${outcome.status.toUpperCase()}: ${outcome.reason}`)
+      }
+    }
+    const testsPassed = outcome.status === 'ran' && outcome.results.every((r) => r.status === 'pass')
+    return testsPassed && rowsPassed ? 0 : 1
   }
 
   if (cmd === 'contract-diff') {
@@ -464,6 +581,10 @@ function usage(): string {
       [--iteration-data <dataset.csv|.json>]          run once per dataset row (data-driven)
       [--target <target>] [--expect-digest <sha256>] [--seed <n>]
       (target defaults to the selected environment's baseUrl var)
+  npx autonomous-qa vitest <suite.json|module.mjs>    run an api.qa/vitest@1 executable suite LOCALLY
+      --target <origin> [--env <name>] [--export <n>] through the SAME shared subset harness the hosted
+      [--expect-digest <sha256:…>] [--seed <n>]       verifier executes (local==hosted by construction);
+      [--module] [--json]                             EXITS NON-ZERO iff any test or row fails
   npx autonomous-qa contract-diff <spec> <target>    did this deploy break the published contract?
       [--json] [--reporter ...] [--seed <n>]          EXITS NON-ZERO on any breaking operation diff
       (spec is the published OpenAPI file; target is fetched live, SSRF-gated)

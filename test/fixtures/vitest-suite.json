@@ -1,0 +1,8 @@
+{
+  "$type": "Suite",
+  "name": "fixture executable suite",
+  "version": "1.0.0",
+  "environments": { "public": { "vars": { "expected": 42 } } },
+  "module": "export const answer = () => 6 * 7\n",
+  "tests": "import { describe, it, expect } from 'vitest'\nimport { vars, seed } from 'suite:env'\nimport { answer } from 'suite:module'\n\ndescribe('a self-contained api.qa/vitest@1 fixture', () => {\n  it('runs the subset with no network at all', () => {\n    expect(answer()).toBe(vars.expected)\n    expect(typeof seed).toBe('number')\n  })\n  it('exercises core matchers, .not, and async', async () => {\n    expect([1, 2, 3]).toHaveLength(3)\n    expect({ a: { b: 1 } }).toMatchObject({ a: { b: 1 } })\n    expect(7).not.toBe(8)\n    await expect(Promise.resolve('ok')).resolves.toBe('ok')\n  })\n})\n"
+}
