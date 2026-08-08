@@ -111,7 +111,32 @@ export interface VerifyPinnedOpts extends ObserverOpts {
    * into BOTH the observe scope and the judge scope so the two agree.
    */
   initialBindings?: Record<string, unknown>
+  /** The `api.qa/vitest@1` execution seam — see VerifyTargetOpts.execRunner. */
+  execRunner?: import('./exec/dialect.js').ExecSuiteRunner
 }
+
+/**
+ * THE RATIFIED ADMISSION CONTRACT — `apis-ax-axp@2.4.0`.
+ *
+ * The coordinated 2.3.0 → 2.4.0 bump (AXP 0.7.0, 2026-08-08): 22 → 23
+ * requirements, retiring digest 9063cb3e… . The ONE added row is
+ * `check-published-test-suite` (kind: check, must: pass,
+ * appliesWhen: { cardDeclares: "interfaces.testSuite" }) — declaration-armed,
+ * so a card that omits the interface gains one not-applicable result and no
+ * new way to fail, and a card that declares a suite and does not keep it
+ * loses admission. The same release ratifies the executable dialect
+ * `api.qa/vitest@1` (Appendix A.8.6) this verifier implements in src/exec/.
+ *
+ * The digest is sha256 over the exact bytes of the spec's
+ * `apis-ax-standard.spec.json` (axp.org.ai `spec/conformance/`), and it is
+ * the ONLY authority: a run pinned to this contract supplies the spec TEXT
+ * plus this digest, and a text that does not hash to it never runs.
+ */
+export const AXP_PINNED_SPEC = {
+  name: 'apis-ax-axp',
+  version: '2.4.0',
+  digest: 'dd3e59417e2acacd0946e14c845c2e156a437ef55724ff06a52c053885e321bf',
+} as const
 
 export function parsePinnedSpec(text: string): PinnedSpec {
   const doc = JSON.parse(text) as PinnedSpec
@@ -168,7 +193,7 @@ export async function verifyPinnedSpec(
     // compliant target.
     budget: opts.budget ?? 64,
   })
-  const bundle = await observeTarget(origin, observer, seed)
+  const bundle = await observeTarget(origin, observer, seed, { execRunner: opts.execRunner })
 
   // Extra observations demanded by the spec's endpoint requirements.
   //

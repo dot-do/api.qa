@@ -68,13 +68,22 @@
 
 import { isPubliclyRoutableSameOrigin } from './http.js'
 import { sha256HexSync } from './sha256-sync.js'
-import { parseSuite } from './suite-doc.js'
+import { parseSuite, parseExecSuiteDocument } from './suite-doc.js'
+import {
+  EXEC_MAX_DOC_BYTES,
+  EXEC_MAX_MODULE_BYTES,
+  VITEST_RUNNER,
+  isFloorBlockedHost,
+} from './exec/dialect.js'
 import type { EndpointReq } from './expect.js'
 import type { Suite } from './types.js'
 import type { TestSuiteClaim } from './discovery.js'
 
-/** The only suite dialect this verifier implements. */
+/** The declarative suite dialect. */
 export const SUITE_RUNNER = 'api.qa/suite@1'
+
+/** The executable dialect (A.8.6) — re-exported so callers dispatch on one constant. */
+export { VITEST_RUNNER }
 
 /**
  * Hard cap on requirements in a CARD-DECLARED suite. Deliberately far below the
@@ -128,13 +137,30 @@ export function gateTestSuiteCard(claim: TestSuiteClaim, origin: string): CardGa
   // The runner is a DIALECT, not a hint. An unknown one FAILS rather than
   // skipping: a card that claims a suite api.qa cannot interpret has made a
   // claim that cannot be verified, which is a defective claim, not an absence.
+  // (The executable dialect never reaches this gate — callers dispatch
+  // `runner: "api.qa/vitest@1"` to `gateVitestSuiteCard` first.)
   if (claim.runner !== SUITE_RUNNER) {
     return {
       ok: false,
       problem:
-        `interfaces.testSuite declares runner ${JSON.stringify(claim.runner)}, which api.qa does not implement — the only defined ` +
-        `suite dialect is ${JSON.stringify(SUITE_RUNNER)} (a digest-pinned api.qa Suite document). This is a FAILURE, not a skip: ` +
+        `interfaces.testSuite declares runner ${JSON.stringify(claim.runner)}, which api.qa does not implement — the defined ` +
+        `suite dialects are ${JSON.stringify(SUITE_RUNNER)} (declarative, interpreted) and ${JSON.stringify(VITEST_RUNNER)} ` +
+        '(executable, A.8.6). This is a FAILURE, not a skip: ' +
         'the card claims a suite this verifier cannot interpret. Omit the key to declare no test suite.',
+    }
+  }
+  // The npm identity assertion belongs to the executable dialect (A.8.6.6):
+  // under a declarative runner it asserts provenance about bytes that are
+  // never instantiated as a module, which is a claim in a shape this dialect
+  // cannot carry — refused, per A.8.5.2 ("a `package` under a declarative
+  // runner MUST fail").
+  if (claim.packageName !== undefined) {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite declares package ${JSON.stringify(claim.packageName)} under the declarative runner ` +
+        `${JSON.stringify(SUITE_RUNNER)} — the npm identity assertion is meaningful only under ${JSON.stringify(VITEST_RUNNER)}. ` +
+        'A defective declaration fails; omit the key to declare no test suite.',
     }
   }
   // The pin is REQUIRED — see judgeTestSuiteDocument for why a suite needs one
@@ -319,4 +345,349 @@ function urlOriginOrUndefined(url: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+// ---------------------------------------------------------------------------
+// The EXECUTABLE dialect gates — `api.qa/vitest@1` (A.8.5 seam + A.8.6)
+// ---------------------------------------------------------------------------
+
+/** Exact published semver — never a range (A.8.5: `version` conditional rule). */
+const EXACT_SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+
+/** An npm package name (scoped or unscoped). */
+const NPM_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/
+
+/** A JS identifier — the only legal `export` member shape. */
+const EXPORT_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/
+
+/** The reference module CDN the native-serving obligation (A.8.6.6) derives url-less coordinates from. */
+export const NATIVE_SERVING_BASE = 'https://pkg.do'
+
+export type VitestCardGate =
+  | {
+      ok: true
+      /** The resolved artifact address (declared url, or derived from the coordinate). */
+      url: string
+      digest: string
+      /** Discriminated by the CARD: `package` present or pathname ends `.mjs` ⇒ module. */
+      kind: 'document' | 'module'
+      environment: string
+      exportName?: string
+      /** The npm identity assertion — RECORDED in the verdict, never adjudicated. */
+      npm?: { package: string; version: string }
+    }
+  | { ok: false; problem: string }
+
+/**
+ * GATE 1 for the executable dialect — decided from the CARD ALONE, before
+ * anything is fetched. The A.8.5 seam:
+ *
+ *   { url?, package?, version?, export?, digest, environment?, runner }
+ *
+ * - at least one of `url` / `package`; `package` requires an EXACT `version`;
+ * - `digest` required, `"sha256:" + 64 lowhex`, the SOLE byte authority;
+ * - the address MAY be off-origin (a versioned module-CDN URL is the SDK
+ *   norm — the digest, never the host, is the provenance); a non-routable or
+ *   floor-blocked address is refused WITHOUT being fetched;
+ * - url-less coordinates resolve via the A.8.6.6 native-serving scheme
+ *   (`https://pkg.do/<package>@<version>/index.mjs`);
+ * - artifact KIND is decided BY THE CARD (package present or pathname ends
+ *   `.mjs` ⇒ module), never by sniffing bytes;
+ * - `export` is an identifier and module-kind-only; a module artifact defines
+ *   no environments, so only the implicit `"public"` selects there.
+ */
+export function gateVitestSuiteCard(claim: TestSuiteClaim, _origin: string): VitestCardGate {
+  if (claim.malformed) {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite is present but is not a JSON object (got ${claim.malformedAs}) — the card claims a published test suite ` +
+        'in a shape no verifier can check. Declare an object, or OMIT the key entirely — omitting it is fully conforming.',
+    }
+  }
+  // The pin, before anything else: the digest is the SOLE byte authority in
+  // every addressing (A.8.6.6) — absent or malformed refuses unfetched.
+  if (claim.digest === undefined) {
+    return {
+      ok: false,
+      problem:
+        'interfaces.testSuite declares no `digest` — a published suite MUST be digest-pinned ("sha256:<64 hex>" over the artifact\'s ' +
+        'exact bytes). The digest is the sole byte authority in every addressing (A.8.6.6). Refused without fetching.',
+    }
+  }
+  if (!/^sha256:[0-9a-f]{64}$/.test(claim.digest)) {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite declares digest ${JSON.stringify(claim.digest)}, which is not of the form "sha256:<64 lowercase hex>" — ` +
+        'refused without fetching.',
+    }
+  }
+
+  // The npm coordinate — an IDENTITY ASSERTION, never a delivery channel.
+  let npm: { package: string; version: string } | undefined
+  if (claim.packageName !== undefined) {
+    if (!NPM_NAME.test(claim.packageName)) {
+      return {
+        ok: false,
+        problem: `interfaces.testSuite declares package ${JSON.stringify(claim.packageName)}, which is not an npm package name — refused.`,
+      }
+    }
+    if (claim.version === undefined) {
+      return {
+        ok: false,
+        problem:
+          `interfaces.testSuite declares package ${JSON.stringify(claim.packageName)} with no \`version\` — the identity assertion ` +
+          'requires the EXACT published version (A.8.5). Refused.',
+      }
+    }
+    if (!EXACT_SEMVER.test(claim.version)) {
+      return {
+        ok: false,
+        problem:
+          `interfaces.testSuite declares version ${JSON.stringify(claim.version)} — the identity assertion requires an EXACT ` +
+          'published semver, never a range (A.8.5). Refused.',
+      }
+    }
+    npm = { package: claim.packageName, version: claim.version }
+  }
+
+  // The address: declared url, or derived from the coordinate under the
+  // native-serving obligation. Neither ⇒ nothing is published.
+  let url = claim.urlRaw !== undefined && claim.url !== '' ? claim.url : undefined
+  if (url === undefined) {
+    if (npm === undefined) {
+      return {
+        ok: false,
+        problem:
+          'interfaces.testSuite declares neither `url` nor `package` — a suite that names no location is not a published suite ' +
+          '(at least one address is required, A.8.5). Omit the whole key to declare no test suite.',
+      }
+    }
+    url = `${NATIVE_SERVING_BASE}/${npm.package}@${npm.version}/index.mjs`
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite declares url ${JSON.stringify(claim.urlRaw ?? url)}, which does not resolve to a URL — refused without fetching.`,
+    }
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return {
+      ok: false,
+      problem: `interfaces.testSuite declares url ${url}, which is not an http(s) address — refused without fetching.`,
+    }
+  }
+  // The network floor applies to the VERIFIER's artifact fetch exactly as it
+  // applies to the isolate's egress: a metadata/private/internal address is
+  // refused unfetched. An OFF-ORIGIN public address is fine — the A.8.5
+  // same-origin restriction is RETIRED for this dialect (revision note 0.7.0);
+  // the digest, never the host, is the authority over the bytes.
+  if (isFloorBlockedHost(parsed.hostname)) {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite declares its artifact at ${url}, which the network floor bars (metadata, link-local, loopback, ` +
+        'private-range, CGNAT, ULA, or estate-internal) — refused without fetching (A.8.6.3).',
+    }
+  }
+
+  // Artifact kind — decided by the CARD, never by sniffing (A.8.5).
+  const kind: 'document' | 'module' = npm !== undefined || parsed.pathname.endsWith('.mjs') ? 'module' : 'document'
+
+  if (claim.exportName !== undefined) {
+    if (kind !== 'module') {
+      return {
+        ok: false,
+        problem:
+          `interfaces.testSuite declares export ${JSON.stringify(claim.exportName)} on a suite DOCUMENT — \`export\` names a ` +
+          'module export and is meaningful only for a module artifact (A.8.5). A defective declaration fails.',
+      }
+    }
+    if (!EXPORT_IDENTIFIER.test(claim.exportName)) {
+      return {
+        ok: false,
+        problem: `interfaces.testSuite declares export ${JSON.stringify(claim.exportName)}, which is not a legal identifier — refused.`,
+      }
+    }
+  }
+
+  // A module artifact defines no environments: exactly the implicit
+  // non-sandbox "public" exists there (A.8.6.4). Selecting any other name is
+  // selecting an environment that does not exist ⇒ fail, at the card.
+  if (kind === 'module' && claim.environment !== 'public') {
+    return {
+      ok: false,
+      problem:
+        `interfaces.testSuite selects environment ${JSON.stringify(claim.environment)} on a MODULE artifact — a pinned module ` +
+        'defines no environments and carries exactly the implicit "public" (sandbox: false, A.8.6.4). Refused.',
+    }
+  }
+
+  return {
+    ok: true,
+    url,
+    digest: claim.digest,
+    kind,
+    environment: claim.environment,
+    ...(claim.exportName !== undefined && { exportName: claim.exportName }),
+    ...(npm !== undefined && { npm }),
+  }
+}
+
+export type VitestDocumentGate =
+  | {
+      ok: true
+      suite: Suite
+      /** Declarative rows, eligible under UNCHANGED suite@1 engine semantics. */
+      rows: EndpointReq[]
+      testsSource: string
+      moduleSource?: string
+      vars: Record<string, unknown>
+      sandbox: boolean
+      digest: string
+    }
+  | { ok: false; problems: string[] }
+
+/**
+ * GATE 2 for the executable DOCUMENT addressing — pure over the exact bytes
+ * served. HASH-THEN-INSTANTIATE (A.8.6.3): the digest is re-computed over the
+ * one fetched buffer BEFORE anything in it is believed, the code strings are
+ * extracted from that same buffer, and a mismatch means nothing is ever
+ * instantiated — there is no execute-then-check ordering under any
+ * circumstance.
+ *
+ * Declarative rows keep the UNCHANGED suite@1 rules (endpoint-only, GET/HEAD
+ * only, same-origin re-gated at resolve time by the engine) — A.8.5.2:
+ * "declarative rows stay home; executable tests roam above the floor."
+ */
+export function gateVitestSuiteDocument(
+  claim: TestSuiteClaim,
+  suiteText: string,
+  cardDigest: string,
+): VitestDocumentGate {
+  const problems: string[] = []
+
+  const docBytes = new TextEncoder().encode(suiteText).byteLength
+  if (docBytes > EXEC_MAX_DOC_BYTES) {
+    return {
+      ok: false,
+      problems: [
+        `the served suite document is ${docBytes} bytes, over the ${EXEC_MAX_DOC_BYTES}-byte (1 MiB) cap of A.8.6.1 — ` +
+          'an abuse circuit-breaker, not a ration; failed, never truncated.',
+      ],
+    }
+  }
+
+  const actual = sha256HexSync(suiteText)
+  const expected = cardDigest.slice('sha256:'.length)
+  if (actual !== expected) {
+    return {
+      ok: false,
+      problems: [
+        `suite digest mismatch: the card pins sha256:${expected} but the document served at ${claim.url} hashes to sha256:${actual} — ` +
+          'the published suite is not the one the card claims. NOTHING was instantiated (digest fail-closed, A.8.6.3).',
+      ],
+    }
+  }
+
+  let suite: Suite
+  try {
+    suite = parseExecSuiteDocument(suiteText)
+  } catch (e) {
+    return {
+      ok: false,
+      problems: [`suite document did not parse as an api.qa/vitest@1 Suite document: ${(e as Error).message}`],
+    }
+  }
+
+  if (!Object.hasOwn(suite.environments, claim.environment)) {
+    const defined = Object.keys(suite.environments)
+    problems.push(
+      `the card selects environment ${JSON.stringify(claim.environment)}, which suite "${suite.name}" does not define ` +
+        `(it defines ${defined.length ? defined.map((n) => JSON.stringify(n)).join(', ') : 'none'})`,
+    )
+  }
+
+  // Declarative rows: the same kind-eligibility and write refusals the
+  // suite@1 gate applies — this dialect widens NOTHING about rows.
+  const rows: EndpointReq[] = []
+  for (const req of suite.requirements) {
+    if (req.kind === 'endpoint') {
+      rows.push(req)
+      continue
+    }
+    problems.push(
+      `requirement "${(req as { id?: string }).id ?? '?'}" is kind:'${(req as { kind?: string }).kind}' — the declarative rows of an ` +
+        `api.qa/vitest@1 document keep unchanged suite@1 semantics: kind:'endpoint' only. Refused.`,
+    )
+  }
+  for (const req of rows) {
+    const method = req.method.toUpperCase()
+    if (method !== 'GET' && method !== 'HEAD') {
+      problems.push(
+        `requirement "${req.id}" declares method ${JSON.stringify(req.method)} — declarative rows run GET/HEAD ONLY in both dialects ` +
+          '(A.8.5.2). Mutating flows belong in the executable tests, against an environment the suite declares "sandbox": true.',
+      )
+    }
+  }
+
+  if (problems.length > 0) return { ok: false, problems }
+
+  const env = suite.environments[claim.environment]!
+  return {
+    ok: true,
+    suite,
+    rows,
+    testsSource: suite.tests!,
+    ...(suite.module !== undefined && { moduleSource: suite.module }),
+    vars: { ...env.vars },
+    sandbox: env.sandbox === true,
+    digest: cardDigest,
+  }
+}
+
+export type VitestModuleGate =
+  | { ok: true; digest: string }
+  | { ok: false; problems: string[] }
+
+/**
+ * GATE 2 for the MODULE addressing (A.8.6.6 channels 2 and 3): the pinned,
+ * natively served ES module. Digest fail-closed over the one fetched buffer;
+ * the 4 MiB module cap (an SDK entry is a bundle). The npm coordinate, where
+ * asserted, was already validated at the card gate and is RECORDED — never
+ * adjudicated: no registry is contacted, and registry state cannot influence
+ * the verdict.
+ */
+export function gateVitestModuleArtifact(
+  claim: TestSuiteClaim,
+  moduleText: string,
+  cardDigest: string,
+): VitestModuleGate {
+  const bytes = new TextEncoder().encode(moduleText).byteLength
+  if (bytes > EXEC_MAX_MODULE_BYTES) {
+    return {
+      ok: false,
+      problems: [
+        `the served module artifact is ${bytes} bytes, over the ${EXEC_MAX_MODULE_BYTES}-byte (4 MiB) cap of A.8.6.3 — ` +
+          'failed, never truncated.',
+      ],
+    }
+  }
+  const actual = sha256HexSync(moduleText)
+  const expected = cardDigest.slice('sha256:'.length)
+  if (actual !== expected) {
+    return {
+      ok: false,
+      problems: [
+        `module digest mismatch: the card pins sha256:${expected} but the module served at ${claim.url} hashes to sha256:${actual} — ` +
+          'the published module is not the one the card claims. NOTHING was instantiated (digest fail-closed, A.8.6.3).',
+      ],
+    }
+  }
+  return { ok: true, digest: cardDigest }
 }

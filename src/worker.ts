@@ -21,6 +21,8 @@
  */
 
 import { verifyTarget, rejudge } from './verify.js'
+import type { ExecSuiteRunner } from './exec/dialect.js'
+import { unavailableExecRunner, workerLoaderExecRunner, type WorkerLoaderLike } from './exec/runner.js'
 import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type SuiteReport } from './pinned.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
 import { landingHtml, reportPageHtml } from './views.js'
@@ -146,6 +148,23 @@ export interface Env {
   TS_RAW_CAP?: string
   /** Time-series hourly rollup-bucket cap before oldest are evicted. */
   TS_ROLLUP_CAP?: string
+  /**
+   * Dynamic Worker Loader binding (`worker_loaders` in wrangler.jsonc) — the
+   * `api.qa/vitest@1` isolate runner (A.8.6.3). OPEN-BETA, PAID-PLAN: the
+   * binding is documented but NOT enabled in the shipped config, so every
+   * account keeps valid deploys; absent, a card declaring the executable
+   * dialect fails with a typed `runner-unavailable` reason.
+   */
+  SUITE_LOADER?: WorkerLoaderLike
+  /**
+   * The egress gateway service binding every isolate fetch is delivered to
+   * (`globalOutbound`). REQUIRED alongside SUITE_LOADER: without it the
+   * runner refuses to run rather than inherit this worker's own network
+   * access (the A.8.6.3 floor). The gateway's fetch handler is
+   * `gatewayFetch` (src/exec/runner.ts) — a thin service wrapper at deploy
+   * time; the floor logic itself is in-repo and unit-tested.
+   */
+  SUITE_OUTBOUND?: unknown
 }
 
 /** Summary of one scheduled tick — returned for tests/observability. */
@@ -309,6 +328,23 @@ export function createApp(
   const routed: Fetcher = (u, init) =>
     u.startsWith(SELF_ORIGIN) ? loopback(u, init) : (opts.externalFetcher ?? fetch)(u, init)
 
+  // The `api.qa/vitest@1` execution seam (A.8.6) — FEATURE-DETECTED. The
+  // Worker Loader binding is an open-beta, paid-plan capability, so the
+  // deployment stays valid without it (wrangler.jsonc documents, but does not
+  // enable, the binding). Three states, all typed and none a crash:
+  //   binding + outbound gateway present → the isolate runner;
+  //   binding present, outbound absent   → runner-unavailable (running
+  //     without a gateway would inherit THIS worker's network, which the
+  //     A.8.6.3 floor forbids — refuse to run open);
+  //   binding absent                     → runner-unavailable.
+  // A card declaring `runner: "api.qa/vitest@1"` on an unprovisioned
+  // deployment therefore FAILS the check with the reason named — the same
+  // direction the ratified unknown-runner rule gives an older verifier —
+  // never a silent pass.
+  const execRunner: ExecSuiteRunner = env.SUITE_LOADER
+    ? workerLoaderExecRunner(env.SUITE_LOADER, { outbound: env.SUITE_OUTBOUND })
+    : unavailableExecRunner()
+
   /**
    * The actual tick body: claim + re-verify every DUE monitor through the
    * SAME attested verifyTarget/verifySuite/cooldown/SSRF path a fetch run
@@ -389,6 +425,7 @@ export function createApp(
           delayMs: isSelf ? 0 : externalDelayMs,
           signingKeys: await keys(),
           allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+          execRunner,
         })
 
         let suiteVerdict: boolean | undefined
@@ -688,6 +725,7 @@ export function createApp(
               delayMs: isSelf ? 0 : externalDelayMs,
               signingKeys: await keys(),
               allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+              execRunner,
             })
             if (!bypass && cache) await cache.putDomain(domain, report, now())
             return respondReport(report, accept, { cache: bypass ? undefined : 'MISS' })
@@ -777,6 +815,7 @@ export function createApp(
             seed: body.seed,
             signingKeys: await keys(),
             allowPrivateTargets: env.ALLOW_PRIVATE_TARGETS === 'true',
+            execRunner,
           })
           if (!bypass && cache) await cache.putDomain(body.target, report, now())
           return respondReport(report, accept, { cache: bypass ? undefined : 'MISS' })

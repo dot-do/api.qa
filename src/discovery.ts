@@ -17,10 +17,23 @@ import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
 import {
   MAX_SUITE_REQUIREMENTS,
   SUITE_DEADLINE_MS,
+  VITEST_RUNNER,
   gateTestSuiteCard,
   gateTestSuiteDocument,
+  gateVitestModuleArtifact,
+  gateVitestSuiteCard,
+  gateVitestSuiteDocument,
 } from './test-suite.js'
-import { captureInto, judgeExpect, resolveEndpoint, type Bindings } from './expect.js'
+import {
+  EXEC_MAX_COMBINED,
+  EXEC_MAX_DOC_BYTES,
+  EXEC_MAX_MODULE_BYTES,
+  EXEC_WALL_MS,
+  type ExecRunOutcome,
+  type ExecSuiteRunner,
+} from './exec/dialect.js'
+import { unavailableExecRunner } from './exec/runner.js'
+import { captureInto, judgeExpect, resolveEndpoint, type Bindings, type EndpointReq } from './expect.js'
 import type {
   ClaimedEndpoint,
   DiscoveryReport,
@@ -175,6 +188,16 @@ export const ROLE = {
    * and the published-test-suite check SKIPs.
    */
   testSuite: 'surface:testsuite',
+  /**
+   * The `api.qa/vitest@1` EXECUTABLE RUN OUTCOME (A.8.6.5) — a SYNTHETIC
+   * evidence item, not an HTTP exchange: its body is the typed
+   * `ExecRunOutcome` JSON (executed digest, environment + sandbox, seed,
+   * applied breaker limits, elapsed wall/CPU, per-test results in
+   * registration order, npm coordinate where asserted). Recorded at observe
+   * time — execution is I/O, judging is pure — so the judge and any replay
+   * read the SAME recorded run, and the whole thing rides the signed bundle.
+   */
+  vitestRun: 'suite:vitest-run',
 } as const
 
 /**
@@ -425,8 +448,25 @@ export interface TestSuiteClaim {
   digest?: string
   /** Environment name to select. Defaults to `"public"`. */
   environment: string
-  /** Suite dialect. Only `"api.qa/suite@1"` is defined. */
+  /** Suite dialect: `"api.qa/suite@1"` (declarative) or `"api.qa/vitest@1"` (executable, A.8.6). */
   runner: string
+  /**
+   * npm IDENTITY ASSERTION (A.8.6.6, `api.qa/vitest@1` only): the pinned
+   * artifact's bytes are asserted byte-identical to `package@version`'s entry
+   * module as published to npm. PROVENANCE, never a delivery channel — the
+   * registry is NEVER contacted, and registry state MUST NOT influence a
+   * verdict; the verdict records the assertion, the digest decides what runs.
+   * `package` without an exact `version` is a defective declaration.
+   */
+  packageName?: string
+  /** Exact published semver of `packageName` — never a range. */
+  version?: string
+  /**
+   * Named nullary (possibly async) module export the harness calls to
+   * register tests (module artifacts only); absent, tests register at module
+   * instantiation.
+   */
+  exportName?: string
 }
 
 /** The only suite dialect this verifier implements. */
@@ -538,6 +578,15 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
       const digest = str(t.digest)
       const environment = str(t.environment)
       const runner = str(t.runner)
+      // The A.8.6.6 widened seam: { url?, package?, version?, export?, digest,
+      // environment?, runner? }. `package`/`version`/`export` are read here as
+      // RAW strings; every rule about them (vitest@1-only, exact semver, at
+      // least one address, module-kind-only export) is judged by the gates in
+      // test-suite.ts, so a defective declaration FAILS rather than being
+      // silently dropped at parse.
+      const packageName = str(t.package)
+      const version = str(t.version)
+      const exportName = str(t.export)
       out.testSuite = {
         declared: true,
         ...(urlRaw !== undefined && { urlRaw }),
@@ -548,6 +597,9 @@ export function parseAgentsJson(doc: unknown, origin: string): AgentsClaims {
         ...(digest !== undefined && { digest }),
         environment: environment ?? TEST_SUITE_DEFAULT_ENVIRONMENT,
         runner: runner ?? TEST_SUITE_RUNNER,
+        ...(packageName !== undefined && { packageName }),
+        ...(version !== undefined && { version }),
+        ...(exportName !== undefined && { exportName }),
       }
     } else {
       out.testSuite = {
@@ -1445,12 +1497,26 @@ async function observeDigitalLink(origin: string, observer: Observer): Promise<v
  * probes), against the CARD'S OWN ORIGIN rather than the suite's `baseUrl`,
  * under a wall-clock deadline. See `test-suite.ts` for the full boundary.
  */
-async function observeTestSuite(origin: string, observer: Observer): Promise<void> {
+async function observeTestSuite(
+  origin: string,
+  observer: Observer,
+  seed: number,
+  execRunner: ExecSuiteRunner,
+): Promise<void> {
   const items = observer.items
   const bundleView: EvidenceBundle = { target: origin, fetchedAt: '', seed: 0, items }
   const agents = parseAgentsJson(parseJsonBody(findEvidence(bundleView, ROLE.agentsJson)), origin)
   const claim = agents.testSuite
   if (!claim) return // interface not declared — optional, nothing to verify
+
+  // Dialect dispatch — on the CARD's `runner`, exactly as A.8.5 discriminates.
+  // The executable dialect has its own observe path (different caps, the
+  // network-floor artifact gate instead of same-origin, and the isolate run);
+  // suite@1 below is UNCHANGED.
+  if (claim.runner === VITEST_RUNNER) {
+    await observeVitestSuite(origin, observer, claim, seed, execRunner)
+    return
+  }
 
   // Card-only gate. A malformed declaration, a missing/bad digest, an unknown
   // runner or an off-origin url is judged from the card alone and never
@@ -1464,20 +1530,39 @@ async function observeTestSuite(origin: string, observer: Observer): Promise<voi
   const plan = gateTestSuiteDocument(claim, docEv.body, gate.digest)
   if (!plan.ok) return // digest mismatch / ineligible shape — judged from the bundle, never run
 
+  await runSuiteRows(origin, observer, plan.requirements, plan.vars, SUITE_DEADLINE_MS, MAX_SUITE_REQUIREMENTS)
+}
+
+/**
+ * Run a card-declared suite's DECLARATIVE ROWS — extracted so the suite@1
+ * path and the `api.qa/vitest@1` document path (whose rows keep UNCHANGED
+ * suite@1 engine semantics, A.8.5.2) execute the IDENTICAL loop: same-origin
+ * re-gate, GET/HEAD only, capture-on-pass, evidence merged under the
+ * `suite:` prefix.
+ */
+async function runSuiteRows(
+  origin: string,
+  observer: Observer,
+  requirements: EndpointReq[],
+  vars: Record<string, unknown>,
+  deadlineMs: number,
+  budget: number,
+): Promise<void> {
+  const items = observer.items
   // A PRIVATE observer for the sub-run. Three tightenings over the parent:
-  // read-only (a stranger's document may not direct a write), its own small
-  // budget (a long suite cannot drain the parent's politeness budget out from
+  // read-only (a stranger's document may not direct a write), its own budget
+  // (a long suite cannot drain the parent's politeness budget out from
   // under the fixed probes), and `allowPrivate` inherited so a consented local
   // target still works in dev without ever loosening the deployed posture.
-  const sub = observer.child({ allowWrites: false, budget: MAX_SUITE_REQUIREMENTS })
+  const sub = observer.child({ allowWrites: false, budget })
 
   // The binding scope starts from the SELECTED ENVIRONMENT's vars, exactly as a
   // `verifySuite` run does. A `baseUrl` among them cannot steer the run: the
   // target is `origin`, and `resolveEndpoint` re-gates every resolved URL
   // same-origin, so an off-origin interpolation fails closed WITHOUT a fetch.
-  const bindings: Bindings = { ...plan.vars }
-  const deadline = Date.now() + SUITE_DEADLINE_MS
-  for (const req of plan.requirements) {
+  const bindings: Bindings = { ...vars }
+  const deadline = Date.now() + deadlineMs
+  for (const req of requirements) {
     if (Date.now() > deadline) break // the judge fails the run for the missing evidence
     const resolved = resolveEndpoint(req, origin, bindings)
     if (!resolved.ok) continue // judge re-derives the identical resolution failure
@@ -1511,7 +1596,139 @@ async function observeTestSuite(origin: string, observer: Observer): Promise<voi
   }
 }
 
-export async function observeTarget(origin: string, observer: Observer, seed: number): Promise<EvidenceBundle> {
+/**
+ * Observe the `api.qa/vitest@1` EXECUTABLE suite (A.8.6): fetch the pinned
+ * artifact ONCE into one buffer, hash-then-instantiate (digest fail-closed —
+ * nothing executes unless the bytes match the card pin), run the declarative
+ * rows under unchanged suite@1 engine semantics, hand the code to the
+ * `ExecSuiteRunner` seam (Worker Loader isolate hosted; the shared-harness
+ * local runner in the CLI; a typed `runner-unavailable` outcome where the
+ * capability is not provisioned), and record the WHOLE typed outcome as
+ * synthetic evidence so the pure judge — and any replay — reads the same run.
+ */
+async function observeVitestSuite(
+  origin: string,
+  observer: Observer,
+  claim: TestSuiteClaim,
+  seed: number,
+  execRunner: ExecSuiteRunner,
+): Promise<void> {
+  const items = observer.items
+  const gate = gateVitestSuiteCard(claim, origin)
+  if (!gate.ok) return // defective declaration — judged from the card alone, nothing fetched
+
+  // ONE fetch, ONE buffer (A.8.6.3). A dedicated child raises the body cap to
+  // the artifact's own limit + 1 byte — an over-cap artifact is visibly over
+  // (the gate fails it by size), never silently truncated into a digest
+  // mismatch. Budget 1: this path costs exactly one request.
+  const cap = (gate.kind === 'module' ? EXEC_MAX_MODULE_BYTES : EXEC_MAX_DOC_BYTES) + 1
+  const artifactObserver = observer.child({ budget: 1, maxBodyBytes: cap })
+  const docEv = await artifactObserver.observe(ROLE.testSuite, gate.url, {
+    accept: gate.kind === 'module' ? 'text/javascript, application/javascript, */*' : 'application/json',
+  })
+  if (items.some((e) => e.role === ROLE.testSuite)) {
+    throw new Error(`evidence role "${ROLE.testSuite}" already exists in the parent bundle — refusing to shadow it`)
+  }
+  items.push(docEv)
+  if (docEv.status === null || docEv.status < 200 || docEv.status >= 300 || docEv.body == null) return
+
+  let outcome: ExecRunOutcome
+  let sandbox = false
+  let declarativeRows = 0
+
+  if (gate.kind === 'document') {
+    const plan = gateVitestSuiteDocument(claim, docEv.body, gate.digest)
+    if (!plan.ok) return // digest mismatch / defective document — judged purely, NOTHING instantiated
+    sandbox = plan.sandbox
+    declarativeRows = plan.rows.length
+    // Declarative rows: the identical suite@1 loop, under the dialect's own
+    // combined bound (the judge fails the count breach; the loop is bounded
+    // by the metered wall clock, not the 20 s scarcity deadline).
+    await runSuiteRows(origin, observer, plan.rows, plan.vars, EXEC_WALL_MS, Math.min(plan.rows.length || 1, EXEC_MAX_COMBINED))
+    outcome = await execRunner.run(
+      {
+        artifactKind: 'document',
+        testsSource: plan.testsSource,
+        ...(plan.moduleSource !== undefined && { moduleSource: plan.moduleSource }),
+        origin,
+        vars: plan.vars,
+        environment: gate.environment,
+        sandbox: plan.sandbox,
+        seed,
+        declarativeRows,
+        digest: gate.digest,
+      },
+      { fetch: observer.transportFetcher },
+    )
+  } else {
+    const mg = gateVitestModuleArtifact(claim, docEv.body, gate.digest)
+    if (!mg.ok) return // digest mismatch / over-cap — judged purely, NOTHING instantiated
+    outcome = await execRunner.run(
+      {
+        artifactKind: 'module',
+        testsSource: docEv.body,
+        ...(gate.exportName !== undefined && { exportName: gate.exportName }),
+        origin,
+        // A module artifact defines no environments: implicit "public",
+        // sandbox false — a mutating verb always fails there (A.8.6.4).
+        vars: {},
+        environment: 'public',
+        sandbox: false,
+        seed,
+        declarativeRows: 0,
+        digest: gate.digest,
+      },
+      { fetch: observer.transportFetcher },
+    )
+  }
+
+  // The A.8.6.5 attestation record: the typed outcome plus everything a
+  // signed verdict must carry — recorded as SYNTHETIC evidence (execution is
+  // I/O; judging is pure over the bundle; the signed report carries the run).
+  const record = {
+    $type: 'VitestRunOutcome',
+    runner: VITEST_RUNNER,
+    executedDigest: gate.digest,
+    address: gate.url,
+    artifactKind: gate.kind,
+    environment: gate.environment,
+    sandbox,
+    seed,
+    declarativeRows,
+    ...(gate.npm !== undefined && { npm: gate.npm }),
+    outcome,
+  }
+  items.push({
+    role: ROLE.vitestRun,
+    url: gate.url,
+    method: 'EXEC',
+    status: 200,
+    contentType: 'application/json',
+    headers: {},
+    body: JSON.stringify(record),
+    elapsedMs: outcome.status === 'ran' ? outcome.elapsedWallMs : 0,
+  })
+}
+
+export interface ObserveTargetOpts {
+  /**
+   * The `api.qa/vitest@1` execution seam. The deployed Worker wires the
+   * Worker Loader runner when the binding is provisioned; the CLI wires the
+   * shared-harness local runner; DEFAULT is the typed `runner-unavailable`
+   * runner — a card that declares the executable dialect against a verifier
+   * without the capability FAILS with the reason named (the same direction
+   * the ratified unknown-runner rule gives an older verifier), never a crash
+   * and never a silent pass.
+   */
+  execRunner?: ExecSuiteRunner
+}
+
+export async function observeTarget(
+  origin: string,
+  observer: Observer,
+  seed: number,
+  opts: ObserveTargetOpts = {},
+): Promise<EvidenceBundle> {
   // 1. The fixed surface plan — identical for every target (no fingerprint).
   const rootAgentEv = await observer.observe(ROLE.rootAgent, `${origin}/`, { accept: '*/*' })
   const rootBrowserEv = await observer.observe(ROLE.rootBrowser, `${origin}/`, {
@@ -1804,7 +2021,7 @@ export async function observeTarget(origin: string, observer: Observer, seed: nu
   //     fully conforming. Ordered with the other fixed high-value probes,
   //     BEFORE the unbounded contract-diff enumeration, and on its OWN observer
   //     so a long suite can never starve them.
-  await observeTestSuite(origin, observer)
+  await observeTestSuite(origin, observer, seed, opts.execRunner ?? unavailableExecRunner())
 
   // 5. Contract-diff probing (ax-e6b.28.4): for a FULL OpenAPI<->live diff,
   //    fetch EVERY GET-safe candidate path once — not just the seeded keyless
