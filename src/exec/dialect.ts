@@ -514,8 +514,14 @@ export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit
 
       const runId = `local:${++localRunCounter}:${req.seed}`
       const violations: GateViolation[] = []
+      // Capture the AMBIENT fetch BEFORE the run swaps `globalThis.fetch` to
+      // the gated fetch: a late-bound `fetch(url)` default would resolve to
+      // the gated fetch itself once the swap lands — every egress recursing
+      // gate→global→gate until the stack blows. The CLI verb (which injects
+      // no io.fetch) rides this default.
+      const ambientFetch = fetch.bind(globalThis) as (url: string, init?: RequestInit) => Promise<Response>
       const gatedFetch = createGatedFetch({
-        realFetch: io.fetch ?? opts.fetch ?? ((url, init) => fetch(url, init)),
+        realFetch: io.fetch ?? opts.fetch ?? ambientFetch,
         sandbox: req.sandbox,
         violations,
       })
