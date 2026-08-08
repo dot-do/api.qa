@@ -96,16 +96,30 @@ export class Observer {
    * point — a mock/injected transport, and the deployed Worker's, must apply to
    * the sub-run identically — while the budget and write posture are isolated.
    */
-  child(overrides: Pick<ObserverOpts, 'budget' | 'allowWrites'>): Observer {
+  child(overrides: Pick<ObserverOpts, 'budget' | 'allowWrites' | 'maxBodyBytes'>): Observer {
     return new Observer({
       fetcher: this.opts.fetcher,
       delayMs: this.opts.delayMs,
       timeoutMs: this.opts.timeoutMs,
-      maxBodyBytes: this.opts.maxBodyBytes,
+      // A child may RAISE the body cap for one declared artifact fetch (the
+      // executable-suite document/module, whose A.8.6.1/A.8.6.3 caps exceed
+      // the probe default — a truncated body could never digest-match, which
+      // would turn every large-but-legal artifact into a false mismatch).
+      maxBodyBytes: overrides.maxBodyBytes ?? this.opts.maxBodyBytes,
       allowPrivate: this.opts.allowPrivate,
       budget: overrides.budget ?? this.opts.budget,
       allowWrites: overrides.allowWrites ?? false,
     })
+  }
+
+  /**
+   * The transport this observer fetches through — exposed so the executable-
+   * suite runner's gated fetch wraps the SAME channel the evidence was
+   * recorded over (an in-memory fixture target, and the deployed Worker's real
+   * fetch, apply to the suite run identically).
+   */
+  get transportFetcher(): Fetcher {
+    return this.opts.fetcher
   }
 
   /**

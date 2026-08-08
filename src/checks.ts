@@ -33,6 +33,7 @@ import {
   isMcpUiMime,
   SUITE_ROLE_PREFIX,
   type ServerJsonClaims,
+  type TestSuiteClaim,
 } from './discovery.js'
 // The card-declared test-suite gates and the shared expectation engine — the
 // SAME code the observe side ran, so what was fetched and what it means cannot
@@ -40,9 +41,14 @@ import {
 // second expectation judge would make conformance depend on which door asked.
 import {
   MAX_SUITE_REQUIREMENTS,
+  VITEST_RUNNER,
   gateTestSuiteCard,
   gateTestSuiteDocument,
+  gateVitestModuleArtifact,
+  gateVitestSuiteCard,
+  gateVitestSuiteDocument,
 } from './test-suite.js'
+import type { ExecRunOutcome, ExecTestResult } from './exec/dialect.js'
 import { captureInto, judgeExpect, resolveEndpoint, type Bindings } from './expect.js'
 import { isPubliclyRoutableSameOrigin, isPublicHttpsOffOriginAllowed } from './http.js'
 import { validateSchema } from './schema.js'
@@ -917,6 +923,11 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
         detail:
           'no published test suite interface declared (agents.json `interfaces.testSuite` absent) — the interface is OPTIONAL and this card does not claim it, so nothing was fetched and nothing is judged; under a pinned must:pass this fails closed',
       }
+    } else if (claim.runner === VITEST_RUNNER) {
+      // The EXECUTABLE dialect (A.8.6): judged purely from the recorded
+      // artifact + the recorded typed run outcome — the judge never
+      // re-executes (observe/judge split, same as every other check).
+      result = judgeVitestPublishedSuite(bundle, claim, evidence)
     } else {
       const cardGate = gateTestSuiteCard(claim, bundle.target)
       if (!cardGate.ok) {
@@ -3345,6 +3356,156 @@ function looksLikeHtml(body: string): boolean {
  */
 function trimTrailingSlash(url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url
+}
+
+/**
+ * Judge a card-declared `api.qa/vitest@1` suite (A.8.5.2 / A.8.6.5), PURELY
+ * from the bundle:
+ *
+ *   - the card gate re-derives (defective declaration ⇒ fail, never skip);
+ *   - the artifact evidence must be a 200 with a body that HASHES TO THE PIN
+ *     (digest fail-closed — a mismatch means nothing was ever instantiated,
+ *     and this judge proves it from the stored bytes);
+ *   - declarative rows are re-judged with the IDENTICAL suite@1 engine the
+ *     declarative branch uses (`resolveEndpoint`/`judgeExpect`, same binding
+ *     scope, capture-on-pass);
+ *   - the EXECUTED tests are judged from the recorded typed run outcome
+ *     (ROLE.vitestRun): `runner-unavailable` and `failed` are named failures;
+ *     `ran` folds per-test results with the rows into ONE result set. The
+ *     judge never re-executes — replay of a stored bundle re-judges
+ *     identically with no isolate and no fetch.
+ *
+ * The passing detail carries the A.8.6.5 attestation surface: executed
+ * digest, discriminated kind + address, environment + sandbox, seed, applied
+ * breaker limits + elapsed, counts (rows, tests, distinct pathnames), and
+ * the npm coordinate where asserted — RECORDED, never adjudicated.
+ */
+function judgeVitestPublishedSuite(
+  bundle: EvidenceBundle,
+  claim: TestSuiteClaim,
+  evidence: string[],
+): { verdict: Verdict; detail: string } {
+  const cardGate = gateVitestSuiteCard(claim, bundle.target)
+  if (!cardGate.ok) return { verdict: 'fail', detail: cardGate.problem }
+
+  const docEv = findEvidence(bundle, ROLE.testSuite)
+  if (!ok(docEv) || docEv?.body == null) {
+    return {
+      verdict: 'fail',
+      detail:
+        `GET ${cardGate.url} did not answer 2xx with a body — ${!docEv ? 'not fetched' : docEv.status === null ? `fetch failed (${docEv.error ?? 'unknown'})` : `status ${docEv.status}`}. ` +
+        'The card DECLARES a published executable suite, so the pinned artifact must be served.',
+    }
+  }
+
+  // Row judging state (document addressing only).
+  const rowProblems: string[] = []
+  const pathnames = new Set<string>()
+  let rowCount = 0
+  let sandbox = false
+
+  if (cardGate.kind === 'document') {
+    const plan = gateVitestSuiteDocument(claim, docEv.body, cardGate.digest)
+    if (!plan.ok) return { verdict: 'fail', detail: plan.problems.slice(0, 6).join('; ') }
+    sandbox = plan.sandbox
+    rowCount = plan.rows.length
+    // The IDENTICAL row engine the declarative branch judges with.
+    const bindings: Bindings = { ...plan.vars }
+    for (const req of plan.rows) {
+      const resolved = resolveEndpoint(req, bundle.target, bindings)
+      if (!resolved.ok) {
+        rowProblems.push(`"${req.id}": ${resolved.detail}`)
+        continue
+      }
+      const role = `${SUITE_ROLE_PREFIX}pinned:${req.id}`
+      evidence.push(role)
+      const ev = bundle.items.find((e) => e.role === role)
+      const ps = judgeExpect(ev, resolved.expect)
+      if (ps.length === 0) {
+        try { pathnames.add(new URL(resolved.url).pathname) } catch { /* resolved urls parse */ }
+        if (req.capture) captureInto(bindings, req.capture, ev)
+      } else {
+        rowProblems.push(`"${req.id}" ${resolved.method} ${resolved.url}: ${ps.join('; ')}`)
+      }
+    }
+  } else {
+    const mg = gateVitestModuleArtifact(claim, docEv.body, cardGate.digest)
+    if (!mg.ok) return { verdict: 'fail', detail: mg.problems.slice(0, 6).join('; ') }
+  }
+
+  // The recorded typed run outcome — REQUIRED. Its absence after a valid,
+  // digest-matched artifact means the run never happened: fail closed.
+  const runEv = findEvidence(bundle, ROLE.vitestRun)
+  evidence.push(ROLE.vitestRun)
+  if (runEv?.body == null) {
+    return {
+      verdict: 'fail',
+      detail:
+        'no executable run outcome was recorded for the declared api.qa/vitest@1 suite — the artifact gates passed but ' +
+        'the run is missing from the bundle, so nothing proves the tests ran. Fail closed, never a silent pass.',
+    }
+  }
+  let record: {
+    executedDigest?: string
+    seed?: number
+    npm?: { package: string; version: string }
+    outcome?: ExecRunOutcome
+  }
+  try {
+    record = JSON.parse(runEv.body) as typeof record
+  } catch {
+    return { verdict: 'fail', detail: 'the recorded executable run outcome is not parseable JSON — fail closed' }
+  }
+  if (record.executedDigest !== cardGate.digest) {
+    return {
+      verdict: 'fail',
+      detail:
+        `the recorded run executed digest ${JSON.stringify(record.executedDigest)} but the card pins ${cardGate.digest} — ` +
+        'the run is not a run of the pinned bytes (digest fail-closed, A.8.6.3)',
+    }
+  }
+  const outcome = record.outcome
+  if (outcome === undefined) {
+    return { verdict: 'fail', detail: 'the recorded executable run carries no outcome — fail closed' }
+  }
+  if (outcome.status === 'runner-unavailable') {
+    return { verdict: 'fail', detail: outcome.reason }
+  }
+  if (outcome.status === 'failed') {
+    return {
+      verdict: 'fail',
+      detail: `the api.qa/vitest@1 run failed: ${outcome.reason}`,
+    }
+  }
+
+  // ONE folded result set (A.8.6.5): rows in document order, tests in
+  // registration order.
+  const failedTests = outcome.results.filter((r: ExecTestResult) => r.status === 'fail')
+  const problems = [
+    ...rowProblems,
+    ...failedTests.map((r: ExecTestResult) => `test "${r.name}": ${r.reason ?? 'failed'}`),
+  ]
+  if (problems.length > 0) {
+    return {
+      verdict: 'fail',
+      detail:
+        `the surface violated its OWN published executable suite (${cardGate.digest.slice(0, 19)}…, environment ` +
+        `"${cardGate.environment}", seed ${record.seed ?? bundle.seed}): ` + problems.slice(0, 6).join('; '),
+    }
+  }
+  return pass(
+    `interfaces.testSuite declared (runner ${VITEST_RUNNER}); ${cardGate.kind} artifact at ${cardGate.url} → ${docEv!.status}, ` +
+      `${cardGate.digest.slice(0, 19)}… matches the card pin (hash-then-instantiate); environment "${cardGate.environment}"` +
+      `${sandbox ? ' (sandbox: true — mutating verbs consented)' : ''}, seed ${record.seed ?? bundle.seed}; ` +
+      `${rowCount} declarative row(s) over ${pathnames.size} distinct pathname(s) + ${outcome.registered} registered test(s), all passed ` +
+      `(${outcome.elapsedWallMs} ms wall elapsed under applied limits ${outcome.appliedLimits.wallMs} ms wall / ${outcome.appliedLimits.cpuMs} ms CPU` +
+      `${outcome.consumedCpuMs !== null ? `, ${outcome.consumedCpuMs} ms CPU consumed` : ''}). ` +
+      (record.npm !== undefined
+        ? `npm identity assertion recorded: ${record.npm.package}@${record.npm.version} (provenance claim — the registry was never contacted and did not influence this verdict). `
+        : '') +
+      'Isolated run: zero ambient authority, network floor only (full external egress above it), digest fail-closed. ' +
+      'NOT judged: whether the suite is ambitious — api.qa verifies the surface keeps its OWN published promise, not that the promise is demanding.',
+  )
 }
 
 function pass(detail: string): { verdict: Verdict; detail: string } {

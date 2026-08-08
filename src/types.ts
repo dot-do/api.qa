@@ -567,6 +567,14 @@ export interface SuiteEnvironment {
   /** `varName -> value`. A value keeps its JSON type: a number seeds a number
    * (typed whole-value interpolation preserves it), a string seeds a string. */
   vars: Record<string, unknown>
+  /**
+   * A.8.6.4 (`api.qa/vitest@1` documents only): the suite's OWN pinned
+   * consent to be written to in this environment. Executable tests may issue
+   * mutating verbs ONLY where this is `true`; the declarative dialect ignores
+   * it (suite@1 rows are GET/HEAD everywhere). Never inferred — consent lives
+   * in the pinned document or it does not exist.
+   */
+  sandbox?: boolean
 }
 
 /**
@@ -589,4 +597,18 @@ export interface Suite {
   /** Named environments; run selects one by name. */
   environments: Record<string, SuiteEnvironment>
   requirements: PinnedRequirement[]
+  /**
+   * A.8.6.1 — the `api.qa/vitest@1` ADDITIVE extension of this same document
+   * grammar (the mdxld house pattern: code as a Code-valued string member of a
+   * JSON-serializable document). ONE served artifact, ONE digest covering both
+   * natures: the declarative rows above and these code strings. The `suite@1`
+   * parser ignores them (unknown root members), and the dialect is
+   * discriminated by the CARD's `runner`, never by sniffing the document.
+   *
+   * `tests` — ES module source in the A.8.6.2 subset, registering the
+   * executable tests. REQUIRED in a vitest@1 document.
+   */
+  tests?: string
+  /** Optional ES module source, instantiated first; importable as `"suite:module"`. */
+  module?: string
 }
