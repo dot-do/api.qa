@@ -7,7 +7,8 @@
  *   GET  /.well-known/agents.json
  *   GET  /icp.json
  *   GET  /openapi.json
- *   GET  /health                keyless liveness
+ *   GET  /health                keyless liveness (?exec=1 adds the measured
+ *                               api.qa/vitest@1 runner-availability probe)
  *   GET  /offers/attested-run   the 402 boundary (a structured offer, not an error)
  *   GET  /self                  api.qa's live verdict on api.qa (loopback, no network)
  *   GET  /{domain}              the public grade page (markdown | HTML+JSON-LD | JSON)
@@ -21,7 +22,7 @@
  */
 
 import { verifyTarget, rejudge } from './verify.js'
-import type { ExecSuiteRunner } from './exec/dialect.js'
+import { VITEST_RUNNER, type ExecSuiteRunner } from './exec/dialect.js'
 import { unavailableExecRunner, workerLoaderExecRunner, type WorkerLoaderLike } from './exec/runner.js'
 import { verifyPinnedSpec, verifySuite, parseSuite, type PinnedReport, type SuiteReport } from './pinned.js'
 import { reportMarkdown, pinnedMarkdown, suiteMarkdown } from './render.js'
@@ -150,10 +151,12 @@ export interface Env {
   TS_ROLLUP_CAP?: string
   /**
    * Dynamic Worker Loader binding (`worker_loaders` in wrangler.jsonc) — the
-   * `api.qa/vitest@1` isolate runner (A.8.6.3). OPEN-BETA, PAID-PLAN: the
-   * binding is documented but NOT enabled in the shipped config, so every
-   * account keeps valid deploys; absent, a card declaring the executable
-   * dialect fails with a typed `runner-unavailable` reason.
+   * `api.qa/vitest@1` isolate runner (A.8.6.3). OPEN-BETA, PAID-PLAN:
+   * ENABLED in the shipped config since 2026-08-08 (the account accepted
+   * `worker_loaders` that day for the apis-vin exec rail). Still
+   * feature-detected — on any deployment without the binding, a card
+   * declaring the executable dialect fails with a typed `runner-unavailable`
+   * reason, so a config rollback can never crash or silently pass.
    */
   SUITE_LOADER?: WorkerLoaderLike
   /**
@@ -162,7 +165,8 @@ export interface Env {
    * runner refuses to run rather than inherit this worker's own network
    * access (the A.8.6.3 floor). Build it on `createOutboundGateway`
    * (src/exec/runner.ts) and expose it from a same-isolate loopback
-   * entrypoint (`ctx.exports`), so it carries BOTH halves of the floor:
+   * entrypoint (the SuiteGateway service binding in wrangler.jsonc,
+   * src/exec/gateway.ts), so it carries BOTH halves of the floor:
    * `fetch` (the refusal itself) and `drainViolations` (the out-of-band
    * record the runner folds into the verdict — the half that makes a
    * caught/absorbed refusal still fail the run, A.8.6.3 fail-closed
@@ -197,6 +201,37 @@ export interface TickSummary {
 
 const LINKSET =
   '</llms.txt>; rel="service-doc", </.well-known/agents.json>; rel="service-desc", </openapi.json>; rel="describedby"'
+
+// ── GET /health?exec=1 — the runner-availability probe (2026-08-08 SUITE_LOADER
+// enrollment). The plain /health answer is UNCHANGED (its declared contract is
+// graded); the opt-in query adds one attested fact: whether this deployment can
+// actually spin an `api.qa/vitest@1` isolate. The probe runs the FIXED,
+// server-owned suite below through the same execRunner a verification uses —
+// one registered test, no network — so "available" is a measured run, not a
+// binding-presence claim. The result is memoized per binding-signature for
+// EXEC_PROBE_TTL_MS in isolate-global state, bounding the metered/billed
+// isolate spins an unauthenticated caller can trigger.
+
+/** The fixed probe suite — server-owned bytes, registers one test, fetches nothing. */
+export const EXEC_PROBE_TESTS = `it('the isolate runs', () => { expect(1).toBe(1) })`
+/** How long one probe verdict answers for a given binding signature. */
+export const EXEC_PROBE_TTL_MS = 5 * 60_000
+
+/** What /health?exec=1 reports — a typed state, never a crash. */
+export interface ExecProbeResult {
+  runner: typeof VITEST_RUNNER
+  /** True iff the probe suite actually RAN in a loader isolate just now (or within TTL). */
+  available: boolean
+  /** The runner outcome status verbatim: 'ran' | 'failed' | 'runner-unavailable'. */
+  status: string
+  /** The typed reason, when not 'ran'. */
+  reason?: string
+  probedAtMs: number
+  /** True when this answer was served from the TTL memo, not a fresh isolate. */
+  cached: boolean
+}
+
+const execProbeMemo = new Map<string, Omit<ExecProbeResult, 'cached'>>()
 
 const DOMAIN_ROUTE = /^\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)$/i
 
@@ -335,9 +370,9 @@ export function createApp(
     u.startsWith(SELF_ORIGIN) ? loopback(u, init) : (opts.externalFetcher ?? fetch)(u, init)
 
   // The `api.qa/vitest@1` execution seam (A.8.6) — FEATURE-DETECTED. The
-  // Worker Loader binding is an open-beta, paid-plan capability, so the
-  // deployment stays valid without it (wrangler.jsonc documents, but does not
-  // enable, the binding). Three states, all typed and none a crash:
+  // Worker Loader binding is an open-beta, paid-plan capability; wrangler.jsonc
+  // enables it (2026-08-08 enrollment), but the code keeps detecting it so a
+  // config rollback stays valid. Three states, all typed and none a crash:
   //   binding + outbound gateway present → the isolate runner;
   //   binding present, outbound absent   → runner-unavailable (running
   //     without a gateway would inherit THIS worker's network, which the
@@ -350,6 +385,43 @@ export function createApp(
   const execRunner: ExecSuiteRunner = env.SUITE_LOADER
     ? workerLoaderExecRunner(env.SUITE_LOADER, { outbound: env.SUITE_OUTBOUND })
     : unavailableExecRunner()
+
+  /**
+   * GET /health?exec=1 body: run (or answer from the TTL memo) the fixed
+   * probe suite through execRunner. Memo key = the binding signature, so a
+   * test's bindingless createApp can never be answered by a bound app's
+   * cached verdict (and vice versa); production has ONE signature per deploy.
+   */
+  const execProbe = async (): Promise<ExecProbeResult> => {
+    const key = `${env.SUITE_LOADER ? 'loader' : '-'}:${env.SUITE_OUTBOUND ? 'outbound' : '-'}`
+    const atMs = now()
+    const hit = execProbeMemo.get(key)
+    if (hit && atMs - hit.probedAtMs < EXEC_PROBE_TTL_MS) return { ...hit, cached: true }
+    const outcome = await execRunner.run({
+      artifactKind: 'document',
+      testsSource: EXEC_PROBE_TESTS,
+      origin: SELF_ORIGIN,
+      vars: {},
+      environment: 'public',
+      sandbox: false,
+      seed: 1,
+      declarativeRows: 0,
+      // The probe bytes are server-owned constants, hashed here exactly as a
+      // card pin would be — a stable content-hash isolate id, so repeat
+      // probes warm-reuse one isolate instead of minting new ones.
+      digest: `sha256:${await sha256Hex(EXEC_PROBE_TESTS)}`,
+      limits: { cpuMs: 5_000, wallMs: 10_000 },
+    })
+    const fresh: Omit<ExecProbeResult, 'cached'> = {
+      runner: VITEST_RUNNER,
+      available: outcome.status === 'ran' && outcome.results.every((r) => r.status === 'pass'),
+      status: outcome.status,
+      ...(outcome.status !== 'ran' ? { reason: outcome.reason } : {}),
+      probedAtMs: atMs,
+    }
+    execProbeMemo.set(key, fresh)
+    return { ...fresh, cached: false }
+  }
 
   /**
    * The actual tick body: claim + re-verify every DUE monitor through the
@@ -672,7 +744,12 @@ export function createApp(
           if (path === '/.well-known/agents.json') return json(selfAgentsJson())
           if (path === '/icp.json') return json(selfIcpJson())
           if (path === '/openapi.json') return json(selfOpenapi())
-          if (path === '/health') return json({ ok: true, verifier: 'api.qa', version: VERIFIER_VERSION })
+          if (path === '/health') {
+            const base = { ok: true, verifier: 'api.qa', version: VERIFIER_VERSION }
+            // Opt-in runner probe; the plain declared-contract answer is untouched.
+            if (url.searchParams.get('exec') !== '1') return json(base)
+            return json({ ...base, exec: await execProbe() })
+          }
           if (path === '/offers/attested-run') return json(selfOffer(), 402)
 
           // Brand assets. These MUST be matched before DOMAIN_ROUTE: that regex

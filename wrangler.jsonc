@@ -22,7 +22,10 @@
 //     skips every check above. Tests: scripts/test-deploy.sh.
 {
   "name": "api-qa",
-  "main": "src/worker.ts",
+  // src/entry.ts re-exports the app worker (src/worker.ts — what vitest
+  // imports) + the workerd-only SuiteGateway entrypoint (imports
+  // `cloudflare:workers`, so it stays out of the vitest module graph).
+  "main": "src/entry.ts",
   "compatibility_date": "2026-07-01",
   "routes": [{ "pattern": "api.qa", "custom_domain": true }],
   "workers_dev": true,
@@ -53,26 +56,27 @@
     { "binding": "REPORTS", "id": "90eb42161ef045eb8b38b01cf87f985a" }
   ],
 
-  // ── api.qa/vitest@1 executable-suite runner (AXP A.8.6) — FLAG-HELD ──────
-  // The Dynamic Worker Loader binding is an OPEN-BETA, PAID-PLAN capability:
-  // enabling it on an unenrolled account breaks `wrangler deploy`, so the
-  // binding ships DOCUMENTED-BUT-DISABLED and the code feature-detects
-  // `env.SUITE_LOADER` (absent ⇒ a card declaring runner "api.qa/vitest@1"
-  // fails with a typed `runner-unavailable` reason — never a crash, never a
-  // silent pass; see src/exec/runner.ts). To provision, on an enrolled
-  // account, uncomment BOTH pieces:
-  //
-  //   "worker_loaders": [ { "binding": "SUITE_LOADER" } ],
-  //   // SUITE_OUTBOUND — the egress gateway (its fetch handler wraps
-  //   // `createOutboundGateway` from src/exec/runner.ts: the A.8.6.3 network
-  //   // floor, re-checked per redirect hop, PLUS the out-of-band
-  //   // `drainViolations` record the runner folds into the verdict so a
-  //   // caught refusal still fails the run). REQUIRED: without it the runner
-  //   // REFUSES to execute rather than let an isolate inherit this worker's
-  //   // own network access. Prefer a same-isolate loopback entrypoint
-  //   // (`ctx.exports.SuiteGateway`) over a separate worker, so
-  //   // `drainViolations` is actually drainable by the runner:
-  //   "services": [ { "binding": "SUITE_OUTBOUND", "service": "api-qa", "entrypoint": "SuiteGateway" } ],
+  // ── api.qa/vitest@1 executable-suite runner (AXP A.8.6) — ENROLLED ───────
+  // The Dynamic Worker Loader binding is an OPEN-BETA, PAID-PLAN capability,
+  // ENABLED here 2026-08-08: account b6641681fe423910342b9ffa1364c76d accepted
+  // `worker_loaders` the same day for the apis-vin exec rail (the precedent
+  // this config copies — same account, same same-worker-loopback outbound
+  // shape). The code still FEATURE-DETECTS `env.SUITE_LOADER`, so if a deploy
+  // ever refuses the key, reverting this file to the flag-held shape is the
+  // whole rollback: absent bindings ⇒ a card declaring runner
+  // "api.qa/vitest@1" fails with a typed `runner-unavailable` reason — never
+  // a crash, never a silent pass (see src/exec/runner.ts).
+  "worker_loaders": [{ "binding": "SUITE_LOADER" }],
+  // SUITE_OUTBOUND — the egress gateway: the SuiteGateway entrypoint
+  // (src/exec/gateway.ts, exported from src/entry.ts) wraps
+  // `createOutboundGateway` from src/exec/runner.ts — the A.8.6.3 network
+  // floor, re-checked per redirect hop, PLUS the out-of-band
+  // `drainViolations` record (an RPC on this same binding) the runner folds
+  // into the verdict so a caught refusal still fails the run. REQUIRED:
+  // without it the runner REFUSES to execute rather than let an isolate
+  // inherit this worker's own network access. Same-worker loopback on
+  // purpose: served in-isolate, so the runner can actually drain the record.
+  "services": [{ "binding": "SUITE_OUTBOUND", "service": "api-qa", "entrypoint": "SuiteGateway" }],
   //
   // Isolate posture (enforced in src/exec/runner.ts, pinned by unit tests):
   // env is ALWAYS {} (zero ambient authority — no SIGNING_KEY, no KV, no DOs,
