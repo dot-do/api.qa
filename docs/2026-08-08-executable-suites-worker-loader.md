@@ -124,11 +124,21 @@ orchestrator (a custom pool) and force-injecting `nodejs_compat` /
 requires a Node host process api.qa does not have in production. **Decision:
 a minimal vitest-compatible harness (`describe` / `it` / `test` / `expect` /
 `beforeAll` / `afterAll` / `beforeEach` / `afterEach`), authored by api.qa and
-injected into the isolate as a module aliased to the bare specifier
-`'vitest'`.** The same suite file then runs unmodified in two places: under
-real vitest (via vitest-pool-workers) on the author's machine, and under the
-shim inside api.qa's sandbox. Authoring ergonomics are real vitest; execution
-is a ~300-line harness we fully control and version.
+made available two ways at once: injected as **globals by default** (the vitest
+`globals: true` posture, Jest's default), so a suite that just calls
+`describe`/`it`/`expect` runs with no import line at all; and exported from a
+module aliased to the bare specifier `'vitest'`, so `import { expect, it,
+describe, … } from 'vitest'` resolves to the very same implementation for
+authors who prefer imports.** Both paths are the one api.qa-owned harness — a
+suite may use either or both, and opts out of the globals by declaring
+`export const globals = false` (§3). The intent is "publish the tests you
+already have": vitest's API is deliberately Jest-compatible, so an existing
+Jest **or** vitest suite should port with zero or near-zero changes. The same
+suite file then runs unmodified in two places: under real vitest (via
+vitest-pool-workers, where `globals: true` or explicit imports both work) on
+the author's machine, and under the shim inside api.qa's sandbox. Authoring
+ergonomics are real vitest; execution is a ~300-line harness we fully control
+and version.
 
 ---
 
@@ -137,14 +147,24 @@ is a ~300-line harness we fully control and version.
 A second suite dialect beside `api.qa/suite@1`.
 
 **The artifact.** One self-contained ES module (`.mjs` semantics, ESM only).
-Bare imports permitted: exactly `'vitest'` (the injected harness) and
-`'axp:suite'` (the injected run context). Everything else must be bundled in
-by the author (esbuild/rollup — their choice, their build; api.qa resolves
-nothing). Shape:
+The test API is present as **globals by default** — `describe` / `it` / `test`
+/ `expect` / `beforeEach` / `afterEach` / `beforeAll` / `afterAll` are injected
+into the isolate's global scope before the module evaluates, so an existing
+Jest or vitest file needs no import line to find them. Bare imports are still
+permitted for the import style: exactly `'vitest'` (the injected harness, same
+implementation as the globals) and `'axp:suite'` (the injected run context).
+Everything else must be bundled in by the author (esbuild/rollup — their
+choice, their build; api.qa resolves nothing). A suite opts out of the globals
+with `export const globals = false` — because globals must be installed before
+the module evaluates, the runner reads this marker from the pinned suite bytes
+while assembling the module set (a cheap static check on the verbatim source it
+already holds, §4) and generates the entry without the global-install step, so
+the isolate's global scope stays clean and the suite must `import … from
+'vitest'`. Shape (globals form — no test-API import needed):
 
 ```js
-import { describe, it, expect } from 'vitest'
 import { target, vars, http } from 'axp:suite'   // http = the brokered fetch
+// describe / it / expect are globals — no import required (globals: true default)
 
 describe('quote → checkout flow', () => {
   let quoteId
@@ -160,8 +180,59 @@ describe('quote → checkout flow', () => {
 })
 ```
 
-(`globalThis.fetch` inside the isolate is the same brokered channel —
-`axp:suite`'s `http` is a convenience, not a second privilege level.)
+The same file with `import { describe, it, expect } from 'vitest'` at the top
+runs identically — the import resolves to the injected harness, the globals and
+the module export are one implementation. (`globalThis.fetch` inside the
+isolate is the same brokered channel — `axp:suite`'s `http` is a convenience,
+not a second privilege level.)
+
+**Jest/vitest compatibility.** The shim implements the common jest/vitest
+surface so a suite written for either runs unmodified — "publish your existing
+tests," not "port them." In scope:
+
+- **Structure & hooks** — `describe`, `it`, `test` (alias of `it`), `it.only` /
+  `it.skip` / `describe.only` / `describe.skip`, and the four hooks
+  (`beforeEach` / `afterEach` / `beforeAll` / `afterAll`), all async-aware.
+- **`expect` core** — `toBe`, `toEqual`, `toStrictEqual`, `toMatchObject`,
+  `toContain` / `toContainEqual`, `toHaveLength`, `toHaveProperty`,
+  `toBeTruthy` / `toBeFalsy` / `toBeNull` / `toBeUndefined` / `toBeDefined`,
+  `toBeGreaterThan` / `toBeGreaterThanOrEqual` / `toBeLessThan` /
+  `toBeLessThanOrEqual`, `toBeCloseTo`, `toMatch` (string/RegExp), `toThrow`
+  (message/RegExp/constructor forms), and the `.not` modifier over all of them.
+- **Async assertions** — `await expect(promise).resolves.<matcher>` and
+  `.rejects.<matcher>`.
+- **`expect.*` helpers, as feasible** — `expect.any`, `expect.anything`,
+  `expect.objectContaining`, `expect.arrayContaining`,
+  `expect.stringContaining`, `expect.stringMatching`, as asymmetric matchers
+  inside `toEqual` / `toMatchObject`.
+
+Out of scope, and honest about why — this is untrusted code in a constrained
+isolate with a brokered fetch, not a full test runner on a Node host:
+
+- **No snapshot matchers** (`toMatchSnapshot` / `toMatchInlineSnapshot`) — there
+  is no snapshot file store in the isolate and nothing to write one to; the
+  matcher is unimplemented and fails with the matcher named (never a silent
+  pass), same as any unknown matcher.
+- **No module mocking** — `vi.mock` / `jest.mock` / `vi.fn` / `jest.fn` /
+  `vi.spyOn` and friends are absent. The isolate resolves no modules to mock
+  (§2: only the four injected modules exist), and mock-based tests generally
+  test the author's own bundled code, not the target's observable HTTP
+  behavior, which is the only thing `axp-exec@1` is scoped to assert (§7).
+- **No fake timers** (`vi.useFakeTimers` / `jest.useFakeTimers`) — absent in v1
+  unless a later version finds a trivially-supportable subset; `Date` is not
+  frozen (§5.5) and time-dependent assertions are not evidenceable from the
+  transcript anyway.
+- **No global test config side-channels** — `vi.setConfig`, custom reporters,
+  `expect.extend` with author matchers (an author matcher would be code
+  computing its own verdict — see §5.3), and environment/setup-file hooks are
+  not honored. The only recognized suite-level export is `globals` (opt-out)
+  and `environments` (§3).
+
+The boundary is enforced, not merely documented: any unrecognized matcher,
+`expect.extend`, or `vi`/`jest` mock call reaches a shim stub that **fails the
+run with the symbol named** rather than passing silently. A suite leaning on an
+out-of-scope feature learns exactly which one at the first call, in the
+evidence.
 
 **Card declaration.** `interfaces.testSuite` gains nothing mandatory; the
 `runner` member takes the new value, and the artifact is named one of two ways:
@@ -244,8 +315,8 @@ POST /suite  (runner: axp-exec@1)          card path: published-test-suite check
     compatibilityDate: PINNED_COMPAT_DATE,        // api.qa's constant, not the card's
     mainModule: 'entry.mjs',                      // api.qa's wrapper, not the suite
     modules: {
-      'entry.mjs':  { js: HARNESS_ENTRY },        // runs collect → run → report
-      'vitest':     { js: VITEST_SHIM },          // describe/it/expect harness
+      'entry.mjs':  { js: HARNESS_ENTRY },        // installs globals (unless opted out) → import suite → collect → run → report
+      'vitest':     { js: VITEST_SHIM },          // describe/it/expect harness — same impl as the globals
       'axp:suite':  { js: CONTEXT_MODULE },       // target, vars, http
       'suite.mjs':  { js: suiteSource },          // THE published code, verbatim
     },
@@ -309,6 +380,16 @@ same bar.
    ported) — is computed by the **parent** from this log. The loaded code
    never returns "I passed"; it returns raw assertion events the parent
    judges. That is the same observe/judge split the declarative path enforces.
+   **The globals default changes nothing here.** The `expect` reachable as a
+   global is the identical shim instance reachable via `import … from
+   'vitest'` — the same `describe`/`it` collector and the same reporter
+   channel back it. Whichever way the suite reaches the API, every assertion
+   still emits a typed event to the `REPORTER` binding and the parent still
+   computes the verdict from that log; there is no globals-only path that
+   returns a boolean, sets a "passed" flag, or bypasses the reporter. A suite
+   cannot vote on its own outcome by any route, imported or global, because
+   the only thing either route exposes is assertion *events* — the pass/fail
+   arithmetic lives in the parent, outside the isolate.
 
 4. **Re-judgeable without re-execution.** verdict = pure function of
    (suiteDigest, harnessVersion, compatibilityDate, assertion log, transcript,
@@ -486,6 +567,27 @@ declarative dialect is unchanged and remains the default.
   digest. Recommended posture for estate properties: top-level declarative
   (maximum verifier compatibility), executable in `suites`.
 
+**Authoring ergonomics — the existing-suite path.** Because the harness is
+jest/vitest-global-compatible, the executable suite is not new code a property
+has to write from scratch: it is the vitest suite the property **already has**.
+The published-verification law already wants every estate property to carry a
+vitest suite; that suite — globals or imports, whichever style it was written
+in — becomes the published `axp-exec@1` artifact with little to no change. Two
+properties matter for this to hold:
+
+- **No source edits to adopt.** A Jest- or vitest-shaped file needs no import
+  rewrite (globals are the default) and no matcher rewrite (the in-scope set
+  above covers the common surface). The author's remaining work is the build,
+  not the tests: bundle to one self-contained ESM (§3), and swap network calls
+  for the injected brokered `http` / `axp:suite` target so the run is
+  origin-pinned and recorded.
+- **Still runs under real vitest locally.** The same file keeps passing under
+  the author's own `vitest` — `globals: true` and explicit `import … from
+  'vitest'` both resolve there exactly as they do in the shim — so the
+  published executable suite and the property's local test run are one artifact,
+  not two that can drift. "Publish the tests you already have" is the whole
+  adoption cost.
+
 ---
 
 ## 9. Phased implementation scope (api.qa)
@@ -498,15 +600,21 @@ are inert until Phase 3 wires them to a verdict.
 movement (§8). Files: `spec/PROTOCOL.md`, build output.
 
 **Phase 1 — the vitest shim + assertion protocol (M).** New
-`src/exec-harness/` in api.qa: the `vitest`-aliased harness
-(describe/it/expect + hooks, async-aware, fail-on-zero-tests), the
-`axp:suite` context module, the harness entry (collect → run → drain
-reporter), and the typed assertion-event schema shared with the judge.
-Pure code, unit-testable under real vitest without any loader. The shim's
-matcher surface: `toBe`, `toEqual`, `toMatchObject`, `toContain`,
-`toBeGreaterThan`-family, `toThrow`, `resolves`/`rejects` — the practical
-80%; unknown matcher → run fails with the matcher named (never a silent
-pass). Files: `src/exec-harness/*` (new), `test/exec-harness.test.ts` (new).
+`src/exec-harness/` in api.qa: the harness (describe/it/test + hooks,
+async-aware, fail-on-zero-tests), exposed **both** as globals (installed by
+the entry before the suite evaluates — the default) and as the `vitest`-aliased
+module export, one implementation behind both; the `axp:suite` context module;
+the harness entry (install globals unless opted out → import suite → collect →
+run → drain reporter); and the typed assertion-event schema shared with the
+judge. Pure code, unit-testable under real vitest without any loader. The shim's
+matcher surface is the jest/vitest-compatibility set of §3 (structure/hooks,
+`expect` core matchers with `.not`, `resolves`/`rejects`, and the feasible
+`expect.*` asymmetric helpers); out-of-scope symbols (snapshots, `vi`/`jest`
+mocks, fake timers, `expect.extend`) resolve to a stub that fails the run with
+the symbol named — never a silent pass. Tests cover globals-form and
+import-form suites producing identical assertion events, and a jest-shaped
+fixture running unmodified. Files: `src/exec-harness/*` (new),
+`test/exec-harness.test.ts` (new).
 
 **Phase 2 — the Worker Loader runtime (M).** `wrangler.jsonc` gains
 `"worker_loaders": [{ "binding": "SUITE_LOADER" }]` (types via
