@@ -20,10 +20,15 @@
  *   THE NETWORK FLOOR — `globalOutbound` is REQUIRED: every fetch the isolate
  *   makes is delivered to a parent-owned gateway that applies
  *   `isFloorBlockedHost` per request and per redirect hop (`gatewayFetch`,
- *   the same floor the local runner's gated fetch applies). Leaving
- *   `globalOutbound` unspecified would inherit the verifier's OWN network
- *   access — the one catastrophic misconfiguration — so a runner constructed
- *   without an outbound gateway REFUSES to execute (typed
+ *   the same floor the local runner's gated fetch applies). A refusal is
+ *   recorded OUT-OF-BAND in the parent's own violation sink
+ *   (`createOutboundGateway`), drained by the runner after the isolate
+ *   returns and folded into the verdict — so suite code that catches the
+ *   refusal (or tampers with anything inside the isolate) still FAILS the
+ *   run, identically to the local runner (A.8.6.3 fail-closed totality).
+ *   Leaving `globalOutbound` unspecified would inherit the verifier's OWN
+ *   network access — the one catastrophic misconfiguration — so a runner
+ *   constructed without an outbound gateway REFUSES to execute (typed
  *   `runner-unavailable`), it never runs open.
  *
  *   METERED BREAKER — `limits.cpuMs` in the isolate (throws on breach), the
@@ -118,18 +123,43 @@ export function unavailableExecRunner(reason: string = RUNNER_UNAVAILABLE_NO_BIN
 // ---------------------------------------------------------------------------
 
 /**
+ * Marker header stamped on every gateway-refused response: `"violation"` when
+ * the floor/verb gate refused (a `GateViolation` was recorded), `"error"` when
+ * the egress attempt failed for a non-gate reason (unroutable, too many
+ * redirects). The value is a FLAG only — the reason travels in the JSON body,
+ * because header values cannot carry the reasons' full character set. The
+ * isolate entry's fetch wrapper reads this marker to re-throw with the reason
+ * (local-parity throw semantics) and, on `"violation"`, to record the refusal
+ * in the run's own violation list.
+ */
+export const GATEWAY_MARKER_HEADER = 'x-apiqa-gateway'
+
+/**
  * Handle ONE outbound request delivered by the isolate's `globalOutbound`.
  * Reuses the SAME gated fetch the local runner uses (`createGatedFetch`), so
  * the floor and the manual per-hop redirect re-check cannot drift between
  * hosts. The eventual gateway entrypoint (deploy-time, beta account) is a
  * thin wrapper over this function; the floor logic lives HERE, unit-tested.
+ *
+ * What this function itself guarantees on a refusal: the request is NOT
+ * forwarded, the refusal is recorded in the caller-owned `opts.violations`
+ * sink (out-of-band — isolate code can never reach it), and the 403 handed
+ * back to the isolate carries the `GATEWAY_MARKER_HEADER`. It does NOT, by
+ * itself, fail the run: the run-level fail-closed verdict is enforced by
+ * `workerLoaderExecRunner`, which drains the sink after the isolate returns
+ * and folds it into the outcome — so a suite that catches the re-thrown
+ * refusal (or absorbs the 403) still fails. Call this through
+ * `createOutboundGateway` so the sink actually reaches the runner; with no
+ * sink wired, the marker + the entry wrapper's in-isolate record are the only
+ * channels, which is NOT sufficient for the attested path.
  */
 export async function gatewayFetch(
   request: Request,
   realFetch: (url: string, init?: RequestInit) => Promise<Response> = (url, init) => fetch(url, init),
-  opts: { sandbox?: boolean } = {},
+  opts: { sandbox?: boolean; violations?: GateViolation[] } = {},
 ): Promise<Response> {
-  const violations: GateViolation[] = []
+  const violations = opts.violations ?? []
+  const before = violations.length
   const gated = createGatedFetch({ realFetch, sandbox: opts.sandbox ?? true, violations })
   try {
     const headers: Record<string, string> = {}
@@ -142,14 +172,47 @@ export async function gatewayFetch(
       body: request.method === 'GET' || request.method === 'HEAD' ? undefined : await request.text(),
     })
   } catch (err) {
-    // The isolate sees an ordinary failed fetch with the refusal named; the
-    // verb/floor policy ALSO fails the run via the in-isolate wrapper's
-    // violation record, so a caught throw cannot become a pass.
     return new Response(
       JSON.stringify({ type: 'BLOCKED', reason: err instanceof Error ? err.message : String(err) }),
-      { status: 403, headers: { 'content-type': 'application/json' } },
+      {
+        status: 403,
+        headers: {
+          'content-type': 'application/json',
+          [GATEWAY_MARKER_HEADER]: violations.length > before ? 'violation' : 'error',
+        },
+      },
     )
   }
+}
+
+/**
+ * A parent-owned egress gateway INSTANCE: `fetch` is the `globalOutbound`
+ * delivery handler (the floor, per request and per redirect hop), and
+ * `drainViolations` hands the out-of-band refusal record to the runner and
+ * clears it. This pairing is the A.8.6.3 fail-closed spine of the hosted
+ * path: the record lives in PARENT memory, so nothing suite code does inside
+ * the isolate — catching, patching globals, forging the response body — can
+ * erase it. Prefer one instance per run; a gateway shared across concurrent
+ * runs can only over-attribute a violation, which errs in the CLOSED
+ * direction (a run may be failed by a neighbour's refusal, never passed by
+ * one). At deploy time, expose this from a same-isolate loopback entrypoint
+ * (`ctx.exports`) so the runner can actually drain it.
+ */
+export function createOutboundGateway(
+  realFetch?: (url: string, init?: RequestInit) => Promise<Response>,
+  opts: { sandbox?: boolean } = {},
+): OutboundGatewayLike {
+  const violations: GateViolation[] = []
+  return {
+    fetch: (request: Request) => gatewayFetch(request, realFetch, { ...opts, violations }),
+    drainViolations: () => violations.splice(0, violations.length),
+  }
+}
+
+/** The gateway shape the runner can drain the out-of-band record from. */
+export interface OutboundGatewayLike {
+  fetch(request: Request): Promise<Response>
+  drainViolations(): GateViolation[] | Promise<GateViolation[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +222,9 @@ export async function gatewayFetch(
 /**
  * The generated isolate ENTRY — orchestration only: create the one shared
  * harness, seed `Math.random` from the harness's own generator, wrap the
- * (already gateway-brokered) global fetch with the A.8.6.4 verb gate,
+ * (already gateway-brokered) global fetch with the A.8.6.4 verb gate and the
+ * gateway-marker re-throw (a floor refusal surfaces as the SAME throw the
+ * local gated fetch gives, recorded in the run's violation list),
  * install the document-form globals, instantiate the pinned module(s), run,
  * and return the raw results as the Response body. The verdict is computed by
  * the PARENT (`foldRunOutcome`) — the isolate returns events, never "passed".
@@ -173,6 +238,13 @@ const SANDBOX = ${JSON.stringify(req.sandbox)}
 const DOCUMENT = ${JSON.stringify(req.artifactKind === 'document')}
 const HAS_MODULE = ${JSON.stringify(hasModule)}
 const EXPORT_NAME = ${JSON.stringify(req.exportName ?? null)}
+const MARKER = ${JSON.stringify(GATEWAY_MARKER_HEADER)}
+
+// Captured at entry evaluation — BEFORE any suite byte runs — so suite code
+// patching Response/JSON cannot forge the body the parent folds. (The
+// authoritative fail-closed record is the parent-side gateway sink anyway;
+// this keeps the in-isolate channel honest too.)
+const RESPOND = ((R, S) => (data) => new R(S(data), { headers: { 'content-type': 'application/json' } }))(Response, JSON.stringify)
 
 export default {
   async fetch() {
@@ -189,7 +261,23 @@ export default {
         violations.push({ url, reason })
         throw new Error(reason)
       }
-      return realFetch(input, init)
+      const res = await realFetch(input, init)
+      // Every egress rides globalOutbound = the parent gateway; a marked 403
+      // is the gateway's refusal. Record it (violation ⇒ fails the run even
+      // if caught) and THROW — the same shape the local gated fetch gives.
+      if (res.status === 403) {
+        const marker = res.headers.get(MARKER)
+        if (marker !== null) {
+          let reason = 'refused by the egress gateway'
+          try {
+            const body = await res.clone().json()
+            if (body && typeof body.reason === 'string') reason = body.reason
+          } catch {}
+          if (marker === 'violation') violations.push({ url, reason })
+          throw new Error(reason)
+        }
+      }
+      return res
     }
     try {
       if (DOCUMENT) for (const n of SUBSET_GLOBALS) globalThis[n] = harness.api[n]
@@ -201,9 +289,9 @@ export default {
         await fn()
       }
       const { registered, results } = await harness.run()
-      return Response.json({ registered, results, violations })
+      return RESPOND({ registered, results, violations })
     } catch (err) {
-      return Response.json({ error: err instanceof Error ? err.message : String(err), violations })
+      return RESPOND({ error: err instanceof Error ? err.message : String(err), violations })
     }
   }
 }
@@ -253,6 +341,26 @@ export interface WorkerLoaderRunnerOpts {
    * verifier's own network access.
    */
   outbound?: unknown
+  /**
+   * Drain the PARENT-SIDE violation record after the isolate returns — the
+   * out-of-band half of A.8.6.3 fail-closed totality: a floor refusal
+   * recorded here fails the run no matter what the suite caught, forged, or
+   * suppressed inside the isolate. Defaults to `outbound.drainViolations`
+   * when the outbound is an `OutboundGatewayLike`. When a drain exists but
+   * THROWS, the run fails closed (the record could not be consulted).
+   */
+  drainViolations?: () => GateViolation[] | Promise<GateViolation[]>
+}
+
+/** The named fail-closed reason when the parent-side record cannot be read. */
+export const GATEWAY_RECORD_UNREADABLE =
+  "the egress gateway's out-of-band violation record could not be read after the run — failing closed: " +
+  'without the record, a floor refusal could have been swallowed inside the isolate (A.8.6.3)'
+
+function hasDrain(x: unknown): x is OutboundGatewayLike {
+  return (
+    typeof x === 'object' && x !== null && typeof (x as Record<string, unknown>).drainViolations === 'function'
+  )
 }
 
 export function workerLoaderExecRunner(
@@ -263,6 +371,18 @@ export function workerLoaderExecRunner(
     async run(req: ExecRunRequest): Promise<ExecRunOutcome> {
       if (opts.outbound === undefined || opts.outbound === null) {
         return { status: 'runner-unavailable', reason: RUNNER_UNAVAILABLE_NO_OUTBOUND }
+      }
+
+      // The out-of-band record's drain seam: explicit, or the gateway's own.
+      const drainFn =
+        opts.drainViolations ?? (hasDrain(opts.outbound) ? () => (opts.outbound as OutboundGatewayLike).drainViolations() : undefined)
+      const drainParentViolations = async (): Promise<GateViolation[] | 'unreadable'> => {
+        if (drainFn === undefined) return []
+        try {
+          return await drainFn()
+        } catch {
+          return 'unreadable'
+        }
       }
 
       // The SAME shared validation the local runner runs — a subset violation
@@ -302,6 +422,9 @@ export function workerLoaderExecRunner(
           breaker,
         ]).finally(() => clearTimeout(timer))
         if (raced === 'breaker') {
+          // Drain (and discard) so a shared gateway cannot carry this run's
+          // refusals into a later run's record; the trip already fails this one.
+          await drainParentViolations()
           return {
             status: 'failed',
             reason:
@@ -315,8 +438,14 @@ export function workerLoaderExecRunner(
           violations?: GateViolation[]
           error?: string
         }
+        // The PARENT-SIDE record outranks anything the isolate reported: it is
+        // the record suite code can never reach. Unreadable ⇒ fail closed.
+        const parentViolations = await drainParentViolations()
+        if (parentViolations === 'unreadable') {
+          return { status: 'failed', reason: GATEWAY_RECORD_UNREADABLE }
+        }
         if (typeof body.error === 'string') {
-          const floored = body.violations?.[0]
+          const floored = parentViolations[0] ?? body.violations?.[0]
           return {
             status: 'failed',
             reason: floored !== undefined ? floored.reason : `the suite failed to instantiate or register: ${body.error}`,
@@ -326,7 +455,7 @@ export function workerLoaderExecRunner(
           {
             registered: body.registered ?? 0,
             results: body.results ?? [],
-            violations: body.violations ?? [],
+            violations: [...parentViolations, ...(body.violations ?? [])],
           },
           req,
           appliedLimits,
@@ -334,6 +463,12 @@ export function workerLoaderExecRunner(
           null, // consumed CPU: surfaced by the platform's limits API when enrolled; recorded null until then
         )
       } catch (err) {
+        // Even a crashed exchange consults the out-of-band record first: a
+        // floor refusal that crashed the run still surfaces BY NAME.
+        const parentViolations = await drainParentViolations()
+        if (parentViolations !== 'unreadable' && parentViolations[0] !== undefined) {
+          return { status: 'failed', reason: parentViolations[0].reason }
+        }
         return {
           status: 'failed',
           reason: `the Worker Loader run failed: ${err instanceof Error ? err.message : String(err)}`,

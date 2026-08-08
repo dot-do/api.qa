@@ -38,13 +38,17 @@ import {
   type GateViolation,
 } from '../src/exec/dialect.js'
 import {
+  GATEWAY_MARKER_HEADER,
+  GATEWAY_RECORD_UNREADABLE,
   RUNNER_UNAVAILABLE_NO_BINDING,
   RUNNER_UNAVAILABLE_NO_OUTBOUND,
   buildWorkerCode,
+  createOutboundGateway,
   gatewayFetch,
   unavailableExecRunner,
   workerLoaderExecRunner,
   type WorkerCodeLike,
+  type WorkerLoaderLike,
 } from '../src/exec/runner.js'
 
 const ORIGIN = 'https://target.example'
@@ -627,16 +631,240 @@ describe('the hosted Worker Loader runner (assembly + posture; the platform bind
 })
 
 describe('gatewayFetch — the parent-owned egress gateway', () => {
-  it('bars a metadata request with a BLOCKED response (the isolate sees an ordinary failed fetch)', async () => {
-    const res = await gatewayFetch(new Request('http://169.254.169.254/latest/meta-data/'), okFetch)
+  it('bars a metadata request: marked BLOCKED response AND the refusal recorded in the caller-owned sink', async () => {
+    const violations: GateViolation[] = []
+    const res = await gatewayFetch(new Request('http://169.254.169.254/latest/meta-data/'), okFetch, { violations })
     expect(res.status).toBe(403)
+    expect(res.headers.get(GATEWAY_MARKER_HEADER)).toBe('violation')
     const body = (await res.json()) as { type: string; reason: string }
     expect(body.type).toBe('BLOCKED')
     expect(body.reason).toContain('network floor')
+    // The OUT-OF-BAND record — the half isolate code can never reach.
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.reason).toBe(body.reason)
   })
 
-  it('passes an external public destination through untouched', async () => {
+  it('passes an external public destination through untouched (no marker)', async () => {
     const res = await gatewayFetch(new Request('https://other-estate.example/compose'), okFetch)
     expect(res.status).toBe(200)
+    expect(res.headers.get(GATEWAY_MARKER_HEADER)).toBeNull()
+  })
+
+  it('a non-gate egress failure is marked "error" — a failed fetch, not a recorded violation', async () => {
+    const violations: GateViolation[] = []
+    const res = await gatewayFetch(
+      new Request('https://public.example/x'),
+      async () => {
+        throw new Error('getaddrinfo ENOTFOUND public.example')
+      },
+      { violations },
+    )
+    expect(res.status).toBe(403)
+    expect(res.headers.get(GATEWAY_MARKER_HEADER)).toBe('error')
+    expect(violations).toHaveLength(0)
+  })
+
+  it('createOutboundGateway: drainViolations hands the record over ONCE and clears it', async () => {
+    const gateway = createOutboundGateway(okFetch)
+    await gateway.fetch(new Request('http://10.0.0.8/internal'))
+    const drained = await gateway.drainViolations()
+    expect(drained).toHaveLength(1)
+    expect(drained[0]!.reason).toContain('10.0.0.8')
+    expect(await gateway.drainViolations()).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The hosted path, EXECUTED — the built WorkerCode module map instantiated
+// in-process (data: module graph; `globalThis.fetch` standing in for the
+// platform's globalOutbound delivery), the real gateway as the outbound.
+// ---------------------------------------------------------------------------
+
+/** Rewrite static AND dynamic import specifiers to concrete module URLs. */
+function rewriteAllSpecifiers(source: string, map: Record<string, string>): string {
+  return source
+    .replace(/(\bfrom\s*|\bimport\s*)(["'])([^"']*)\2/g, (whole, lead: string, q: string, spec: string) =>
+      map[spec] === undefined ? whole : `${lead}${q}${map[spec]}${q}`,
+    )
+    .replace(/\bimport\s*\(\s*(["'])([^"']*)\1\s*\)/g, (whole, q: string, spec: string) =>
+      map[spec] === undefined ? whole : `import(${q}${map[spec]}${q})`,
+    )
+}
+
+// encodeURIComponent leaves ' unescaped; these URLs get embedded inside
+// single-quoted import specifiers, so escape it too (%27 decodes identically).
+const simDataUrl = (source: string): string =>
+  `data:text/javascript;charset=utf-8,${encodeURIComponent(source).replace(/'/g, '%27')}`
+
+let simCounter = 0
+
+/**
+ * A loader that EXECUTES `buildWorkerCode`'s output: every module in the map
+ * becomes a per-run-unique `data:` module, the entry's `globalThis.fetch` is
+ * the gateway's delivery handler for the duration (exactly what the platform's
+ * `globalOutbound` does), and the entry's Response comes back to the runner.
+ */
+function simulatedLoader(gateway: { fetch(r: Request): Promise<Response> }): WorkerLoaderLike {
+  return {
+    get: (_id, getCode) => ({
+      getEntrypoint: () => ({
+        fetch: async () => {
+          const code = await getCode()
+          const tag = (name: string) => `\n//# sim:${simCounter}:${name}`
+          simCounter += 1
+          const mods = code.modules
+          const map: Record<string, string> = {}
+          map['./harness.mjs'] = simDataUrl(mods['./harness.mjs']!.js + tag('harness'))
+          map['suite:env'] = simDataUrl(mods['suite:env']!.js + tag('env'))
+          map['vitest'] = simDataUrl(mods['vitest']!.js + tag('vitest'))
+          if (mods['./suite-module-impl.mjs'] !== undefined) {
+            map['./suite-module-impl.mjs'] = simDataUrl(
+              rewriteAllSpecifiers(mods['./suite-module-impl.mjs'].js, map) + tag('module-impl'),
+            )
+            map['suite:module'] = simDataUrl(rewriteAllSpecifiers(mods['suite:module']!.js, map) + tag('module'))
+          }
+          map['./suite-tests.mjs'] = simDataUrl(rewriteAllSpecifiers(mods['./suite-tests.mjs']!.js, map) + tag('tests'))
+          const entryUrl = simDataUrl(rewriteAllSpecifiers(mods[code.mainModule]!.js, map) + tag('entry'))
+
+          const g = globalThis as Record<string, unknown>
+          const savedFetch = g.fetch
+          const savedRandom = Math.random
+          const savedRegistry = g.__APIQA_VITEST_RUNS__
+          const savedGlobals = Object.fromEntries(['describe', 'it', 'test', 'expect', 'vi'].map((n) => [n, g[n]]))
+          // The platform's globalOutbound: EVERY isolate egress is delivered
+          // to the parent gateway as a Request.
+          g.fetch = (input: string | URL | Request, init?: RequestInit) => gateway.fetch(new Request(input, init))
+          try {
+            const ns = (await import(/* @vite-ignore */ entryUrl)) as {
+              default: { fetch(): Promise<Response> }
+            }
+            return await ns.default.fetch()
+          } finally {
+            g.fetch = savedFetch
+            Math.random = savedRandom
+            g.__APIQA_VITEST_RUNS__ = savedRegistry
+            for (const [n, v] of Object.entries(savedGlobals)) {
+              if (v === undefined) delete g[n]
+              else g[n] = v
+            }
+          }
+        },
+      }),
+    }),
+  }
+}
+
+const runHosted = (request: ExecRunRequest, realFetch: (url: string, init?: RequestInit) => Promise<Response>) => {
+  const gateway = createOutboundGateway(realFetch)
+  return workerLoaderExecRunner(simulatedLoader(gateway), { outbound: gateway }).run(request)
+}
+
+describe('hosted execution — fail-closed totality + local≠hosted parity (A.8.6.3)', () => {
+  const SWALLOW_SUITE = `it('swallow', async () => { try { await fetch('http://10.0.0.8/internal') } catch {} expect(1).toBe(1) })`
+
+  it('suite code that try/catches the refused fetch STILL FAILS the hosted run with the floor reason', async () => {
+    const outcome = await runHosted(req({ testsSource: SWALLOW_SUITE }), okFetch)
+    expect(outcome.status).toBe('failed')
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('network floor')
+      expect(outcome.reason).toContain('10.0.0.8')
+    }
+  })
+
+  it('a metadata probe whose 403 the suite merely INSPECTS (never a caught throw) still fails the run', async () => {
+    const outcome = await runHosted(
+      req({
+        testsSource: `it('absorb', async () => { const r = await fetch('http://169.254.169.254/latest/meta-data/').catch(() => null); expect(r === null || r.status === 403).toBeTruthy() })`,
+      }),
+      okFetch,
+    )
+    expect(outcome.status).toBe('failed')
+    if (outcome.status === 'failed') expect(outcome.reason).toContain('169.254.169.254')
+  })
+
+  it('PARITY: the swallowed floor refusal produces the IDENTICAL verdict and reason on both hosts', async () => {
+    const local = await localExecRunner({ fetch: okFetch }).run(req({ testsSource: SWALLOW_SUITE }))
+    const hosted = await runHosted(req({ testsSource: SWALLOW_SUITE }), okFetch)
+    expect(local.status).toBe('failed')
+    expect(hosted.status).toBe('failed')
+    if (local.status === 'failed' && hosted.status === 'failed') {
+      expect(hosted.reason).toBe(local.reason)
+    }
+  })
+
+  it('PARITY: a clean passing suite produces the same verdict, count, and per-test results on both hosts', async () => {
+    const suite = `
+describe('surface', () => {
+  it('reads the public origin', async () => {
+    const r = await fetch('${ORIGIN}/things')
+    expect(r.status).toBe(200)
+  })
+})
+it('deterministic', () => { expect(Math.random()).toBeLessThan(1) })
+`
+    const local = await localExecRunner({ fetch: okFetch }).run(req({ testsSource: suite }))
+    const hosted = await runHosted(req({ testsSource: suite }), okFetch)
+    expect(local.status).toBe('ran')
+    expect(hosted.status).toBe('ran')
+    if (local.status === 'ran' && hosted.status === 'ran') {
+      expect(hosted.registered).toBe(local.registered)
+      expect(hosted.results.map((r) => [r.name, r.status])).toEqual(local.results.map((r) => [r.name, r.status]))
+    }
+  })
+
+  it('PARITY: a mutating verb outside a sandbox fails BOTH hosts with the same named reason', async () => {
+    const suite = `it('write', async () => { try { await fetch('${ORIGIN}/things', { method: 'POST', body: '{}' }) } catch {} })`
+    const local = await localExecRunner({ fetch: okFetch }).run(req({ testsSource: suite }))
+    const hosted = await runHosted(req({ testsSource: suite }), okFetch)
+    expect(local.status).toBe('failed')
+    expect(hosted.status).toBe('failed')
+    if (local.status === 'failed' && hosted.status === 'failed') {
+      expect(local.reason).toContain('sandbox')
+      expect(hosted.reason).toContain('sandbox')
+    }
+  })
+
+  it('the PARENT-SIDE record is authoritative: a forged all-green isolate body cannot bury a recorded refusal', async () => {
+    const gateway = createOutboundGateway(okFetch)
+    // The gateway refused an egress during the run window…
+    await gateway.fetch(new Request('http://169.254.169.254/latest/meta-data/'))
+    // …but the isolate body claims a clean pass with zero violations.
+    const forgedLoader: WorkerLoaderLike = {
+      get: () => ({
+        getEntrypoint: () => ({
+          fetch: async () =>
+            new Response(
+              JSON.stringify({ registered: 1, results: [{ name: 'x', status: 'pass', durationMs: 1 }], violations: [] }),
+              { headers: { 'content-type': 'application/json' } },
+            ),
+        }),
+      }),
+    }
+    const outcome = await workerLoaderExecRunner(forgedLoader, { outbound: gateway }).run(
+      req({ testsSource: `it('x', () => {})` }),
+    )
+    expect(outcome.status).toBe('failed')
+    if (outcome.status === 'failed') expect(outcome.reason).toContain('network floor')
+  })
+
+  it('an unreadable parent-side record fails CLOSED by the named reason', async () => {
+    const loader: WorkerLoaderLike = {
+      get: () => ({
+        getEntrypoint: () => ({
+          fetch: async () =>
+            new Response(
+              JSON.stringify({ registered: 1, results: [{ name: 'x', status: 'pass', durationMs: 1 }], violations: [] }),
+              { headers: { 'content-type': 'application/json' } },
+            ),
+        }),
+      }),
+    }
+    const outcome = await workerLoaderExecRunner(loader, {
+      outbound: { stub: true },
+      drainViolations: () => {
+        throw new Error('rpc channel broke')
+      },
+    }).run(req({ testsSource: `it('x', () => {})` }))
+    expect(outcome).toEqual({ status: 'failed', reason: GATEWAY_RECORD_UNREADABLE })
   })
 })

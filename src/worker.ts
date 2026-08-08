@@ -157,12 +157,18 @@ export interface Env {
    */
   SUITE_LOADER?: WorkerLoaderLike
   /**
-   * The egress gateway service binding every isolate fetch is delivered to
+   * The egress gateway every isolate fetch is delivered to
    * (`globalOutbound`). REQUIRED alongside SUITE_LOADER: without it the
    * runner refuses to run rather than inherit this worker's own network
-   * access (the A.8.6.3 floor). The gateway's fetch handler is
-   * `gatewayFetch` (src/exec/runner.ts) — a thin service wrapper at deploy
-   * time; the floor logic itself is in-repo and unit-tested.
+   * access (the A.8.6.3 floor). Build it on `createOutboundGateway`
+   * (src/exec/runner.ts) and expose it from a same-isolate loopback
+   * entrypoint (`ctx.exports`), so it carries BOTH halves of the floor:
+   * `fetch` (the refusal itself) and `drainViolations` (the out-of-band
+   * record the runner folds into the verdict — the half that makes a
+   * caught/absorbed refusal still fail the run, A.8.6.3 fail-closed
+   * totality). The runner auto-detects `drainViolations` on this binding; a
+   * plain fetch-only service binding leaves only the in-isolate record,
+   * which is NOT sufficient for the attested path.
    */
   SUITE_OUTBOUND?: unknown
 }
