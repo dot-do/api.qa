@@ -36,9 +36,11 @@
  *   whole run fails, never a partial verdict.
  *
  * FEATURE DETECTION. The Worker Loader binding is an open-beta, paid-plan
- * capability. `wrangler.jsonc` documents (but does not enable) the binding so
- * every account keeps valid deploys; `worker.ts` wires this runner ONLY when
- * `env.SUITE_LOADER` exists. Anywhere the binding — or the outbound gateway —
+ * capability, ENABLED in `wrangler.jsonc` since the 2026-08-08 account
+ * enrollment (SUITE_LOADER + the SuiteGateway loopback outbound) — but
+ * `worker.ts` still wires this runner ONLY when `env.SUITE_LOADER` exists,
+ * so a config rollback keeps every deploy valid.
+ * Anywhere the binding — or the outbound gateway —
  * is absent, the runner is `unavailableExecRunner(...)`: a card that declares
  * `runner: "api.qa/vitest@1"` then FAILS with the reason named (the same
  * direction the ratified unknown-runner rule already gives an older
@@ -195,8 +197,9 @@ export async function gatewayFetch(
  * erase it. Prefer one instance per run; a gateway shared across concurrent
  * runs can only over-attribute a violation, which errs in the CLOSED
  * direction (a run may be failed by a neighbour's refusal, never passed by
- * one). At deploy time, expose this from a same-isolate loopback entrypoint
- * (`ctx.exports`) so the runner can actually drain it.
+ * one). At deploy time this is exposed from a same-isolate loopback
+ * entrypoint (`SuiteGateway`, src/exec/gateway.ts — the SUITE_OUTBOUND
+ * service binding) so the runner can actually drain it.
  */
 export function createOutboundGateway(
   realFetch?: (url: string, init?: RequestInit) => Promise<Response>,
