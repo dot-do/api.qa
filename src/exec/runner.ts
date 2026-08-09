@@ -125,6 +125,86 @@ export function unavailableExecRunner(reason: string = RUNNER_UNAVAILABLE_NO_BIN
 // ---------------------------------------------------------------------------
 
 /**
+ * THE CONNECTION BUDGET (ax: burst-vs-sibling isolation). A workerd isolate
+ * may hold only ~6 simultaneous open connections; past the budget the runtime
+ * force-closes the least-recently-used open response body, which surfaces to
+ * whoever was reading it as "Response closed due to connection limit". A suite
+ * test that BURSTS concurrent fetches (a 429 rate-limit test firing dozens of
+ * requests, bodies never read) would otherwise exhaust the budget and corrupt
+ * a SIBLING test's plain GET-and-parse mid-read — the verdict would then
+ * reflect the runner's plumbing, not the target's behavior. Two guards, both
+ * applied per isolate AND at the parent gateway:
+ *
+ *   1. A SEMAPHORE bounds in-flight fetches to EXEC_MAX_CONCURRENT_FETCHES
+ *      (headroom under the budget); excess fetches QUEUE, they are never
+ *      refused — the suite's assertions see the same statuses/bodies, only
+ *      the wire-level concurrency is shaped.
+ *   2. Every non-stream response body is FULLY BUFFERED while the slot is
+ *      held (`bufferResponse`), so an unread body can never pin a connection
+ *      after its fetch resolves. `text/event-stream` responses pass through
+ *      as live streams (buffering one would hang until the wall breaker) and
+ *      release their slot on arrival.
+ *
+ * Neither guard changes what a suite test can assert: status, statusText,
+ * headers, url, and body bytes are preserved verbatim.
+ */
+export const EXEC_MAX_CONCURRENT_FETCHES = 5
+
+/** A tiny FIFO semaphore bounding concurrent in-flight fetches. */
+export interface FetchLimiter {
+  acquire(): Promise<void>
+  release(): void
+}
+
+export function createFetchLimiter(max: number = EXEC_MAX_CONCURRENT_FETCHES): FetchLimiter {
+  let inFlight = 0
+  const waiters: Array<() => void> = []
+  return {
+    acquire(): Promise<void> {
+      if (inFlight < max) {
+        inFlight += 1
+        return Promise.resolve()
+      }
+      return new Promise((resolve) => waiters.push(resolve))
+    },
+    release(): void {
+      const next = waiters.shift()
+      if (next !== undefined) next() // the slot transfers; inFlight is unchanged
+      else inFlight -= 1
+    },
+  }
+}
+
+/** Statuses the Response constructor refuses a body for (RFC 9110 null-body). */
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304])
+
+/**
+ * Read a response FULLY into memory and hand back a memory-backed equivalent
+ * — same status, statusText, headers, url, and body bytes — so the underlying
+ * connection is consumed and closed the moment the fetch resolves, whether or
+ * not the suite ever reads the body. `text/event-stream` responses are
+ * returned untouched (a live stream must stay live). This is the half of the
+ * connection-budget guard that makes an UNREAD body harmless.
+ */
+export async function bufferResponse(res: Response): Promise<Response> {
+  const ctype = (res.headers.get('content-type') ?? '').toLowerCase()
+  if (ctype.includes('text/event-stream')) return res
+  if (res.body === null) return res
+  const buf = await res.arrayBuffer()
+  const out = new Response(NULL_BODY_STATUSES.has(res.status) ? null : buf, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  })
+  try {
+    Object.defineProperty(out, 'url', { value: res.url })
+  } catch {
+    // A runtime with a non-configurable url getter keeps its own value.
+  }
+  return out
+}
+
+/**
  * Marker header stamped on every gateway-refused response: `"violation"` when
  * the floor/verb gate refused (a `GateViolation` was recorded), `"error"` when
  * the egress attempt failed for a non-gate reason (unroutable, too many
@@ -158,21 +238,27 @@ export const GATEWAY_MARKER_HEADER = 'x-apiqa-gateway'
 export async function gatewayFetch(
   request: Request,
   realFetch: (url: string, init?: RequestInit) => Promise<Response> = (url, init) => fetch(url, init),
-  opts: { sandbox?: boolean; violations?: GateViolation[] } = {},
+  opts: { sandbox?: boolean; violations?: GateViolation[]; limiter?: FetchLimiter } = {},
 ): Promise<Response> {
   const violations = opts.violations ?? []
   const before = violations.length
   const gated = createGatedFetch({ realFetch, sandbox: opts.sandbox ?? true, violations })
+  // The connection-budget guard, parent side: bound in-flight upstream
+  // fetches and consume every non-stream body while the slot is held — a
+  // suite burst can queue here, it can never pin unread upstream connections
+  // against the parent isolate's budget (see EXEC_MAX_CONCURRENT_FETCHES).
+  if (opts.limiter !== undefined) await opts.limiter.acquire()
   try {
     const headers: Record<string, string> = {}
     request.headers.forEach((v, k) => {
       headers[k] = v
     })
-    return await gated(request.url, {
+    const res = await gated(request.url, {
       method: request.method,
       headers,
       body: request.method === 'GET' || request.method === 'HEAD' ? undefined : await request.text(),
     })
+    return await bufferResponse(res)
   } catch (err) {
     return new Response(
       JSON.stringify({ type: 'BLOCKED', reason: err instanceof Error ? err.message : String(err) }),
@@ -184,6 +270,8 @@ export async function gatewayFetch(
         },
       },
     )
+  } finally {
+    opts.limiter?.release()
   }
 }
 
@@ -206,8 +294,12 @@ export function createOutboundGateway(
   opts: { sandbox?: boolean } = {},
 ): OutboundGatewayLike {
   const violations: GateViolation[] = []
+  // ONE limiter per gateway instance: the module-level deploy gateway is
+  // shared across concurrent runs, so this bound is what actually protects
+  // the parent isolate's connection budget from ANY combination of suites.
+  const limiter = createFetchLimiter()
   return {
-    fetch: (request: Request) => gatewayFetch(request, realFetch, { ...opts, violations }),
+    fetch: (request: Request) => gatewayFetch(request, realFetch, { ...opts, violations, limiter }),
     drainViolations: () => violations.splice(0, violations.length),
   }
 }
@@ -242,6 +334,7 @@ const DOCUMENT = ${JSON.stringify(req.artifactKind === 'document')}
 const HAS_MODULE = ${JSON.stringify(hasModule)}
 const EXPORT_NAME = ${JSON.stringify(req.exportName ?? null)}
 const MARKER = ${JSON.stringify(GATEWAY_MARKER_HEADER)}
+const MAX_CONCURRENT_FETCHES = ${JSON.stringify(EXEC_MAX_CONCURRENT_FETCHES)}
 
 // Captured at entry evaluation — BEFORE any suite byte runs — so suite code
 // patching Response/JSON cannot forge the body the parent folds. (The
@@ -256,6 +349,29 @@ export default {
     globalThis[${JSON.stringify('__APIQA_VITEST_RUNS__')}] = { [${JSON.stringify(HOSTED_RUN_ID)}]: { api: harness.api } }
     Math.random = seededRandom(SEED)
     const realFetch = globalThis.fetch.bind(globalThis)
+    // THE CONNECTION-BUDGET GUARD, isolate side: workerd holds ~6 simultaneous
+    // connections and force-closes the least-recently-used open body past the
+    // budget — so a test bursting concurrent fetches (bodies never read) must
+    // not be able to truncate a SIBLING test's response mid-parse. In-flight
+    // fetches are bounded by a FIFO semaphore (excess QUEUES, nothing is
+    // refused), and every non-stream body is fully buffered while the slot is
+    // held, so an unread response can never pin a connection. Event streams
+    // pass through live. Status/headers/url/bytes are preserved verbatim —
+    // the suite's assertions are untouched, only wire concurrency is shaped.
+    let inFlightFetches = 0
+    const fetchWaiters = []
+    const acquireFetchSlot = () => {
+      if (inFlightFetches < MAX_CONCURRENT_FETCHES) {
+        inFlightFetches += 1
+        return Promise.resolve()
+      }
+      return new Promise((resolve) => fetchWaiters.push(resolve))
+    }
+    const releaseFetchSlot = () => {
+      const next = fetchWaiters.shift()
+      if (next !== undefined) next()
+      else inFlightFetches -= 1
+    }
     globalThis.fetch = async (input, init) => {
       const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input)
       const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase()
@@ -264,23 +380,36 @@ export default {
         violations.push({ url, reason })
         throw new Error(reason)
       }
-      const res = await realFetch(input, init)
-      // Every egress rides globalOutbound = the parent gateway; a marked 403
-      // is the gateway's refusal. Record it (violation ⇒ fails the run even
-      // if caught) and THROW — the same shape the local gated fetch gives.
-      if (res.status === 403) {
-        const marker = res.headers.get(MARKER)
-        if (marker !== null) {
-          let reason = 'refused by the egress gateway'
-          try {
-            const body = await res.clone().json()
-            if (body && typeof body.reason === 'string') reason = body.reason
-          } catch {}
-          if (marker === 'violation') violations.push({ url, reason })
-          throw new Error(reason)
+      await acquireFetchSlot()
+      try {
+        const res = await realFetch(input, init)
+        const ctype = (res.headers.get('content-type') || '').toLowerCase()
+        // A live event stream stays live (buffering would hang to the wall
+        // breaker); its slot frees on arrival, the stream itself rides on.
+        if (ctype.indexOf('text/event-stream') !== -1) return res
+        const buf = res.body === null ? null : await res.arrayBuffer()
+        // Every egress rides globalOutbound = the parent gateway; a marked 403
+        // is the gateway's refusal. Record it (violation ⇒ fails the run even
+        // if caught) and THROW — the same shape the local gated fetch gives.
+        if (res.status === 403) {
+          const marker = res.headers.get(MARKER)
+          if (marker !== null) {
+            let reason = 'refused by the egress gateway'
+            try {
+              const body = JSON.parse(new TextDecoder().decode(buf))
+              if (body && typeof body.reason === 'string') reason = body.reason
+            } catch {}
+            if (marker === 'violation') violations.push({ url, reason })
+            throw new Error(reason)
+          }
         }
+        const nullBody = res.status === 101 || res.status === 204 || res.status === 205 || res.status === 304
+        const out = new Response(nullBody ? null : buf, { status: res.status, statusText: res.statusText, headers: res.headers })
+        try { Object.defineProperty(out, 'url', { value: res.url }) } catch {}
+        return out
+      } finally {
+        releaseFetchSlot()
       }
-      return res
     }
     try {
       if (DOCUMENT) for (const n of SUBSET_GLOBALS) globalThis[n] = harness.api[n]

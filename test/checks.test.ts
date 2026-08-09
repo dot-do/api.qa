@@ -212,3 +212,97 @@ describe('content-negotiation grades Accept: application/json (ax-c7m)', () => {
     expect(grade).toBe('A+')
   })
 })
+
+// ---------------------------------------------------------------------------
+// keyless-flow sampler robustness (ax: keyed-door-heavy properties).
+//
+// Modeled on apis.vin: a card declaring MANY own-scope KEYED doors (/keys/me,
+// /usage, /dealer/leads — all CORRECTLY 401 a keyless probe) beside a few
+// genuinely keyless doors (/listings, /pricing → 200). The old sampler drew 3
+// random candidates and failed when all 3 landed on keyed doors — keyless-
+// first held on the surface, the verdict was sampling noise. The fix walks
+// candidates (card-hinted keyless doors first, then escalation past the first
+// wave up to MAX_KEYLESS_PROBE_TOTAL) until a keyless door is FOUND, and
+// fails ONLY when no walked door grants keyless access — escalation widens
+// the search, never the acceptance.
+// ---------------------------------------------------------------------------
+
+import { MAX_KEYLESS_PROBES, MAX_KEYLESS_PROBE_TOTAL } from '../src/discovery.js'
+import type { Evidence } from '../src/types.js'
+
+function keyedHeavyRoutes(opts: { keyed: number; keyless: string[]; hintKeyless: boolean }): Routes {
+  const base = goodTargetRoutes()
+  const agents = JSON.parse(base['GET /.well-known/agents.json']!({ method: 'GET', accept: '*/*' }).body!)
+  const paths: Record<string, unknown> = {}
+  const over: Routes = {}
+  agents.interfaces.http = {}
+  for (let i = 1; i <= opts.keyed; i++) {
+    const p = `/api/keyed${String(i).padStart(2, '0')}`
+    // NO auth hint on the card, NO security in the openapi — exactly the
+    // under-hinted card shape that made keyed doors look like candidates.
+    agents.interfaces.http[`keyed${i}`] = { method: 'GET', url: `${GOOD}${p}` }
+    paths[p] = { get: { responses: { '200': { description: 'ok' } } } }
+    over[`GET ${p}`] = () => ({ status: 401, contentType: 'application/json', body: '{"error":"key required"}' })
+  }
+  for (const p of opts.keyless) {
+    agents.interfaces.http[p] = opts.hintKeyless
+      ? { method: 'GET', url: `${GOOD}${p}`, auth: 'none' }
+      : { method: 'GET', url: `${GOOD}${p}` }
+    paths[p] = { get: { responses: { '200': { description: 'ok' } } } }
+    over[`GET ${p}`] = () => ({ status: 200, contentType: 'application/json', body: '{"items":[{"id":1}]}' })
+  }
+  const openapi = { openapi: '3.1.0', info: { title: 'keyed-heavy', version: '1.0.0' }, paths }
+  return withOverrides(withoutRoutes(base, 'GET /api/status', 'GET /api/widgets'), {
+    'GET /.well-known/agents.json': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(agents) }),
+    'GET /openapi.json': () => ({ status: 200, contentType: 'application/json', body: JSON.stringify(openapi) }),
+    ...over,
+  })
+}
+
+const keylessProbesOf = (bundle: { items: Evidence[] }) =>
+  bundle.items.filter((e) => e.role.startsWith('probe:endpoint:'))
+
+describe('keyless-flow sampler — robust against keyed-door-heavy cards', () => {
+  it('(a) many keyed doors + ONE keyless door → PASSES on every seed (escalation finds the keyless door)', async () => {
+    // 9 keyed + 1 keyless = 10 candidates ≤ MAX_KEYLESS_PROBE_TOTAL: the walk
+    // is GUARANTEED to reach /api/listings whatever the seed draws first.
+    for (const seed of [1, 7, 42, 1337]) {
+      const { bundle, checks } = await judge(keyedHeavyRoutes({ keyed: 9, keyless: ['/api/listings'], hintKeyless: false }), seed)
+      const c = checks.find((x) => x.id === 'keyless-flow')
+      expect(c?.verdict, `seed ${seed}: ${c?.detail}`).toBe('pass')
+      const probes = keylessProbesOf(bundle)
+      expect(probes.length).toBeGreaterThanOrEqual(MAX_KEYLESS_PROBES)
+      expect(probes.length).toBeLessThanOrEqual(MAX_KEYLESS_PROBE_TOTAL)
+      expect(probes.some((p) => p.status === 200)).toBe(true)
+    }
+  })
+
+  it('a card-hinted keyless door (interfaces.http auth:"none") is walked FIRST — resolved inside the cheap wave', async () => {
+    const { bundle, checks } = await judge(keyedHeavyRoutes({ keyed: 9, keyless: ['/api/listings'], hintKeyless: true }))
+    expect(checks.find((x) => x.id === 'keyless-flow')?.verdict).toBe('pass')
+    const probes = keylessProbesOf(bundle)
+    // Hinted-first ordering: the keyless door succeeded at probe #1, so the
+    // walk stopped at the ordinary first wave — no escalation spend.
+    expect(probes.length).toBe(MAX_KEYLESS_PROBES)
+    expect(probes[0]!.role).toBe('probe:endpoint:GET /api/listings')
+    expect(probes[0]!.status).toBe(200)
+  })
+
+  it('(b) ZERO keyless access still FAILS — escalation walks to the cap, every door refuses, no leniency', async () => {
+    const { bundle, checks } = await judge(keyedHeavyRoutes({ keyed: 14, keyless: [], hintKeyless: false }))
+    const c = checks.find((x) => x.id === 'keyless-flow')
+    expect(c?.verdict).toBe('fail')
+    expect(c?.detail).toMatch(/no keyless access found/)
+    expect(c?.detail).toMatch(/at least one declared door must answer 2xx with no key/)
+    const probes = keylessProbesOf(bundle)
+    // 14 candidates, but the politeness ceiling bounds the walk.
+    expect(probes.length).toBe(MAX_KEYLESS_PROBE_TOTAL)
+    for (const p of probes) expect(p.status).toBe(401)
+  })
+
+  it('(b2) a SMALL all-keyed card also fails (both waves exhausted below the caps)', async () => {
+    const { bundle, checks } = await judge(keyedHeavyRoutes({ keyed: 4, keyless: [], hintKeyless: false }))
+    expect(checks.find((x) => x.id === 'keyless-flow')?.verdict).toBe('fail')
+    expect(keylessProbesOf(bundle)).toHaveLength(4) // every candidate walked, all refused
+  })
+})
