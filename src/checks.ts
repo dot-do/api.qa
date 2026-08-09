@@ -475,15 +475,28 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
   }
 
   // ── AX 7: keyless flow ───────────────────────────────────────────────────
+  //    PASSES on one existence proof: any sampled door answering 2xx with no
+  //    key. Own-scope keyed doors (a /keys/me, a /usage) CORRECTLY 401 a
+  //    keyless probe — their refusals are the declared contract, not evidence
+  //    against keyless-first — so the observe side walks candidates until a
+  //    keyless door is found (hinted-keyless first, escalation past the first
+  //    wave, src/discovery.ts). The check therefore fails ONLY when NO walked
+  //    door grants keyless access at all.
   {
     const succeeded = probes.filter((p) => p.status !== null && p.status >= 200 && p.status < 300)
+    const allAuthRefused = probes.length > 0 && probes.every((p) => p.status === 401 || p.status === 403)
     checks.push(check('keyless-flow', 'at least one declared endpoint answers 2xx with no key', 7,
       probes.map((p) => p.role),
       probes.length === 0
         ? { verdict: 'fail', detail: 'no keyless GET candidates discoverable from agents.json/OpenAPI — nothing an agent can try without an account' }
         : succeeded.length > 0
           ? pass(`${succeeded.length}/${probes.length} sampled endpoint(s) answered 2xx keyless (seed ${bundle.seed})`)
-          : { verdict: 'fail', detail: `all ${probes.length} sampled keyless candidates failed (statuses: ${probes.map((p) => p.status ?? 'ERR').join(', ')})` }))
+          : {
+              verdict: 'fail',
+              detail: allAuthRefused
+                ? `no keyless access found: every sampled door (${probes.length}) demands a key (statuses: ${probes.map((p) => p.status ?? 'ERR').join(', ')}) — keyed doors answering 401 are legitimate, but at least one declared door must answer 2xx with no key`
+                : `all ${probes.length} sampled keyless candidates failed (statuses: ${probes.map((p) => p.status ?? 'ERR').join(', ')})`,
+            }))
   }
 
   // ── AX 8: 402 offers ─────────────────────────────────────────────────────

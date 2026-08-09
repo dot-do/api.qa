@@ -1019,6 +1019,33 @@ function scrubAsMetadataEvidence(ev: Evidence | undefined): void {
 export const MAX_KEYLESS_PROBES = 3
 
 /**
+ * Escalation ceiling for the keyless sample (ax: keyless-flow robustness).
+ * The first wave is MAX_KEYLESS_PROBES doors; when NONE of them answers 2xx
+ * the sampler keeps walking the remaining candidates — a property with many
+ * own-scope KEYED doors (/keys/me, /usage — which CORRECTLY 401 keyless) must
+ * not fail keyless-flow just because the random three all landed on keyed
+ * doors while /listings answers 200 keyless. The walk stops at the FIRST
+ * keyless success (the check needs one existence proof, not a census) or at
+ * this ceiling (politeness: the escalation may spend at most
+ * MAX_KEYLESS_PROBE_TOTAL requests of the shared budget, and it only fires on
+ * surfaces where the cheap wave found no keyless door at all). A surface with
+ * genuinely NO keyless access probes up to the ceiling, every door refuses,
+ * and keyless-flow still FAILS — escalation widens the search, never the
+ * acceptance.
+ */
+export const MAX_KEYLESS_PROBE_TOTAL = 12
+
+/**
+ * Card-declared per-endpoint auth hints (agents.json interfaces.http[].auth)
+ * that mark a door EXPLICITLY keyless. Honored twice: a hinted-keyless door
+ * sorts to the FRONT of the probe order (the strongest candidates are tried
+ * first), and a door hinted as anything else (apiKey, bearer, oauth…) is
+ * excluded from the keyless candidate pool entirely (its 401 is the declared
+ * contract, not evidence against keyless-first).
+ */
+export const KEYLESS_AUTH_HINT_RE = /none|keyless|public/i
+
+/**
  * Upper bound on requests the contract-diff pass (step 5, below) will itself
  * fire, independent of however much of the shared politeness budget happens
  * to remain. This is the explicit reserve for the fixed high-value probes
@@ -1830,16 +1857,42 @@ export async function observeTarget(
   // 2. Seeded endpoint sampling — which endpoints get probed is not
   //    predictable before the run (the seed is fresh), but fully replayable
   //    after it (the seed is in the report).
+  const templated = (p: string) => p.includes('{') || p.includes('%7B') // URL templates aren't probeable
   const candidatePaths = dedupe([
     ...openapi.probeCandidates.map((c) => c.path),
     ...agents.endpoints
-      .filter((e) => e.method === 'GET' && (!e.auth || /none|keyless|public/i.test(e.auth)))
+      .filter((e) => e.method === 'GET' && (!e.auth || KEYLESS_AUTH_HINT_RE.test(e.auth)))
       .map((e) => pathOf(e.url, origin))
       .filter((p): p is string => p !== undefined),
   ])
-    .filter((p) => !p.includes('{') && !p.includes('%7B')) // URL templates aren't probeable
+    .filter((p) => !templated(p))
     .sort()
-  for (const path of sampleSeeded(candidatePaths, MAX_KEYLESS_PROBES, seed)) {
+  // Doors the card EXPLICITLY hints keyless (interfaces.http[].auth "none"/
+  // "keyless"/"public") are the strongest candidates: they go FIRST in the
+  // probe order, so a card that hints its doors resolves keyless-flow inside
+  // the cheap first wave. Unhinted candidates (openapi GETs with no security,
+  // interfaces.http entries with no auth member) follow in seeded order.
+  const hintedKeyless = new Set(
+    agents.endpoints
+      .filter((e) => e.method === 'GET' && typeof e.auth === 'string' && KEYLESS_AUTH_HINT_RE.test(e.auth))
+      .map((e) => pathOf(e.url, origin))
+      .filter((p): p is string => p !== undefined && !templated(p) && candidatePaths.includes(p)),
+  )
+  const probeOrder = [
+    ...sampleSeeded([...hintedKeyless].sort(), hintedKeyless.size, seed),
+    ...sampleSeeded(candidatePaths.filter((p) => !hintedKeyless.has(p)), candidatePaths.length, seed),
+  ]
+  // First wave: MAX_KEYLESS_PROBES doors (unchanged evidence volume for the
+  // sibling checks that read the sample). Escalation: while NO door has
+  // answered 2xx keyless yet, keep walking the remaining candidates up to
+  // MAX_KEYLESS_PROBE_TOTAL — so keyless-flow can only fail a surface where
+  // every walked door refused, never one where the random wave happened to
+  // land on own-scope keyed doors. Stops at the first keyless success.
+  let keylessProbed = 0
+  let keylessFound = false
+  for (const path of probeOrder) {
+    if (keylessProbed >= MAX_KEYLESS_PROBE_TOTAL) break
+    if (keylessProbed >= MAX_KEYLESS_PROBES && keylessFound) break
     // Candidate paths are CARD-DERIVED: openapi path keys are raw attacker
     // input, and a key that does NOT begin with "/" (e.g. "@evil.example/x" or
     // ".evil.example/x") makes `${origin}${path}` resolve OFF-ORIGIN. The
@@ -1849,7 +1902,9 @@ export async function observeTarget(
     // origin and pass unchanged.
     const url = `${origin}${path}`
     if (!isPubliclyRoutableSameOrigin(url, origin)) continue
-    await observer.observe(ROLE.keyless('GET', path), url, { accept: 'application/json' })
+    const ev = await observer.observe(ROLE.keyless('GET', path), url, { accept: 'application/json' })
+    keylessProbed += 1
+    if (ev.status !== null && ev.status >= 200 && ev.status < 300) keylessFound = true
   }
 
   // 2c. Clause-3 typed-body legibility beyond the root (ax-fsg): a target that
