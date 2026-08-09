@@ -38,10 +38,12 @@ import {
   type GateViolation,
 } from '../src/exec/dialect.js'
 import {
+  EXEC_MAX_CONCURRENT_FETCHES,
   GATEWAY_MARKER_HEADER,
   GATEWAY_RECORD_UNREADABLE,
   RUNNER_UNAVAILABLE_NO_BINDING,
   RUNNER_UNAVAILABLE_NO_OUTBOUND,
+  bufferResponse,
   buildWorkerCode,
   createOutboundGateway,
   gatewayFetch,
@@ -866,5 +868,211 @@ it('deterministic', () => { expect(Math.random()).toBeLessThan(1) })
       },
     }).run(req({ testsSource: `it('x', () => {})` }))
     expect(outcome).toEqual({ status: 'failed', reason: GATEWAY_RECORD_UNREADABLE })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The CONNECTION BUDGET — one suite test bursting concurrent fetches must
+// never corrupt a sibling test's response (ax: burst-vs-sibling isolation).
+//
+// workerd grants an isolate ~6 simultaneous connections and force-closes the
+// least-recently-used OPEN response body past the budget; the reader then sees
+// "Response closed due to connection limit". The transport below models
+// exactly that failure mode: a body COUNTS AS OPEN until fully read (or
+// canceled), and any fetch arriving while the budget is exhausted gets a body
+// that truncates mid-stream. Unfixed, a 429 rate-limit burst whose bodies are
+// never read leaves the budget pinned and the NEXT test's plain GET-and-parse
+// reads truncated non-JSON — the exact apis.vin corruption.
+// ---------------------------------------------------------------------------
+
+interface BudgetedTransport {
+  fetchImpl: (url: string, init?: RequestInit) => Promise<Response>
+  stats: { readonly open: number; readonly peakOpen: number; readonly truncated: number }
+}
+
+function budgetedTransport(
+  routes: Record<string, () => { status: number; contentType?: string; body: string }>,
+  budget = 6,
+): BudgetedTransport {
+  let open = 0
+  let peakOpen = 0
+  let truncated = 0
+  const fetchImpl = async (url: string): Promise<Response> => {
+    const route =
+      routes[new URL(url).pathname] ??
+      ((): { status: number; contentType?: string; body: string } => ({ status: 404, body: '{"error":"not found"}' }))
+    const { status, contentType, body } = route()
+    const bytes = new TextEncoder().encode(body)
+    const headers = { 'content-type': contentType ?? 'application/json' }
+    if (open >= budget) {
+      // Budget exhausted: the runtime closes this response's body mid-flight.
+      truncated += 1
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(bytes.slice(0, Math.max(1, Math.floor(bytes.length / 2))))
+          c.error(new Error('Response closed due to connection limit'))
+        },
+      })
+      return new Response(stream, { status, headers })
+    }
+    open += 1
+    peakOpen = Math.max(peakOpen, open)
+    let settled = false
+    const settle = () => {
+      if (!settled) {
+        settled = true
+        open -= 1
+      }
+    }
+    // The body counts as an OPEN connection until fully read or canceled.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(bytes)
+      },
+      pull(c) {
+        c.close()
+        settle()
+      },
+      cancel() {
+        settle()
+      },
+    })
+    return new Response(stream, { status, headers })
+  }
+  return {
+    fetchImpl,
+    stats: {
+      get open() {
+        return open
+      },
+      get peakOpen() {
+        return peakOpen
+      },
+      get truncated() {
+        return truncated
+      },
+    },
+  }
+}
+
+describe('connection budget — a bursting test cannot corrupt a sibling test (hosted path)', () => {
+  const BURST_SUITE = `
+it('rate limit burst', async () => {
+  const responses = await Promise.all(Array.from({ length: 20 }, () => fetch('${ORIGIN}/burst')))
+  expect(responses).toHaveLength(20)
+  expect(responses.every((r) => r.status === 429)).toBeTruthy()
+})
+it('listings keyless ok', async () => {
+  const r = await fetch('${ORIGIN}/listings')
+  expect(r.status).toBe(200)
+  const body = await r.json()
+  expect(body.items).toHaveLength(2)
+})
+`
+
+  const LISTINGS_OK = () => ({
+    status: 200,
+    body: JSON.stringify({ items: [{ vin: '1HGCM82633A004352' }, { vin: '1HGCM82633A004353' }] }),
+  })
+
+  it('test A bursts 20 concurrent fetches (bodies never read), test B still reads VALID JSON — both pass', async () => {
+    const transport = budgetedTransport({
+      '/burst': () => ({ status: 429, body: '{"type":"RATE_LIMIT"}' }),
+      '/listings': LISTINGS_OK,
+    })
+    const gateway = createOutboundGateway(transport.fetchImpl)
+    const outcome = await workerLoaderExecRunner(simulatedLoader(gateway), { outbound: gateway }).run(
+      req({ testsSource: BURST_SUITE }),
+    )
+    expect(outcome.status).toBe('ran')
+    if (outcome.status === 'ran') {
+      for (const r of outcome.results) expect(r.status, `${r.name}: ${r.reason ?? ''}`).toBe('pass')
+    }
+    // The runner never exceeded the isolate budget and never pinned an unread
+    // body: the burst was shaped + drained, not passed through as 20 open wires.
+    expect(transport.stats.peakOpen).toBeLessThanOrEqual(EXEC_MAX_CONCURRENT_FETCHES)
+    expect(transport.stats.truncated).toBe(0)
+    expect(transport.stats.open).toBe(0)
+  })
+
+  it('the guard is NOT lenient: a listings body that is GENUINELY non-JSON still fails test B by parse error', async () => {
+    const transport = budgetedTransport({
+      '/burst': () => ({ status: 429, body: '{"type":"RATE_LIMIT"}' }),
+      '/listings': () => ({ status: 200, contentType: 'text/html', body: '<!doctype html><html>not json</html>' }),
+    })
+    const gateway = createOutboundGateway(transport.fetchImpl)
+    const outcome = await workerLoaderExecRunner(simulatedLoader(gateway), { outbound: gateway }).run(
+      req({ testsSource: BURST_SUITE }),
+    )
+    expect(outcome.status).toBe('ran')
+    if (outcome.status === 'ran') {
+      const burst = outcome.results.find((r) => r.name === 'rate limit burst')
+      const listings = outcome.results.find((r) => r.name === 'listings keyless ok')
+      expect(burst?.status).toBe('pass')
+      expect(listings?.status).toBe('fail') // the target's own defect, reported truthfully
+    }
+  })
+
+  it('REGRESSION SHAPE: an unshaped passthrough of the same burst DOES corrupt the sibling under the budget model', async () => {
+    // Pin that the transport model actually reproduces the failure the guard
+    // exists for: without shaping/buffering, 20 unread burst bodies pin the
+    // budget and the sibling's read truncates. (Raw transport, no runner.)
+    const transport = budgetedTransport({
+      '/burst': () => ({ status: 429, body: '{"type":"RATE_LIMIT"}' }),
+      '/listings': LISTINGS_OK,
+    })
+    const burst = await Promise.all(Array.from({ length: 20 }, () => transport.fetchImpl(`${ORIGIN}/burst`)))
+    expect(burst.every((r) => r.status === 429)).toBe(true)
+    const listings = await transport.fetchImpl(`${ORIGIN}/listings`)
+    await expect(listings.json()).rejects.toThrow(/connection limit/)
+  })
+
+  it('gateway bounds in-flight upstream fetches to EXEC_MAX_CONCURRENT_FETCHES (excess queues, none refused)', async () => {
+    let inFlight = 0
+    let peak = 0
+    const slowFetch = async (url: string): Promise<Response> => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((r) => setTimeout(r, 5))
+      inFlight -= 1
+      return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const gateway = createOutboundGateway(slowFetch)
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, () => gateway.fetch(new Request('https://public.example/x'))),
+    )
+    expect(responses).toHaveLength(20)
+    for (const r of responses) expect(r.status).toBe(200)
+    expect(peak).toBeLessThanOrEqual(EXEC_MAX_CONCURRENT_FETCHES)
+  })
+
+  it('bufferResponse consumes the wire immediately and preserves status/statusText/headers/url/bytes', async () => {
+    const transport = budgetedTransport({ '/listings': LISTINGS_OK })
+    const raw = await transport.fetchImpl(`${ORIGIN}/listings`)
+    expect(transport.stats.open).toBe(1)
+    const buffered = await bufferResponse(raw)
+    expect(transport.stats.open).toBe(0) // the connection freed BEFORE anyone reads the body
+    expect(buffered.status).toBe(200)
+    expect(buffered.headers.get('content-type')).toBe('application/json')
+    const body = (await buffered.json()) as { items: unknown[] }
+    expect(body.items).toHaveLength(2)
+  })
+
+  it('bufferResponse leaves a live text/event-stream STREAMING (no hang, no buffering)', async () => {
+    // An SSE body never ends; buffering it would hang to the wall breaker.
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const live = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c
+        c.enqueue(new TextEncoder().encode('data: {"tick":1}\n\n'))
+      },
+    })
+    const res = new Response(live, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const out = await bufferResponse(res) // must resolve promptly — the identity, not a buffer
+    expect(out).toBe(res)
+    const reader = out.body!.getReader()
+    const first = await reader.read()
+    expect(new TextDecoder().decode(first.value)).toContain('"tick":1')
+    controller.close()
   })
 })
