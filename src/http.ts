@@ -101,10 +101,12 @@ export class Observer {
       fetcher: this.opts.fetcher,
       delayMs: this.opts.delayMs,
       timeoutMs: this.opts.timeoutMs,
-      // A child may RAISE the body cap for one declared artifact fetch (the
+      // A child may RAISE the body cap for a declared artifact fetch (the
       // executable-suite document/module, whose A.8.6.1/A.8.6.3 caps exceed
       // the probe default — a truncated body could never digest-match, which
-      // would turn every large-but-legal artifact into a false mismatch).
+      // would turn every large-but-legal artifact into a false mismatch) and
+      // for declarative suite rows (real API responses routinely exceed the
+      // discovery-surface probe default; see SUITE_ROW_MAX_BODY_BYTES).
       maxBodyBytes: overrides.maxBodyBytes ?? this.opts.maxBodyBytes,
       allowPrivate: this.opts.allowPrivate,
       budget: overrides.budget ?? this.opts.budget,
@@ -237,7 +239,7 @@ export class Observer {
       // readCapped surfaces the abort as a clean rejection (caught below and
       // recorded as a timeout error) — no hang, no unhandled rejection — and the
       // maxBodyBytes cap still applies to a fast body.
-      const text = await this.readCapped(res)
+      const { text, truncated } = await this.readCapped(res)
       clearTimeout(timer)
       const kept: Record<string, string> = {}
       for (const h of HEADER_ALLOWLIST) {
@@ -247,6 +249,7 @@ export class Observer {
       return this.record(
         role, url, method, init.accept,
         res.status, res.headers.get('content-type'), kept, text, Date.now() - started,
+        undefined, truncated,
       )
     } catch (err) {
       clearTimeout(timer)
@@ -328,7 +331,7 @@ export class Observer {
       })
       // Timer stays ARMED across the body read (ax-gf2): a slow-lorised / dripped
       // MCP response body cannot hold this probe past timeoutMs either.
-      const text = await this.readCapped(res)
+      const { text, truncated } = await this.readCapped(res)
       clearTimeout(timer)
       const kept: Record<string, string> = {}
       for (const h of HEADER_ALLOWLIST) {
@@ -339,7 +342,10 @@ export class Observer {
       // the follow-up tools/list can echo it; not added to HEADER_ALLOWLIST.
       const sid = res.headers.get('mcp-session-id')
       if (sid) kept['mcp-session-id'] = sid
-      return this.record(role, url, method, accept, res.status, res.headers.get('content-type'), kept, text, Date.now() - started)
+      return this.record(
+        role, url, method, accept, res.status, res.headers.get('content-type'), kept, text, Date.now() - started,
+        undefined, truncated,
+      )
     } catch (err) {
       clearTimeout(timer)
       return this.record(role, url, method, accept, null, null, {}, null, Date.now() - started,
@@ -367,15 +373,21 @@ export class Observer {
    *
    * Normal (non-oversized) bodies are read in full and decoded as UTF-8,
    * preserving prior behavior for every legitimate target.
+   *
+   * Returns the retained text AND whether the body was truncated (cut at the
+   * cap, or refused outright on a declared oversize) — the flag travels into
+   * `Evidence.truncated` so a judge can report the truncation honestly
+   * instead of misjudging a body the OBSERVER cut (e.g. calling a valid-but-
+   * large JSON document "not JSON" because it was severed mid-token).
    */
-  private async readCapped(res: Response): Promise<string> {
+  private async readCapped(res: Response): Promise<{ text: string; truncated: boolean }> {
     const maxBytes = this.opts.maxBodyBytes
     const declaredLength = res.headers.get('content-length')
     if (declaredLength !== null) {
       const declared = Number(declaredLength)
       if (Number.isFinite(declared) && declared > maxBytes) {
         try { await res.body?.cancel() } catch { /* best-effort — connection may already be closed */ }
-        return ''
+        return { text: '', truncated: true }
       }
     }
 
@@ -384,7 +396,9 @@ export class Observer {
       // No streamable body on this Response implementation (some test/mock
       // Response constructions) — fall back to a single bounded read.
       const text = await res.text()
-      return text.length <= maxBytes ? text : text.slice(0, maxBytes)
+      return text.length <= maxBytes
+        ? { text, truncated: false }
+        : { text: text.slice(0, maxBytes), truncated: true }
     }
 
     const reader = body.getReader()
@@ -422,15 +436,16 @@ export class Observer {
       buf.set(chunk, offset)
       offset += chunk.byteLength
     }
-    return new TextDecoder('utf-8').decode(buf)
+    return { text: new TextDecoder('utf-8').decode(buf), truncated }
   }
 
   private record(
     role: string, url: string, method: string, accept: string | undefined,
     status: number | null, contentType: string | null, headers: Record<string, string>,
-    body: string | null, elapsedMs: number, error?: string,
+    body: string | null, elapsedMs: number, error?: string, truncated?: boolean,
   ): Evidence {
     const ev: Evidence = { role, url, method, accept, status, contentType, headers, body, elapsedMs }
+    if (truncated) ev.truncated = true
     if (error) ev.error = error
     this.items.push(ev)
     return ev

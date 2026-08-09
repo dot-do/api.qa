@@ -27,6 +27,16 @@ export interface Evidence {
   headers: Record<string, string>
   /** Body text, truncated to the politeness byte cap. null on error. */
   body: string | null
+  /**
+   * True when `body` is NOT the full response the target served — the read
+   * was cut at the observer's byte cap (or a declared Content-Length over the
+   * cap was refused before reading, leaving an empty body). A judge must
+   * report a truncated body HONESTLY ("body too large / truncated at N
+   * bytes"), never as a defect of the bytes themselves (e.g. "not JSON" about
+   * a body the VERIFIER cut mid-document). Absent (not false) on evidence
+   * recorded before this field existed, so stored bundles replay unchanged.
+   */
+  truncated?: boolean
   error?: string
   /** Wall-clock ms; excluded from the evidence digest (non-deterministic). */
   elapsedMs: number
