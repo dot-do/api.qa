@@ -17,6 +17,7 @@ import { canonicalJson, sha256Hex, sampleSeeded } from './digest.js'
 import {
   MAX_SUITE_REQUIREMENTS,
   SUITE_DEADLINE_MS,
+  SUITE_ROW_MAX_BODY_BYTES,
   VITEST_RUNNER,
   gateTestSuiteCard,
   gateTestSuiteDocument,
@@ -1581,7 +1582,13 @@ async function runSuiteRows(
   // (a long suite cannot drain the parent's politeness budget out from
   // under the fixed probes), and `allowPrivate` inherited so a consented local
   // target still works in dev without ever loosening the deployed posture.
-  const sub = observer.child({ allowWrites: false, budget })
+  // ONE loosening: the body cap is raised to the suite-row ceiling (4 MiB —
+  // the exec module-artifact cap), because rows probe REAL API endpoints whose
+  // legitimate JSON responses routinely exceed the 256 KiB discovery-surface
+  // default; under that default a large VALID body was severed mid-token and
+  // misjudged "body is not JSON". Beyond even this cap, `Evidence.truncated`
+  // makes judgeExpect fail with the honest truncation reason.
+  const sub = observer.child({ allowWrites: false, budget, maxBodyBytes: SUITE_ROW_MAX_BODY_BYTES })
 
   // The binding scope starts from the SELECTED ENVIRONMENT's vars, exactly as a
   // `verifySuite` run does. A `baseUrl` among them cannot steer the run: the

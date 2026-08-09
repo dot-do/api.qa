@@ -92,6 +92,7 @@ export {
   gateVitestSuiteDocument,
   gateVitestModuleArtifact,
   NATIVE_SERVING_BASE,
+  SUITE_ROW_MAX_BODY_BYTES,
   type VitestCardGate,
   type VitestDocumentGate,
   type VitestModuleGate,

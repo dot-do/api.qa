@@ -53,6 +53,7 @@ import {
 // card-declared Suite exactly as it runs for a ratified PinnedSpec. Splitting
 // them would leave the suite door unguarded.
 import { parseSuite, validateRequirements } from './suite-doc.js'
+import { SUITE_ROW_MAX_BODY_BYTES } from './test-suite.js'
 export { parseSuite, validateRequirements }
 import type {
   AppliesWhen,
@@ -186,6 +187,12 @@ export async function verifyPinnedSpec(
     ...opts,
     allowWrites: true,
     allowPrivate: opts.allowPrivateTargets ?? mode === 'local',
+    // Pinned endpoint requirements probe REAL API endpoints, not discovery
+    // surfaces: raise the body cap to the same suite-row ceiling the
+    // card-declared path uses (a legitimate large JSON response must not be
+    // severed mid-token and misjudged "not JSON"). An explicit caller cap
+    // still wins.
+    maxBodyBytes: opts.maxBodyBytes ?? SUITE_ROW_MAX_BODY_BYTES,
     // Headroom (ax-fsg/ax-0v2): the Clause-3 typed-body sampling and the
     // Clause-4 query-flip probes add a handful of fetches on top of the surface
     // + keyless + contract-diff plan; keep the budget above the worst case so a

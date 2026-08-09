@@ -95,6 +95,20 @@ export const MAX_SUITE_REQUIREMENTS = 25
 /** Wall-clock deadline for the whole sub-run, ms. A breach FAILS, never passes what it got. */
 export const SUITE_DEADLINE_MS = 20_000
 
+/**
+ * Body byte cap for a DECLARATIVE SUITE ROW's response (4 MiB — the same
+ * ceiling as the executable dialect's module artifact, EXEC_MAX_MODULE_BYTES).
+ * The Observer's default probe cap (256 KiB) is sized for discovery surfaces,
+ * not API responses: a real endpoint legitimately returns hundreds of KB of
+ * valid JSON (a listings collection, a search page), and under the probe cap
+ * the read was severed mid-token — misjudged as "body is not JSON" though the
+ * target served a perfectly valid document. Rows are fetched sequentially, so
+ * peak retained memory stays one body ≤ this cap. A response beyond even THIS
+ * cap still fails its body expectations — but with the honest truncation
+ * reason (`Evidence.truncated`), never a false "not JSON".
+ */
+export const SUITE_ROW_MAX_BODY_BYTES = 4_194_304
+
 /** `sha256:` + exactly 64 lowercase hex. */
 const DIGEST_FORMAT = /^sha256:[0-9a-f]{64}$/
 

@@ -177,6 +177,11 @@ export function resolveEndpoint(req: EndpointReq, origin: string, bindings: Bind
  * downstream `{{var}}` reference fails closed rather than silently skipping.
  */
 export function captureInto(bindings: Bindings, capture: Record<string, string>, ev: Evidence | undefined): void {
+  // Never capture out of a truncated body: the observer cut the read at its
+  // byte cap, so even a partial text that happens to parse (e.g. severed
+  // inside trailing whitespace or a bare number) is not the value the target
+  // served. Leaving the vars unbound fails the downstream reference closed.
+  if (ev?.truncated) return
   let body: unknown
   try {
     body = JSON.parse(ev?.body ?? '')
@@ -206,6 +211,20 @@ export function judgeExpect(ev: Evidence | undefined, expect: EndpointExpect): s
     problems.push(`content-type ${ev.contentType}, wanted *${expect.contentTypeIncludes}*`)
   }
   if (expect.schema || expect.paths) {
+    // A truncated body is NOT the bytes the target served — the OBSERVER cut
+    // the read at its byte cap. Judging the partial text would lie in both
+    // directions: a valid-but-large JSON document severed mid-token would be
+    // misreported as "body is not JSON", and a partial body that happens to
+    // parse could be judged against assertions the full body would fail. Fail
+    // with the honest truncation reason instead — a genuinely oversized body
+    // still FAILS its body expectations, but for the true cause.
+    if (ev.truncated) {
+      const bytes = new TextEncoder().encode(ev.body ?? '').byteLength
+      problems.push(
+        `body too large: truncated at ${bytes} bytes by the verifier read cap — cannot judge body expectations against a partial body`,
+      )
+      return problems
+    }
     let body: unknown
     try { body = JSON.parse(ev.body ?? '') } catch { problems.push('body is not JSON') }
     if (body !== undefined) {
