@@ -39,5 +39,7 @@
     "rateCardRef": "/pricing",
     "startDate": "2026-08-23",
     "hypothesis": "The free keyless grade rail is the acquisition engine; conversion to paid attested runs/CI webhooks tracks suite-consumer count, not gate pressure."
-  }
+  },
+  "railLedger": "https://ledger.apis.ax/faces?face=api.qa",
+  "railLedgerNote": "spec §9.1 final box (Face registered in the rail ledger, faces-payable/week denominator): registered via LEDGER.md door A — row in packages/rail-ledger/registry/faces.json @ draft/rail-ledger-v1 (studio #9 alignment pass 2026-08-23); readout https://ledger.apis.ax/readouts/faces-payable (service built, deploy pending Batch-S)"
 }
