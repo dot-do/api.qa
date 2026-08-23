@@ -24,7 +24,8 @@ describe('mcp server (stdio, newline-delimited JSON-RPC)', () => {
     const init = replies[0] as { result: { serverInfo: { name: string } } }
     expect(init.result.serverInfo.name).toBe('api.qa')
     const tools = (replies[1] as { result: { tools: Array<{ name: string }> } }).result.tools.map((t) => t.name)
-    expect(tools).toEqual(['verify_domain', 'discover_domain', 'verify_pinned_spec'])
+    // camelCase: an MCP tool name IS the canonical operationId (axp-ext-rates-g2 §1)
+    expect(tools).toEqual(['verifyDomain', 'discoverDomain', 'verifyPinnedSpec'])
   })
 
   it('answers unknown methods with a JSON-RPC error', async () => {

@@ -1,6 +1,9 @@
 /**
  * MCP server (stdio, newline-delimited JSON-RPC) — dependency-free.
- * Tools: verify_domain, discover_domain, verify_pinned_spec.
+ * Tools: verifyDomain, discoverDomain, verifyPinnedSpec — camelCase because
+ * an MCP tool name IS the canonical cross-face operationId
+ * (axp-ext-rates-g2 §1: OpenAPI operationId = MCP tool name = suite
+ * coverage reference = SDK method = rates[] key).
  *
  * An agent that just built an API adds this server and asks "does it work?"
  * — the same verifier core answers, in local (advisory) mode.
@@ -19,7 +22,7 @@ interface JsonRpcRequest {
 
 const TOOLS = [
   {
-    name: 'verify_domain',
+    name: 'verifyDomain',
     description:
       'Run the full api.qa verification against a target domain or URL: discovery from its published machine surfaces (llms.txt, agents.json, icp.json, OpenAPI), contract-derived deterministic checks, AX score (0-10) and letter grade. Local mode: advisory, unsigned.',
     inputSchema: {
@@ -32,7 +35,7 @@ const TOOLS = [
     },
   },
   {
-    name: 'discover_domain',
+    name: 'discoverDomain',
     description:
       'Discovery only: fetch and parse the target\'s machine surfaces and return the DiscoveryReport (what the target claims to be) without grading it.',
     inputSchema: {
@@ -42,7 +45,7 @@ const TOOLS = [
     },
   },
   {
-    name: 'verify_pinned_spec',
+    name: 'verifyPinnedSpec',
     description:
       'Verify a target against a pinned spec document (the anti-Goodhart harness). If expectedDigest is supplied and the spec text does not hash to it, verification refuses to run. Use this as the acceptance gate of a build loop: the workers cannot pass by editing the spec.',
     inputSchema: {
@@ -124,13 +127,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const seed = typeof args.seed === 'number' ? args.seed : undefined
   const local = /localhost|127\.0\.0\.1/.test(target)
   switch (name) {
-    case 'verify_domain':
+    case 'verifyDomain':
       return verifyTarget(target, { mode: 'local', seed, delayMs: local ? 0 : 150 })
-    case 'discover_domain': {
+    case 'discoverDomain': {
       const report = await verifyTarget(target, { mode: 'local', seed, delayMs: local ? 0 : 150 })
       return report.discovery
     }
-    case 'verify_pinned_spec':
+    case 'verifyPinnedSpec':
       return verifyPinnedSpec(target, String(args.specText ?? ''), {
         mode: 'local',
         seed,

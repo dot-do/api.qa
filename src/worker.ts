@@ -839,7 +839,7 @@ export function createApp(
 
           const domain = path === '/self' ? 'api.qa' : DOMAIN_ROUTE.exec(path)?.[1]
           if (domain) {
-            emitMeter(env.METERING, request, 'report', 'anon-sandbox')
+            emitMeter(env.METERING, request, 'getReport', 'anon-sandbox')
             const isSelf = domain === 'api.qa'
             const bypass = isSelf // loopback self-verification is never cached / gated
 

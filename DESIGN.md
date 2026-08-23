@@ -98,7 +98,8 @@ verifyTarget(target)
 
 One core, three mounts: the Worker (`src/worker.ts`, `api.qa/{domain}` grade
 pages + `/self`), the CLI (`cli/index.ts`, `npx api.qa`), the MCP server
-(`src/mcp.ts`, `verify_domain` / `discover_domain` / `verify_pinned_spec`).
+(`src/mcp.ts`, `verifyDomain` / `discoverDomain` / `verifyPinnedSpec` — tool
+names are canonical operationIds per axp-ext-rates-g2 §1).
 All three call `verifyTarget` / `verifyPinnedSpec` with an injectable fetcher —
 which is also how api.qa verifies itself with zero network (loopback into its
 own handler) and how tests run hermetically.

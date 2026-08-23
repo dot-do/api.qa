@@ -88,7 +88,7 @@ verdict that clears your bar.
 - \`GET /.well-known/agents.json\` — capability card (with the AXP probe manifest)
 - \`GET /icp.json\` — who this is for; self-classify
 - \`GET /openapi.json\` — the API contract (we are verified against it too)
-- \`GET /pricing\` — the rate card: model, per-operation rates, free quotas
+- \`GET /pricing\` — the rate card: model, per-operation rates (all zero: free model)
 - \`GET /reports\` — VerificationReport collection (keyless sandbox; branches on \`?domain=\`, \`?grade=\`, \`?before=\`; typed OK/EMPTY/BLOCKED envelopes)
 - \`GET /health\` — keyless liveness
 - \`GET /self\` — api.qa's own verdict on api.qa, run live
@@ -143,7 +143,9 @@ export function selfAgentsJson(): object {
       mcp: {
         transport: 'stdio',
         command: 'npx autonomous-qa mcp',
-        tools: ['verify_domain', 'discover_domain', 'verify_pinned_spec'],
+        // MCP tool names ARE canonical operationIds (axp-ext-rates-g2 §1):
+        // camelCase strings, one cross-face name per operation.
+        tools: ['verifyDomain', 'discoverDomain', 'verifyPinnedSpec'],
       },
     },
     /**
@@ -173,12 +175,17 @@ export function selfAgentsJson(): object {
       // deliberately NOT declared until one exists that covers every declared
       // operation and MCP tool (presence-when-true).
       verify: 'https://www.npmjs.com/package/autonomous-qa',
+      // The same G2/ICP truth as a URL — legal beside the top-level g2
+      // member (axp-ext-rates-g2 §4), and it answers: GET /icp.json.
+      icp: `${SELF_ORIGIN}/icp.json`,
     },
     /**
      * G2 coordinates of this projection (fn-it register row): who the surface
-     * is for, in ICP + persona terms. The persona detail lives at /icp.json.
+     * is for, in ICP + persona terms — at the RULED placement: TOP-LEVEL `g2`
+     * on the card (axp-ext-rates-g2 §4). The persona detail lives at
+     * /icp.json.
      */
-    coordinates: {
+    g2: {
       substrate: 'fn-it',
       system: { system: 'QA/Conformance Register', coordinates: ['agent-facing-apis'] },
       icp: {
@@ -272,7 +279,7 @@ export function selfOpenapi(): object {
     paths: {
       '/health': {
         get: {
-          operationId: 'health',
+          operationId: 'getHealth',
           summary: 'Keyless liveness probe',
           responses: {
             '200': {
@@ -296,7 +303,7 @@ export function selfOpenapi(): object {
       },
       '/openapi.json': {
         get: {
-          operationId: 'openapi',
+          operationId: 'getOpenapi',
           summary: 'This contract',
           responses: {
             '200': {
@@ -313,7 +320,7 @@ export function selfOpenapi(): object {
       '/pricing': {
         get: {
           operationId: 'getPricing',
-          summary: 'The rate card: pricing model, per-operation rates, free quotas',
+          summary: 'The rate card: pricing model, per-operation rates (free model: all zero)',
           responses: {
             '200': {
               description: 'the Pricing Document (AXP A.2) extended with per-operation rates',
@@ -353,7 +360,7 @@ export function selfOpenapi(): object {
       },
       '/{domain}': {
         get: {
-          operationId: 'report',
+          operationId: 'getReport',
           summary: 'Public grade report for a target domain (content-negotiated)',
           parameters: [
             { name: 'domain', in: 'path', required: true, schema: { type: 'string' } },
@@ -432,13 +439,16 @@ export function selfHomeJson(): object {
 }
 
 /**
- * The rate card (`/pricing`) — the AXP A.2 Pricing Document extended with
- * per-operation rates (the estate rate-card extension; unknown members are
- * ignored by conformance). Model is honestly `free`: the public verification
- * rail is keyless, rate-limited, and never answers 402 — a gate on the free
- * grade would contradict the product thesis. The purchasable boundaries
- * (attested runs, CI webhooks) are declared monetization offers answered as
- * structured 402 OFFERs; settlement is a stub seam, never fake billing.
+ * The rate card (`/pricing`) — the AXP A.2 Pricing Document carrying the
+ * ratified extension member `rates[]` at its RULED placement (top-level;
+ * axp-ext-rates-g2@0.2.0 §2). Model is honestly `free`, so §2.8 governs the
+ * rows: scalar ZERO rates only — no `freeQuota` (it implies billable
+ * overage), no modifiers, no volume breaks, nothing withheld. The public
+ * rail's throttle behavior (per-domain cooldown) is descriptive prose in
+ * `note`, never a quota claim. Rows key on the canonical operationId (§1).
+ * The purchasable boundaries (attested runs, CI webhooks) are declared
+ * monetization offers answered as structured 402 OFFERs; settlement is a
+ * stub seam, never fake billing.
  */
 export function selfPricing(): object {
   return {
@@ -447,12 +457,12 @@ export function selfPricing(): object {
     statement:
       'Public keyless verification is free and rate-limited (per-domain cooldown), never paywalled. Paid boundaries (attested runs, CI webhooks) answer HTTP 402 with structured offers; checkout settlement is not yet activated — the offer surface is a labeled stub.',
     rates: [
-      { operation: 'report', price: 0, unit: 'usd-per-call', freeQuota: 'rate-limited (per-domain cooldown; cached verdicts served in cooldown)' },
-      { operation: 'verify', price: 0, unit: 'usd-per-call', freeQuota: 'rate-limited (per-domain cooldown)' },
-      { operation: 'listReports', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
-      { operation: 'getPricing', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
-      { operation: 'health', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
-      { operation: 'openapi', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
+      { operation: 'getReport', price: 0, unit: 'usd-per-call', note: 'free; rate-limited (per-domain cooldown; cached verdicts served in cooldown)' },
+      { operation: 'verify', price: 0, unit: 'usd-per-call', note: 'free; rate-limited (per-domain cooldown)' },
+      { operation: 'listReports', price: 0, unit: 'usd-per-call', note: 'free; unthrottled' },
+      { operation: 'getPricing', price: 0, unit: 'usd-per-call', note: 'free; unthrottled' },
+      { operation: 'getHealth', price: 0, unit: 'usd-per-call', note: 'free; unthrottled' },
+      { operation: 'getOpenapi', price: 0, unit: 'usd-per-call', note: 'free; unthrottled' },
     ],
     offers: [
       { id: 'attested-run', title: 'On-demand attested verification run', price: { amount: 5, currency: 'USD', interval: 'one-time' }, probe: `${SELF_ORIGIN}/offers/attested-run` },

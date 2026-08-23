@@ -19,7 +19,7 @@ service lives at **[api.qa](https://api.qa)**.
 ```sh
 curl https://api.qa/example.com        # public grade page, as markdown
 npx autonomous-qa example.com          # same verifier core, locally (advisory)
-npx autonomous-qa mcp                  # MCP server: verify_domain, discover_domain, verify_pinned_spec
+npx autonomous-qa mcp                  # MCP server: verifyDomain, discoverDomain, verifyPinnedSpec
 ```
 
 ## Free vs. paid — the value line
