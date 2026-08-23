@@ -32,6 +32,7 @@ import {
   externalUrlOf,
   isMcpUiMime,
   SUITE_ROLE_PREFIX,
+  type AgentsClaims,
   type ServerJsonClaims,
   type TestSuiteClaim,
 } from './discovery.js'
@@ -500,6 +501,18 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
   }
 
   // ── AX 8: 402 offers ─────────────────────────────────────────────────────
+  //    CONDITIONAL on the OBSERVED pricing model (AXP 0.9.0 Clause 5 / A.5,
+  //    apis-ax-axp@2.6.0): a surface whose observed Pricing Document — the
+  //    card-declared `probes.pricing` entry 0 (A.2) — declares `"model":
+  //    "free"` and whose card declares NO purchasable surface (no
+  //    `monetization.offers`, no `monetization.probe`) has no 402 boundary to
+  //    prove, so the offer obligation is satisfied VACUOUSLY and the check
+  //    PASSES. The rule is deliberately narrow, fail-closed on both edges:
+  //    only the observed `"free"` declaration earns the vacuous pass (an
+  //    unobserved, non-JSON, or undetermined model keeps the hard fail), and
+  //    anything the card DOES declare is still judged strictly — a free card
+  //    declaring offers or a probe made a claim and is held to it, exactly as
+  //    A.8 holds every declaration.
   {
     const offerEv = findEvidence(bundle, ROLE.offer)
     const declared = (agents.offers?.length ?? 0) > 0
@@ -509,11 +522,33 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
     // declared-only. Decided from the URL string alone; the hostile URL is
     // never requested.
     const probeViolation = monetizationProbeViolation(agentsDoc, bundle.target)
+    // The observed Pricing Document (entry 0 of the card-declared
+    // probes.pricing channel) — the SAME evidence the probe-manifest check
+    // and the pinned `appliesWhen { fromProbe: 'pricing' }` gate read, so the
+    // check-level verdict and the pinned-requirement gate agree by
+    // construction.
+    const pricingEv = findEvidence(bundle, ROLE.pricing)
+    const pricingDoc = ok(pricingEv) ? (parseJsonBody(pricingEv) as Record<string, unknown> | undefined) : undefined
+    const observedFree = pricingDoc?.model === 'free'
     let result: { verdict: Verdict; detail: string }
     if (probeViolation) {
       result = { verdict: 'fail', detail: probeViolation }
+    } else if (!declared && !agents.offerProbe && observedFree) {
+      result = pass(
+        'observed Pricing Document declares "model": "free" and the card declares no purchasable surface ' +
+          '(no monetization.offers, no monetization.probe) — no 402 boundary exists to prove, so the offer ' +
+          'obligation is satisfied vacuously (AXP Clause 5/A.5: the metering obligations bind iff the observed model is "metered")',
+      )
     } else if (!declared) {
-      result = fail(agentsEv, 'no monetization.offers declared — payment boundaries are dead ends, not offers')
+      result = fail(
+        agentsEv,
+        'no monetization.offers declared — payment boundaries are dead ends, not offers' +
+          (agents.offerProbe
+            ? ' (a monetization.probe is declared without offers — a defective monetization declaration is judged, never excused)'
+            : observedFree
+              ? ''
+              : ` (observed pricing model: ${pricingDoc?.model === undefined ? 'undetermined' : JSON.stringify(pricingDoc.model)} — only an observed "free" declaration earns the vacuous pass)`),
+      )
     } else if (agents.offerProbe) {
       const body = parseJsonBody(offerEv) as Record<string, unknown> | undefined
       // Every 402 body is a typed OFFER outcome (AXP Appendix A.1): a bare 402
@@ -1006,6 +1041,42 @@ export function runChecks(bundle: EvidenceBundle): CheckResult[] {
 
     checks.push(check('published-test-suite',
       'a DECLARED test-suite interface publishes a digest-pinned suite the surface actually passes', undefined,
+      evidence, result))
+  }
+
+  // ── capability-coverage (OPTIONAL, DECLARATION-ARMED — AXP A.8.7) ─────────
+  //    The SECOND judgment armed by the SAME `interfaces.testSuite` key: one
+  //    declaration, two strictly judged facets (A.8: the registry is keyed by
+  //    check, and one card key MAY arm more than one). `published-test-suite`
+  //    judges that the suite is KEPT; this judges that it REACHES everything
+  //    else the card declares: every contract operation, every callable
+  //    interface entry (resolved to its operation; the unconditionally
+  //    verified faces exempt), every declared MCP tool, and every other
+  //    optional declared interface MUST be exercised by at least one PASSING
+  //    row/test of the SAME single run — one run, two judgments, never a
+  //    second fetch or execution (A.8.7.3). The mapping is the pinned
+  //    artifact's own: the explicit `coverage` root member unioned with
+  //    implicit square-bracket coverage tags in row ids and test names.
+  //
+  //    axItem is undefined — an additive readiness dimension that moves no AX
+  //    point, exactly like published-test-suite and digital-link-resolver.
+  {
+    const claim = agents.testSuite
+    const evidence: string[] = [ROLE.agentsJson, ROLE.openapi, ROLE.testSuite]
+    let result: { verdict: Verdict; detail: string }
+    if (!claim) {
+      result = {
+        verdict: 'skip',
+        detail:
+          'no published test suite interface declared (agents.json `interfaces.testSuite` absent) — capability coverage ' +
+          'is judged only over a declared suite\'s run (A.8.7): nothing is claimed, so nothing is judged; ' +
+          'under a pinned must:pass this fails closed',
+      }
+    } else {
+      result = judgeCapabilityCoverage(bundle, claim, agentsDoc, openapiDoc, agents, evidence)
+    }
+    checks.push(check('capability-coverage',
+      'every capability the card declares is exercised by a passing test of its published suite', undefined,
       evidence, result))
   }
 
@@ -3518,6 +3589,338 @@ function judgeVitestPublishedSuite(
         : '') +
       'Isolated run: zero ambient authority, network floor only (full external egress above it), digest fail-closed. ' +
       'NOT judged: whether the suite is ambitious — api.qa verifies the surface keeps its OWN published promise, not that the promise is demanding.',
+  )
+}
+
+// ---------------------------------------------------------------------------
+// capability-coverage (AXP A.8.7) — one run, two judgments
+// ---------------------------------------------------------------------------
+
+/** A bracketed token is a coverage TAG iff it matches the A.8.7.2 grammar. */
+const COVERAGE_TAG_RE = /\[((?:openapi|mcp):[^[\]]+|interfaces\.[A-Za-z][A-Za-z0-9]*)\]/g
+
+/** The faces AXP itself requires and unconditionally verifies on every run
+ *  (Clauses 6, 1, 2) — exempt from A.8.7.1 rule 2: a suite re-proving a door
+ *  the verifier just verified would be ceremony. */
+const COVERAGE_EXEMPT_PATHNAMES = new Set(['/.well-known/agents.json', '/openapi.json', '/llms.txt'])
+
+const OPENAPI_METHODS = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'])
+
+/** One row/test of the folded result set, as the coverage judge reads it. */
+interface FoldedResult {
+  name: string
+  passed: boolean
+}
+
+type SuiteRunFold =
+  /** The A.8.5.2 run did not complete honestly — coverage cannot be read off it. */
+  | { state: 'run-failed'; reason: string }
+  | {
+      state: 'ran'
+      /** Declarative rows (by id) and registered tests (by folded name), one run. */
+      results: FoldedResult[]
+      /** The pinned artifact's own explicit `coverage` root member, raw. */
+      coverageMap?: unknown
+      /** True for an A.8.6.6 module artifact (its `coverage` EXPORT is not in
+       *  the recorded outcome — see the judge's fail detail). */
+      moduleArtifact: boolean
+    }
+
+/**
+ * Re-derive the folded result set of the SAME published-suite run the
+ * `published-test-suite` check judges — PURELY from the bundle, through the
+ * IDENTICAL gates and row engine, so the two judgments read one run and agree
+ * by construction (A.8.7.3: one run, two judgments, never a second fetch or
+ * execution). Any gate/fetch/run failure folds to `run-failed`: coverage
+ * cannot be read off a run that did not complete honestly.
+ */
+function foldPublishedSuiteRun(bundle: EvidenceBundle, claim: TestSuiteClaim, evidence: string[]): SuiteRunFold {
+  const docEv = findEvidence(bundle, ROLE.testSuite)
+
+  if (claim.runner === VITEST_RUNNER) {
+    const cardGate = gateVitestSuiteCard(claim, bundle.target)
+    if (!cardGate.ok) return { state: 'run-failed', reason: cardGate.problem }
+    if (!ok(docEv) || docEv?.body == null) {
+      return { state: 'run-failed', reason: `the pinned artifact at ${cardGate.url} was not served 2xx with a body` }
+    }
+    const results: FoldedResult[] = []
+    let coverageMap: unknown
+    let moduleArtifact = false
+    if (cardGate.kind === 'document') {
+      const plan = gateVitestSuiteDocument(claim, docEv.body, cardGate.digest)
+      if (!plan.ok) return { state: 'run-failed', reason: plan.problems.slice(0, 3).join('; ') }
+      judgeFoldedRows(bundle, plan.rows, plan.vars, results, evidence)
+      coverageMap = coverageMemberOf(docEv.body)
+    } else {
+      const mg = gateVitestModuleArtifact(claim, docEv.body, cardGate.digest)
+      if (!mg.ok) return { state: 'run-failed', reason: mg.problems.slice(0, 3).join('; ') }
+      moduleArtifact = true
+    }
+    const runEv = findEvidence(bundle, ROLE.vitestRun)
+    evidence.push(ROLE.vitestRun)
+    if (runEv?.body == null) {
+      return { state: 'run-failed', reason: 'no executable run outcome was recorded for the declared api.qa/vitest@1 suite' }
+    }
+    let record: { executedDigest?: string; outcome?: ExecRunOutcome }
+    try {
+      record = JSON.parse(runEv.body) as typeof record
+    } catch {
+      return { state: 'run-failed', reason: 'the recorded executable run outcome is not parseable JSON' }
+    }
+    if (record.executedDigest !== cardGate.digest) {
+      return { state: 'run-failed', reason: 'the recorded run is not a run of the pinned bytes (executed digest mismatch)' }
+    }
+    const outcome = record.outcome
+    if (outcome === undefined) return { state: 'run-failed', reason: 'the recorded executable run carries no outcome' }
+    if (outcome.status !== 'ran') return { state: 'run-failed', reason: outcome.reason }
+    for (const r of outcome.results) results.push({ name: r.name, passed: r.status === 'pass' })
+    return { state: 'ran', results, ...(coverageMap !== undefined && { coverageMap }), moduleArtifact }
+  }
+
+  // The declarative dialect (api.qa/suite@1).
+  const cardGate = gateTestSuiteCard(claim, bundle.target)
+  if (!cardGate.ok) return { state: 'run-failed', reason: cardGate.problem }
+  if (!ok(docEv) || docEv?.body == null) {
+    return { state: 'run-failed', reason: `the pinned suite document at ${cardGate.url} was not served 2xx with a body` }
+  }
+  const plan = gateTestSuiteDocument(claim, docEv.body, cardGate.digest)
+  if (!plan.ok) return { state: 'run-failed', reason: plan.problems.slice(0, 3).join('; ') }
+  const results: FoldedResult[] = []
+  judgeFoldedRows(bundle, plan.requirements, plan.vars, results, evidence)
+  const coverageMap = coverageMemberOf(docEv.body)
+  return { state: 'ran', results, ...(coverageMap !== undefined && { coverageMap }), moduleArtifact: false }
+}
+
+/**
+ * Judge declarative rows into the folded result set — the IDENTICAL row
+ * engine (resolveEndpoint + judgeExpect over `${SUITE_ROLE_PREFIX}pinned:*`
+ * evidence) the published-test-suite check judges with. A row that fails to
+ * resolve or fails its expectation folds as `passed: false`: it covers
+ * nothing (A.8.7.2), and the run-level failure is `published-test-suite`'s to
+ * report.
+ */
+function judgeFoldedRows(
+  bundle: EvidenceBundle,
+  rows: Array<import('./expect.js').EndpointReq>,
+  vars: Record<string, unknown>,
+  results: FoldedResult[],
+  evidence: string[],
+): void {
+  const bindings: Bindings = { ...vars }
+  for (const req of rows) {
+    const resolved = resolveEndpoint(req, bundle.target, bindings)
+    if (!resolved.ok) {
+      results.push({ name: req.id, passed: false })
+      continue
+    }
+    const role = `${SUITE_ROLE_PREFIX}pinned:${req.id}`
+    evidence.push(role)
+    const ev = bundle.items.find((e) => e.role === role)
+    const passed = judgeExpect(ev, resolved.expect).length === 0
+    if (passed && req.capture) captureInto(bindings, req.capture, ev)
+    results.push({ name: req.id, passed })
+  }
+}
+
+/** The raw `coverage` root member of the pinned suite document, if present. */
+function coverageMemberOf(docBody: string): unknown {
+  try {
+    const doc = JSON.parse(docBody) as unknown
+    if (doc && typeof doc === 'object' && !Array.isArray(doc)) {
+      return (doc as Record<string, unknown>).coverage
+    }
+  } catch { /* a non-JSON body already failed the gates */ }
+  return undefined
+}
+
+/**
+ * The A.8.7.1 coverage domain — every capability the card and contract
+ * declare, from the SAME retrieved card and contract bytes the run's other
+ * checks used (never re-fetched). Returns the identifier set plus any
+ * by-construction problems (an `interfaces.http` entry resolving to no
+ * contract operation is an uncovered capability by construction).
+ */
+function coverageDomainOf(
+  agentsDoc: unknown,
+  openapiDoc: unknown,
+  agents: AgentsClaims,
+): { ids: string[]; problems: string[] } {
+  const ids = new Set<string>()
+  const problems: string[] = []
+  const ops: Array<{ method: string; path: string; id: string }> = []
+
+  // Rule 1: every contract operation, one canonical identifier each.
+  const paths = (openapiDoc as Record<string, unknown> | undefined)?.paths
+  if (paths && typeof paths === 'object' && !Array.isArray(paths)) {
+    for (const [path, item] of Object.entries(paths as Record<string, unknown>)) {
+      if (!item || typeof item !== 'object') continue
+      for (const [method, op] of Object.entries(item as Record<string, unknown>)) {
+        if (!OPENAPI_METHODS.has(method)) continue
+        const opId = op && typeof op === 'object' && typeof (op as Record<string, unknown>).operationId === 'string' &&
+          ((op as Record<string, unknown>).operationId as string).length > 0
+          ? `openapi:${(op as Record<string, unknown>).operationId as string}`
+          : `openapi:${method.toUpperCase()} ${path}`
+        ids.add(opId)
+        ops.push({ method: method.toUpperCase(), path, id: opId })
+      }
+    }
+  }
+
+  // Rule 2: every interfaces.http entry resolves (method + pathname) to a
+  // contract operation — Clause 1 obliges the contract to describe every
+  // callable operation — and is covered exactly when that operation is; the
+  // unconditionally verified faces are exempt.
+  for (const ep of agents.endpoints) {
+    let pathname: string | undefined
+    try { pathname = new URL(ep.url).pathname } catch { /* unresolvable url */ }
+    if (pathname === undefined) {
+      problems.push(`interfaces.http entry ${ep.method} ${ep.url} does not resolve to a URL — an uncovered capability by construction (A.8.7.1)`)
+      continue
+    }
+    if (COVERAGE_EXEMPT_PATHNAMES.has(pathname)) continue
+    const hit = ops.find((o) => o.method === ep.method && openapiPathMatches(o.path, pathname!))
+    if (!hit) {
+      problems.push(
+        `interfaces.http entry ${ep.method} ${pathname} resolves to no contract operation — ` +
+          'an uncovered capability by construction (A.8.7.1 rule 2)',
+      )
+    }
+  }
+
+  // Rule 2, MCP half: per declared tool, or the single interface identifier.
+  if (agents.mcp !== undefined) {
+    const tools = agents.mcp.tools
+    if (tools && tools.length > 0) {
+      for (const t of tools) ids.add(`mcp:${t}`)
+    } else {
+      ids.add('interfaces.mcp')
+    }
+  }
+
+  // Rule 3: every other optional declared interface, testSuite itself
+  // excluded (the suite is the instrument of proof, A.8.5.2 bars recursion).
+  const interfaces = (agentsDoc as Record<string, unknown> | undefined)?.interfaces
+  if (interfaces && typeof interfaces === 'object' && !Array.isArray(interfaces)) {
+    for (const key of Object.keys(interfaces as Record<string, unknown>)) {
+      if (key === 'http' || key === 'mcp' || key === 'testSuite') continue
+      ids.add(`interfaces.${key}`)
+    }
+  }
+
+  return { ids: [...ids].sort(), problems }
+}
+
+/** Segment-wise match of an OpenAPI path template against a concrete pathname. */
+function openapiPathMatches(template: string, pathname: string): boolean {
+  if (template === pathname) return true
+  const t = template.split('/')
+  const p = pathname.split('/')
+  if (t.length !== p.length) return false
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === p[i]) continue
+    if (/^\{.+\}$/.test(t[i]!)) continue
+    return false
+  }
+  return true
+}
+
+/**
+ * The A.8.7 judgment: over the folded result set of the ONE published-suite
+ * run, every capability the card declares must be covered by at least one
+ * PASSING row or test, bound by the pinned artifact's own explicit `coverage`
+ * map unioned with implicit square-bracket coverage tags. Fail closed, never
+ * skip: uncovered, defective member, out-of-domain key/tag/reference, or a
+ * dangling reference each fails; a run that did not complete honestly fails
+ * by the named reason `suite-run-failed` (A.8.7.3).
+ */
+function judgeCapabilityCoverage(
+  bundle: EvidenceBundle,
+  claim: TestSuiteClaim,
+  agentsDoc: unknown,
+  openapiDoc: unknown,
+  agents: AgentsClaims,
+  evidence: string[],
+): { verdict: Verdict; detail: string } {
+  const fold = foldPublishedSuiteRun(bundle, claim, evidence)
+  if (fold.state === 'run-failed') {
+    return {
+      verdict: 'fail',
+      detail:
+        `suite-run-failed: coverage cannot be read off a run that did not complete honestly (A.8.7.3) — ${fold.reason}`,
+    }
+  }
+
+  const domain = coverageDomainOf(agentsDoc, openapiDoc, agents)
+  const problems = [...domain.problems]
+  const ids = new Set(domain.ids)
+  const byName = new Map<string, boolean>()
+  for (const r of fold.results) byName.set(r.name, r.passed)
+  const covered = new Set<string>()
+
+  // The explicit map (A.8.7.2) — the pinned artifact's own `coverage` member.
+  if (fold.coverageMap !== undefined) {
+    const cov = fold.coverageMap
+    if (cov === null || typeof cov !== 'object' || Array.isArray(cov)) {
+      problems.push('the suite `coverage` member must be a JSON object mapping capability identifiers to non-empty arrays of test references (A.8.7.2)')
+    } else {
+      for (const [key, refs] of Object.entries(cov as Record<string, unknown>)) {
+        if (!ids.has(key)) {
+          problems.push(`coverage key "${key}" names no declared capability — coverage of undeclared surface is a claim about surface that does not exist (presence-when-true, A.8.7.2)`)
+          continue
+        }
+        if (!Array.isArray(refs) || refs.length === 0 || refs.some((r) => typeof r !== 'string')) {
+          problems.push(`coverage["${key}"] must be a non-empty array of test-reference strings (A.8.7.2)`)
+          continue
+        }
+        for (const ref of refs as string[]) {
+          if (!byName.has(ref)) {
+            problems.push(`coverage["${key}"] references "${ref}", which names no row and no registered test of this run (A.8.7.2)`)
+          } else if (byName.get(ref)) {
+            covered.add(key)
+          }
+        }
+      }
+    }
+  }
+
+  // The implicit tags (A.8.7.2) — square-bracket identifiers in row ids and
+  // full folded test names.
+  for (const r of fold.results) {
+    for (const m of r.name.matchAll(COVERAGE_TAG_RE)) {
+      const tag = m[1]!
+      if (!ids.has(tag)) {
+        problems.push(`"${r.name}" carries coverage tag [${tag}], which names no declared capability (presence-when-true, A.8.7.2)`)
+      } else if (r.passed) {
+        covered.add(tag)
+      }
+    }
+  }
+
+  // The gate itself: every declared capability has a PASSING row or test.
+  const uncovered = domain.ids.filter((id) => !covered.has(id))
+  for (const id of uncovered) {
+    problems.push(`declared capability "${id}" is not covered by any passing row or test — declared-but-untested is inadmissible (A.8.7)`)
+  }
+  if (uncovered.length > 0 && fold.moduleArtifact) {
+    problems.push(
+      'NOTE: the pinned MODULE artifact\'s optional `coverage` export is not read by this verifier version — ' +
+        'bind coverage via square-bracket tags in test names, or publish the map in a suite document (deferral is fail-closed, never lenient)',
+    )
+  }
+
+  if (problems.length > 0) {
+    return {
+      verdict: 'fail',
+      detail:
+        `capability coverage: ${covered.size}/${domain.ids.length} declared capabilities covered by a passing row/test of the ` +
+        `declared suite's single run — ${problems.slice(0, 8).join('; ')}`,
+    }
+  }
+  return pass(
+    `capability coverage: ${domain.ids.length}/${domain.ids.length} declared capabilities covered by at least one passing ` +
+      `row/test of the declared suite's single run (${fold.results.length} row(s)/test(s); one run, two judgments — no second ` +
+      'fetch or execution, A.8.7.3). NOT judged: rigour — coverage decides the completeness of the declaration↔proof mapping, ' +
+      'never how demanding any single test is (A.8.7.4).',
   )
 }
 

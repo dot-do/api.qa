@@ -79,19 +79,28 @@ export const OPTIONAL_DECLARED_INTERFACES: Readonly<Record<string, string>> = Ob
   'digital-link-resolver': 'interfaces.digitalLink',
   /**
    * A card-published, digest-pinned api.qa Suite the target asserts about
-   * itself.
-   *
-   * ⚠ ELIGIBLE BUT NOT YET IMPLEMENTED. `runChecks` does not produce a
-   * `published-test-suite` check today — it lands in a later, separate change.
-   * The row is here because eligibility and admission are different things and
-   * this is the standing demonstration of that: the registry says what MAY be
-   * declaration-armed, the ratified spec says what IS pinned, and nothing pins
-   * this. A spec that pins it anyway does not get a lenient verdict: against a
-   * DECLARING card the requirement fails loudly with `unknown check
-   * "published-test-suite"`, which is the correct direction of failure for a
-   * verifier that is too old for the spec it was handed.
+   * itself. Implemented (checks.ts `published-test-suite`): the artifact is
+   * fetched, byte-checked against the card pin, and RUN — in the dialect the
+   * card's `runner` names (`api.qa/suite@1` interpreted as declarative data,
+   * `api.qa/vitest@1` executed under the A.8.6 invariants). Pinned as
+   * `check-published-test-suite` since `apis-ax-axp@2.4.0`.
    */
   'published-test-suite': 'interfaces.testSuite',
+  /**
+   * Capability coverage (AXP A.8.7, pinned as `check-capability-coverage`
+   * since `apis-ax-axp@2.5.0`): over the SAME single published-suite run,
+   * every capability the card declares must be covered by at least one
+   * PASSING row or test. Implemented (checks.ts `capability-coverage`).
+   *
+   * DELIBERATELY the same card key as `published-test-suite`: one declaration,
+   * two strictly judged facets (the suite is KEPT; it REACHES everything else
+   * the card declares). A.8 permits it because this registry is keyed by
+   * CHECK — a check appears at most once, bound to exactly one card key —
+   * and nothing limits how many registered checks one key arms. A card that
+   * omits the key gains one not-applicable result PER armed check and no new
+   * way to fail.
+   */
+  'capability-coverage': 'interfaces.testSuite',
 })
 
 /**
