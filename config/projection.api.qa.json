@@ -1,0 +1,43 @@
+{
+  "$type": "G4Projection",
+  "$comment": "Stratum B — the G4 projection config for api.qa over the fn-it substrate (property-template §2, 2026-08-23). Content, not code. Non-exclusive by design: apis.ax (B2A, cross-cutting) may project the same substrate with its own offer/pricing config.",
+  "substrate": "fn-it",
+  "brand": "api.qa",
+  "domains": ["api.qa"],
+  "icp": {
+    "companyTypes": [
+      "platform/engineering teams shipping agent-facing APIs",
+      "autonomous agent fleets selecting APIs by verified conformance",
+      "estate properties clearing the worthiness bar (internal mandatory customers)"
+    ],
+    "jobTypes": ["platform engineer", "API builder", "fleet orchestrator", "agent procurement"]
+  },
+  "personas": ["builder", "fleet-orchestrator", "evaluator", "procurement"],
+  "motion": "B2D",
+  "motionNote": "FOUNDER RULING REQUESTED: the row's ICP hint names both B2D (builders) and B2A (agents — the trust signal IS the product). B2D is declared primary here because the paid boundaries (attested runs, CI webhooks) settle to human principals via checkout; the keyless free rail serves machine identities without any gate, and a distinct apis.ax B2A projection of this substrate is the register's design. If B2A should be primary for api.qa itself, the offer array and OFFER alternatives change shape (§5.1).",
+  "offer": [
+    { "shape": "anon-sandbox", "gate": "none — keyless", "price": "free", "notes": "GET /{domain}, /self, /reports; rate-limited by per-domain cooldown, never paywalled" },
+    { "shape": "self-serve-offer", "gate": "402 boundary with structured OFFER; checkout stub (settlement rail not activated — labeled, never fake billing)", "price": "attested-run $5 one-time; ci-webhook $20/mo" }
+  ],
+  "pricing": {
+    "pattern": "freemium-ladder",
+    "rateCard": "/pricing",
+    "model": "free",
+    "notes": "Rate card serves model:free with zero-priced operationId-keyed rates + declared offers; a gate on the free grade would contradict the product thesis."
+  },
+  "positioning": "The external third-party verifier for agent-first APIs — every grade is judged by api.qa, never self-graded. NOTE: api.qa is the attestor of the estate's worthiness bar (#3 rule 5); it does not carry the 'agent default' claim for itself — self-attestation is exactly what the mechanism exists to prevent. Founder ruling requested on who attests the attestor.",
+  "counterpartBrand": {
+    "required": false,
+    "reason": "ICP contains no non-technical principals; both personas speak API natively. §9.3 diagnostic seams are emitted regardless (identity class + referral on every metering event)."
+  },
+  "mdx": null,
+  "mdxNote": "Custom site (src/views.ts), allowed at wave zero per §7.1 prove-then-extract; CNAME to the workers.do lane deferred until the lane is proven.",
+  "experiment": {
+    "pattern": "freemium-ladder",
+    "motion": "B2D",
+    "shapes": ["anon-sandbox", "self-serve-offer"],
+    "rateCardRef": "/pricing",
+    "startDate": "2026-08-23",
+    "hypothesis": "The free keyless grade rail is the acquisition engine; conversion to paid attested runs/CI webhooks tracks suite-consumer count, not gate pressure."
+  }
+}

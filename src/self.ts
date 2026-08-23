@@ -11,6 +11,24 @@ import { TAGLINE, AXP_ANCHOR, JUDGED, ADMISSION, VILLAIN } from './copy.js'
 
 export const SELF_ORIGIN = 'https://api.qa'
 
+/**
+ * AXP A.7.5 face alternates — every root/face response advertises BOTH
+ * sibling faces via `Link rel="alternate"` with a type parameter, and the
+ * three advertised addresses are extension-forced (A.7 rule 1: the address
+ * wins over any contradictory Accept header).
+ */
+export const FACE_ALTERNATES =
+  '</index.html>; rel="alternate"; type="text/html", ' +
+  '</index.json>; rel="alternate"; type="application/ld+json", ' +
+  '</index.md>; rel="alternate"; type="text/markdown"'
+
+/**
+ * AXP A.7.4 known-agent User-Agent tokens (client-class step 3b). Detection
+ * by UA happens ONLY on a bare wildcard Accept — an explicit face-naming
+ * Accept always wins first (A.7 step 2).
+ */
+export const AGENT_UA_PATTERN = /claude-user|claudebot|gptbot|oai-searchbot|perplexitybot|google-extended|agent/i
+
 export function selfLlmsTxt(): string {
   return `# api.qa
 
@@ -67,12 +85,19 @@ verdict that clears your bar.
 ## Other surfaces
 
 - \`GET /llms.txt\` — this document
-- \`GET /.well-known/agents.json\` — capability card
+- \`GET /.well-known/agents.json\` — capability card (with the AXP probe manifest)
 - \`GET /icp.json\` — who this is for; self-classify
 - \`GET /openapi.json\` — the API contract (we are verified against it too)
+- \`GET /pricing\` — the rate card: model, per-operation rates, free quotas
+- \`GET /reports\` — VerificationReport collection (keyless sandbox; branches on \`?domain=\`, \`?grade=\`, \`?before=\`; typed OK/EMPTY/BLOCKED envelopes)
 - \`GET /health\` — keyless liveness
 - \`GET /self\` — api.qa's own verdict on api.qa, run live
 - \`npx autonomous-qa <domain>\` — CLI; \`npx autonomous-qa mcp\` — MCP server (stdio)
+
+The home address content-negotiates three faces (AXP Clause 3): bare
+\`Accept: */*\` gets JSON-LD, a known agent User-Agent gets this markdown, a
+browser navigation gets HTML; \`/index.json\`, \`/index.md\`, \`/index.html\`
+force their face regardless of Accept.
 
 ## 402s are offers, not errors
 
@@ -109,6 +134,8 @@ export function selfAgentsJson(): object {
       http: {
         report: { method: 'GET', url: `${SELF_ORIGIN}/{domain}`, auth: 'none' },
         verify: { method: 'POST', url: `${SELF_ORIGIN}/verify`, auth: 'none' },
+        reports: { method: 'GET', url: `${SELF_ORIGIN}/reports`, auth: 'none' },
+        pricing: { method: 'GET', url: `${SELF_ORIGIN}/pricing`, auth: 'none' },
         health: { method: 'GET', url: `${SELF_ORIGIN}/health`, auth: 'none' },
         usage: { method: 'GET', url: `${SELF_ORIGIN}/llms.txt`, auth: 'none' },
       },
@@ -119,7 +146,48 @@ export function selfAgentsJson(): object {
         tools: ['verify_domain', 'discover_domain', 'verify_pinned_spec'],
       },
     },
+    /**
+     * AXP A.3 probe manifest: WHERE the verifier probes; what counts as
+     * passing lives in the pinned standard. knownEmpty is honest by
+     * construction (no VerificationReport predates the verifier); the
+     * knownForbidden scopes are the two genuinely operator-gated report
+     * scopes (private retained reports; monitor administration records).
+     */
+    probes: {
+      keyless: [{ url: '/reports' }],
+      pricing: [{ url: '/pricing' }],
+      knownEmpty: [{ url: '/reports?before=1970-01-01' }, { url: '/reports?before=2020-01-01' }],
+      knownForbidden: [{ url: '/reports?scope=private' }, { url: '/reports?scope=monitor-owner' }],
+    },
     openapi: `${SELF_ORIGIN}/openapi.json`,
+    llms: `${SELF_ORIGIN}/llms.txt`,
+    links: {
+      openapi: `${SELF_ORIGIN}/openapi.json`,
+      llms: `${SELF_ORIGIN}/llms.txt`,
+      pricing: `${SELF_ORIGIN}/pricing`,
+      // The verifier's own conformance page — same rail every property links.
+      conformance: `${SELF_ORIGIN}/api.qa`,
+      // The runnable form of "run this, don't trust us": the npm package IS
+      // the published verifier suite (advisory local mode; only the deployed
+      // service signs). A digest-pinned interfaces.testSuite document is
+      // deliberately NOT declared until one exists that covers every declared
+      // operation and MCP tool (presence-when-true).
+      verify: 'https://www.npmjs.com/package/autonomous-qa',
+    },
+    /**
+     * G2 coordinates of this projection (fn-it register row): who the surface
+     * is for, in ICP + persona terms. The persona detail lives at /icp.json.
+     */
+    coordinates: {
+      substrate: 'fn-it',
+      system: { system: 'QA/Conformance Register', coordinates: ['agent-facing-apis'] },
+      icp: {
+        companyTypes: ['platform/engineering teams shipping agent-facing APIs', 'autonomous agent fleets selecting APIs', 'estate properties clearing the worthiness bar'],
+        jobTypes: ['platform engineer', 'API builder', 'fleet orchestrator', 'agent procurement'],
+      },
+      personas: ['builder', 'fleet-orchestrator', 'evaluator', 'procurement'],
+      motion: 'B2D',
+    },
     attestationLadder: [
       {
         rung: 'advisory-local',
@@ -242,6 +310,47 @@ export function selfOpenapi(): object {
           },
         },
       },
+      '/pricing': {
+        get: {
+          operationId: 'getPricing',
+          summary: 'The rate card: pricing model, per-operation rates, free quotas',
+          responses: {
+            '200': {
+              description: 'the Pricing Document (AXP A.2) extended with per-operation rates',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', required: ['model', 'rates'] },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/reports': {
+        get: {
+          operationId: 'listReports',
+          summary: 'VerificationReport collection (keyless sandbox; query-branching)',
+          description:
+            'Branches on its query (AXP branching-collection pattern): ?domain= and ?grade= filter, ?before= bounds verifiedAt, ?scope=private|monitor-owner are operator-gated. Typed envelopes: 200 OK | 200 EMPTY | 401/403 BLOCKED.',
+          parameters: [
+            { name: 'domain', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'grade', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'before', in: 'query', required: false, schema: { type: 'string', format: 'date' } },
+            { name: 'scope', in: 'query', required: false, schema: { type: 'string' } },
+          ],
+          responses: {
+            '200': {
+              description: 'OK or EMPTY envelope of report summaries',
+              content: {
+                'application/json': {
+                  schema: { type: 'object', required: ['type'] },
+                },
+              },
+            },
+            '403': { description: 'BLOCKED envelope: operator-gated scope' },
+          },
+        },
+      },
       '/{domain}': {
         get: {
           operationId: 'report',
@@ -293,6 +402,164 @@ export function selfOffer(): object {
       { id: 'free-tier', how: 'GET /{domain} — free rate-limited public verification, no key needed' },
       { id: 'local-mode', how: 'npx autonomous-qa <target> — run the same verifier core locally (advisory, unsigned)' },
     ],
+  }
+}
+
+/**
+ * The JSON-LD home face (AXP A.7.1): what a bare wildcard-Accept or explicit
+ * `application/json` client receives at `/`. JSON-first, token-cheap, and
+ * one hop from every other surface.
+ */
+export function selfHomeJson(): object {
+  return {
+    $context: 'https://schema.org.ai',
+    $type: 'Service',
+    name: 'api.qa',
+    description:
+      'External third-party verifier for agent-first APIs: contract-derived deterministic checks, attested public grade reports. Every grade is judged by api.qa, never self-graded.',
+    url: SELF_ORIGIN,
+    getStarted: `curl ${SELF_ORIGIN}/example.com`,
+    surfaces: {
+      agentsJson: `${SELF_ORIGIN}/.well-known/agents.json`,
+      llmsTxt: `${SELF_ORIGIN}/llms.txt`,
+      openapi: `${SELF_ORIGIN}/openapi.json`,
+      pricing: `${SELF_ORIGIN}/pricing`,
+      reports: `${SELF_ORIGIN}/reports`,
+      icp: `${SELF_ORIGIN}/icp.json`,
+      self: `${SELF_ORIGIN}/self`,
+    },
+  }
+}
+
+/**
+ * The rate card (`/pricing`) — the AXP A.2 Pricing Document extended with
+ * per-operation rates (the estate rate-card extension; unknown members are
+ * ignored by conformance). Model is honestly `free`: the public verification
+ * rail is keyless, rate-limited, and never answers 402 — a gate on the free
+ * grade would contradict the product thesis. The purchasable boundaries
+ * (attested runs, CI webhooks) are declared monetization offers answered as
+ * structured 402 OFFERs; settlement is a stub seam, never fake billing.
+ */
+export function selfPricing(): object {
+  return {
+    model: 'free',
+    binding: false,
+    statement:
+      'Public keyless verification is free and rate-limited (per-domain cooldown), never paywalled. Paid boundaries (attested runs, CI webhooks) answer HTTP 402 with structured offers; checkout settlement is not yet activated — the offer surface is a labeled stub.',
+    rates: [
+      { operation: 'report', price: 0, unit: 'usd-per-call', freeQuota: 'rate-limited (per-domain cooldown; cached verdicts served in cooldown)' },
+      { operation: 'verify', price: 0, unit: 'usd-per-call', freeQuota: 'rate-limited (per-domain cooldown)' },
+      { operation: 'listReports', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
+      { operation: 'getPricing', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
+      { operation: 'health', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
+      { operation: 'openapi', price: 0, unit: 'usd-per-call', freeQuota: 'unlimited' },
+    ],
+    offers: [
+      { id: 'attested-run', title: 'On-demand attested verification run', price: { amount: 5, currency: 'USD', interval: 'one-time' }, probe: `${SELF_ORIGIN}/offers/attested-run` },
+      { id: 'ci-webhook', title: 'CI webhook: verify on every deploy', price: { amount: 20, currency: 'USD', interval: 'month' } },
+    ],
+  }
+}
+
+/**
+ * Sandbox seed corpus (§5.2 of the property template): synthetic
+ * VerificationReport summaries, mechanically shaped like real report
+ * exhaust, every record labeled `example: true`. Fixture law: reserved
+ * `.example` targets only (RFC 2606), no real company or person names.
+ * Real verdicts are always one hop away — `GET /{domain}` and `/self` run
+ * the live verifier; this collection is the keyless floor that answers with
+ * substance even on a cold deployment.
+ */
+const SEED_REPORTS = [
+  {
+    example: true,
+    target: 'https://demo-alpha.example',
+    grade: 'A+',
+    axScore: { points: 10, of: 10 },
+    passed: true,
+    attested: true,
+    verifiedAt: '2026-08-20T14:05:00Z',
+    checks: { pass: 10, fail: 0, skip: 2 },
+    note: 'EXAMPLE DATA — synthetic seed record over a reserved .example target; not a real verdict. Live verdicts: GET /{domain}.',
+  },
+  {
+    example: true,
+    target: 'https://demo-bravo.example',
+    grade: 'B',
+    axScore: { points: 7, of: 10 },
+    passed: false,
+    attested: true,
+    verifiedAt: '2026-08-21T09:30:00Z',
+    checks: { pass: 7, fail: 3, skip: 2 },
+    failing: ['content-negotiation', 'mcp-declared', 'offers-402'],
+    note: 'EXAMPLE DATA — synthetic seed record over a reserved .example target; not a real verdict. Live verdicts: GET /{domain}.',
+  },
+  {
+    example: true,
+    target: 'https://demo-charlie.example',
+    grade: 'C',
+    axScore: { points: 8, of: 10 },
+    passed: false,
+    attested: true,
+    verifiedAt: '2026-08-22T18:45:00Z',
+    checks: { pass: 8, fail: 2, skip: 2 },
+    failing: ['claims-honesty', 'schema-conformance'],
+    note: 'EXAMPLE DATA — synthetic seed record; grade capped at C by an honesty check (a lying surface is worse than a missing one). Not a real verdict.',
+  },
+] as const
+
+/**
+ * `GET /reports` — the branching VerificationReport collection (data ply of
+ * the fn-it substrate). One keyless address whose query branches discharge
+ * the typed-envelope law: 200 OK, 200 EMPTY, 401/403 BLOCKED. Pure function
+ * of the URL so the worker route and tests share one definition.
+ */
+export function selfReportsResponse(url: URL): { status: number; body: object } {
+  const scope = url.searchParams.get('scope')
+  if (scope === 'private' || scope === 'monitor-owner') {
+    return {
+      status: 403,
+      body: {
+        $context: 'https://schema.org.ai',
+        type: 'BLOCKED',
+        reason:
+          scope === 'private'
+            ? 'private retained reports are scoped to the principal that purchased the attested run'
+            : 'monitor administration records are scoped to the registering operator',
+        see: `${SELF_ORIGIN}/offers/attested-run`,
+      },
+    }
+  }
+  const before = url.searchParams.get('before')
+  const domain = url.searchParams.get('domain')
+  const grade = url.searchParams.get('grade')
+  let items = SEED_REPORTS.filter((r) => {
+    if (before !== null && !(r.verifiedAt < before)) return false
+    if (domain !== null && !r.target.includes(domain)) return false
+    if (grade !== null && r.grade !== grade) return false
+    return true
+  })
+  if (items.length === 0) {
+    return {
+      status: 200,
+      body: {
+        $context: 'https://schema.org.ai',
+        type: 'EMPTY',
+        results: [],
+        message: 'no verification reports match this query (the verifier has existed since 2026 — nothing predates it)',
+      },
+    }
+  }
+  return {
+    status: 200,
+    body: {
+      $context: 'https://schema.org.ai',
+      type: 'OK',
+      dataNotice:
+        'EXAMPLE DATA — this keyless sandbox collection serves labeled synthetic seed records. Live, attested verdicts are one hop away: GET /{domain} or /self.',
+      results: items,
+      live: { report: `${SELF_ORIGIN}/{domain}`, self: `${SELF_ORIGIN}/self` },
+    },
   }
 }
 

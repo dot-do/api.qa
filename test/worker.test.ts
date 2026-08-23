@@ -9,11 +9,25 @@ function app() {
 const req = (path: string, init?: RequestInit) => new Request(`https://api.qa${path}`, init)
 
 describe('worker machine surfaces', () => {
-  it('content-negotiates the root: curl gets markdown, browsers get HTML', async () => {
+  it('content-negotiates the root per AXP A.7: bare */* gets JSON-LD, agent UA gets markdown, browsers get HTML', async () => {
+    // Step 3c: everything that is neither a browser navigation nor a known
+    // agent defaults to the JSON face.
     const asCurl = await app().fetch(req('/', { headers: { accept: '*/*' } }))
-    expect(await asCurl.text()).toMatch(/^# api\.qa/)
+    expect(asCurl.headers.get('content-type')).toContain('application/ld+json')
+    const home = (await asCurl.json()) as { name: string; $context: string }
+    expect(home.name).toBe('api.qa')
+    expect(home.$context).toBe('https://schema.org.ai')
+    // Step 3b: a known agent User-Agent on */* defaults to markdown.
+    const asAgent = await app().fetch(req('/', { headers: { accept: '*/*', 'user-agent': 'Claude-User/1.0' } }))
+    expect(await asAgent.text()).toMatch(/^# api\.qa/)
+    // Step 2: an explicit face-naming Accept receives exactly its face.
     const asBrowser = await app().fetch(req('/', { headers: { accept: 'text/html,application/xhtml+xml' } }))
     expect(await asBrowser.text()).toMatch(/^<!doctype html>/)
+    // A.7 rule 1: extension-named addresses force their face over Accept.
+    const forcedMd = await app().fetch(req('/index.md', { headers: { accept: 'text/html' } }))
+    expect(await forcedMd.text()).toMatch(/^# api\.qa/)
+    // A.7.5: every face response advertises its siblings via Link alternates.
+    expect(asCurl.headers.get('link')).toContain('rel="alternate"')
   })
 
   it('serves llms.txt, agents.json, icp.json, openapi.json, health', async () => {

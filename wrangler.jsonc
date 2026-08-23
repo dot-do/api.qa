@@ -56,6 +56,15 @@
     { "binding": "REPORTS", "id": "90eb42161ef045eb8b38b01cf87f985a" }
   ],
 
+  // ── Metering seam (property-template §7.4, fn-it wave zero) ──────────────
+  // Usage/money events tagged {substrate, projection, motion, operation,
+  // shape, pattern} + identity class + referral (src/meter.ts). The seam
+  // FALLS BACK to structured log lines while this binding is absent — enable
+  // the Analytics Engine dataset when the unified analytics plane lands:
+  //   "analytics_engine_datasets": [
+  //     { "binding": "METERING", "dataset": "api_qa_metering" }
+  //   ],
+
   // ── api.qa/vitest@1 executable-suite runner (AXP A.8.6) — ENROLLED ───────
   // The Dynamic Worker Loader binding is an OPEN-BETA, PAID-PLAN capability,
   // ENABLED here 2026-08-08: account b6641681fe423910342b9ffa1364c76d accepted

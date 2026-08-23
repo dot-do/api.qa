@@ -19,7 +19,7 @@ import { runContractDiff } from '../src/contract-cli.js'
 import { exitCodeFor, jsonReport } from '../src/reporters.js'
 import { axScoreOf, gradeOf } from '../src/grade.js'
 import { verifyPinnedSpec } from '../src/pinned.js'
-import { selfOpenapi, selfAgentsJson, selfIcpJson, selfLlmsTxt, SELF_ORIGIN } from '../src/self.js'
+import { selfOpenapi, selfAgentsJson, selfIcpJson, selfLlmsTxt, selfPricing, selfReportsResponse, SELF_ORIGIN } from '../src/self.js'
 import { GOOD, goodTargetRoutes, makeFetcher, withOverrides, withoutRoutes, type Routes } from './helpers.js'
 
 function json(body: unknown): { status: number; contentType: string; body: string } {
@@ -632,14 +632,16 @@ describe("dogfood — contract-diff against api.qa's own openapi.json shape", ()
     'GET /icp.json': () => json(selfIcpJson()),
     'GET /openapi.json': () => json(selfOpenapi()),
     'GET /health': () => json({ ok: true, verifier: 'api.qa', version: '0.1.0' }),
+    'GET /pricing': () => json(selfPricing()),
+    'GET /reports': () => json(selfReportsResponse(new URL(`${SELF_ORIGIN}/reports`)).body),
     ...over,
   })
 
   it('the self shape diffs with no breaking deviations (llms.txt is an additive ghost)', async () => {
     const { diff, checks } = await run(selfRoutes(), SELF_ORIGIN)
     expect(diff.openapiValid).toBe(true)
-    // /health + /openapi.json are the two GET-safe declared operations.
-    expect(diff.operationsProbed).toBe(2)
+    // /health + /openapi.json + /pricing + /reports are the GET-safe declared operations.
+    expect(diff.operationsProbed).toBe(4)
     expect(diff.breaking).toBe(0)
     expect(diffCheck(checks).verdict).toBe('pass')
     // agents.json declares GET /llms.txt (usage) — present, but not in the OpenAPI.

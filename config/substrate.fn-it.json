@@ -1,0 +1,72 @@
+{
+  "$type": "APIProduct",
+  "$comment": "Stratum A — the G3 substrate instance for the fn-it register row (property-template §1, 2026-08-23). Authored in the primitives.org.ai digital-products shape; the normative type definition lands in that package — this instance moves there when it exists (prove-then-extract). Brand, ICP, motion, offer, and price live in config/projection.api.qa.json (G4), never here.",
+  "substrate": "fn-it",
+  "nouns": [
+    {
+      "name": "VerificationReport",
+      "schema": { "$type": "VerificationReport", "$context": "https://schema.org.ai", "definition": "src/types.ts" },
+      "binding": "native",
+      "verbs": ["list", "get", "verify", "rejudge", "attest"],
+      "notes": "The row's compounding record: signed, dated, replayable. Owned by construction — every verification run produces first-party exhaust."
+    },
+    {
+      "name": "PinnedSpec",
+      "schema": { "$type": "PinnedSpec", "$context": "https://schema.org.ai", "definition": "src/types.ts" },
+      "binding": "native",
+      "verbs": ["verify"],
+      "notes": "Digest-bound acceptance contracts (the anti-Goodhart gate)."
+    },
+    {
+      "name": "Monitor",
+      "schema": { "$type": "Monitor", "$context": "https://schema.org.ai", "definition": "src/monitors.ts" },
+      "binding": "native",
+      "verbs": ["register", "list", "get", "run"],
+      "notes": "Continuous re-verification registrations; the continuously-verified half of worthiness-bar item (c)."
+    },
+    {
+      "name": "TestSuite",
+      "schema": { "$type": "TestSuite", "$context": "https://schema.org.ai", "definition": "src/suite-doc.ts" },
+      "binding": "native",
+      "verbs": ["publish", "run"],
+      "notes": "Publish/verify split is doctrinal: apis.ax publishes suites, api.qa independently verifies (#3 rule 5)."
+    },
+    {
+      "name": "MockSpec",
+      "schema": { "$type": "MockSpec", "$context": "https://schema.org.ai", "definition": "src/mock.ts" },
+      "binding": "generated",
+      "verbs": ["register", "serve"],
+      "notes": "Deterministic schema-conformant mock exhaust, content-addressed by digest."
+    }
+  ],
+  "systems": [
+    { "system": "QA/Conformance Register", "coordinates": ["agent-facing-apis"] }
+  ],
+  "transports": ["REST", "MCP"],
+  "face": {
+    "$comment": "The quartet is hand-authored in src/self.ts + src/worker.ts, NOT emitted via axp-faces: api.qa is the independent verifier — sharing generator code with the surfaces it judges would let a generator bug self-certify. Founder ruling pending on whether this independence exemption stands (see checklist row 3).",
+    "agentsJson": "/.well-known/agents.json",
+    "openapi": "/openapi.json",
+    "pricing": "/pricing",
+    "llmsTxt": "/llms.txt"
+  },
+  "operations": ["report", "verify", "listReports", "getPricing", "health", "openapi"],
+  "sandbox": {
+    "$comment": "§5.2 universal floor: GET /reports answers keyless with labeled synthetic seed records (reserved .example targets, mechanically shaped like real report exhaust); the REAL rail is one hop away (GET /{domain}, /self run the live verifier keylessly). Seed spec versioned with the code (src/self.ts SEED_REPORTS); reseed = build step.",
+    "keylessProbe": "/reports",
+    "seed": "src/self.ts#SEED_REPORTS",
+    "fixtureLaw": "reserved .example targets only; no real company or person names; every record labeled example:true"
+  },
+  "suite": {
+    "$comment": "The runnable public suite is the npm package (npx autonomous-qa <domain>) + test/self.test.ts + test/self-pinned.test.ts (the pinned 2.6.0 admission gate run on itself). A digest-pinned interfaces.testSuite document is deliberately not declared until one exists that covers every declared operation and MCP tool (A.8.7 capability coverage) — presence-when-true.",
+    "runnable": "npx autonomous-qa api.qa",
+    "pinnedSelfGate": "test/self-pinned.test.ts"
+  },
+  "meters": [
+    { "operation": "report", "event": "metering" },
+    { "operation": "verify", "event": "metering" },
+    { "operation": "listReports", "event": "metering" },
+    { "operation": "getPricing", "event": "metering" },
+    { "operation": "offerAttestedRun", "event": "money" }
+  ]
+}

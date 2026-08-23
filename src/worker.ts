@@ -2,11 +2,16 @@
  * The api.qa Cloudflare Worker — the deployed mount of the verifier core.
  *
  * Routes:
- *   GET  /                      content-negotiated (curl → llms.txt, browser → HTML)
+ *   GET  /                      content-negotiated per AXP A.7 (bare curl → JSON-LD,
+ *                               agent UA → markdown, browser → HTML; /index.{html,json,md}
+ *                               force their face; Link rel="alternate" siblings)
  *   GET  /llms.txt              agent-actionable usage doc
- *   GET  /.well-known/agents.json
+ *   GET  /.well-known/agents.json  capability card (+ AXP probe manifest)
  *   GET  /icp.json
  *   GET  /openapi.json
+ *   GET  /pricing               the rate card (free model; per-operation rates)
+ *   GET  /reports               VerificationReport collection (keyless sandbox;
+ *                               query-branching typed envelopes OK/EMPTY/BLOCKED)
  *   GET  /health                keyless liveness (?exec=1 adds the measured
  *                               api.qa/vitest@1 runner-availability probe)
  *   GET  /offers/attested-run   the 402 boundary (a structured offer, not an error)
@@ -97,14 +102,20 @@ import {
 } from './alerts.js'
 import type { VerificationReport } from './types.js'
 import {
+  AGENT_UA_PATTERN,
+  FACE_ALTERNATES,
   SELF_ORIGIN,
   selfAgentsJson,
+  selfHomeJson,
   selfIcpJson,
   selfLlmsTxt,
   selfOffer,
   selfOpenapi,
+  selfPricing,
+  selfReportsResponse,
 } from './self.js'
 import { VERIFIER_VERSION } from './verify.js'
+import { emitMeter, type MeteringSink } from './meter.js'
 
 // Re-exported so wrangler discovers the DO class as a named export of `main`.
 export { DomainCooldown } from './cooldown.js'
@@ -112,6 +123,12 @@ export { DomainCooldown } from './cooldown.js'
 export interface Env {
   /** base64 pkcs8 Ed25519 key — the held-out attestation key (Worker secret). */
   SIGNING_KEY?: string
+  /**
+   * Metering-seam sink (Analytics Engine dataset, property-template §7.4).
+   * Optional: absent falls back to structured log lines; request handling is
+   * never affected (presence-when-true).
+   */
+  METERING?: MeteringSink
   ALLOW_PRIVATE_TARGETS?: string
   /** KV report cache (per-target cooldown + replay store). */
   REPORTS?: KVLike
@@ -735,22 +752,68 @@ export function createApp(
         }
 
         if (request.method === 'GET' || request.method === 'HEAD') {
-          if (path === '/') {
-            return accept.includes('text/html')
-              ? html(landingHtml())
-              : text(selfLlmsTxt())
+          // --- The home faces (AXP Clause 3 / A.7) --------------------------
+          // Selection: explicit face-naming Accept first (step 2), then the
+          // */* client-class defaults (step 3): Sec-Fetch browser navigation →
+          // HTML, known agent User-Agent → markdown, everything else → JSON.
+          // The three extension-named addresses force their face regardless of
+          // Accept (rule 1: the address wins). Every face response advertises
+          // both siblings via Link rel="alternate" (A.7.5).
+          if (path === '/' || path === '/index.html' || path === '/index.json' || path === '/index.md') {
+            const face =
+              path === '/index.html' ? 'html'
+              : path === '/index.json' ? 'json'
+              : path === '/index.md' ? 'md'
+              : accept.includes('text/html') ? 'html'
+              : accept.includes('application/json') || accept.includes('application/ld+json') ? 'json'
+              : accept.includes('text/markdown') ? 'md'
+              : request.headers.get('sec-fetch-mode') === 'navigate' || request.headers.get('sec-fetch-dest') === 'document' ? 'html'
+              : AGENT_UA_PATTERN.test(request.headers.get('user-agent') ?? '') ? 'md'
+              : 'json'
+            const faceLink = { link: `${LINKSET}, ${FACE_ALTERNATES}` }
+            if (face === 'html') return html(landingHtml(), 200, faceLink)
+            if (face === 'md') return text(selfLlmsTxt(), 200, faceLink)
+            return new Response(JSON.stringify(selfHomeJson(), null, 2), {
+              headers: { 'content-type': 'application/ld+json; charset=utf-8', link: `${LINKSET}, ${FACE_ALTERNATES}`, 'access-control-allow-origin': '*' },
+            })
           }
           if (path === '/llms.txt') return text(selfLlmsTxt())
           if (path === '/.well-known/agents.json') return json(selfAgentsJson())
           if (path === '/icp.json') return json(selfIcpJson())
           if (path === '/openapi.json') return json(selfOpenapi())
+          if (path === '/pricing') {
+            emitMeter(env.METERING, request, 'getPricing', 'anon-sandbox')
+            return json(selfPricing())
+          }
+          if (path === '/reports') {
+            emitMeter(env.METERING, request, 'listReports', 'anon-sandbox')
+            const out = selfReportsResponse(url)
+            return json(out.body, out.status)
+          }
+          // Labeled checkout stub (402-shaped payable seam): the OFFER's
+          // checkoutUrl resolves, states plainly that settlement is not yet
+          // activated, and never pretends to bill (presence-when-true).
+          if (path === '/checkout/attested-run') {
+            return json({
+              status: 'stub',
+              offer: 'attested-run',
+              statement:
+                'Settlement is not yet activated on this deployment — this checkout address is a labeled stub, not a billing surface. The free keyless rail (GET /{domain}) stays free.',
+              see: `${SELF_ORIGIN}/offers/attested-run`,
+            }, 200)
+          }
           if (path === '/health') {
             const base = { ok: true, verifier: 'api.qa', version: VERIFIER_VERSION }
             // Opt-in runner probe; the plain declared-contract answer is untouched.
             if (url.searchParams.get('exec') !== '1') return json(base)
             return json({ ...base, exec: await execProbe() })
           }
-          if (path === '/offers/attested-run') return json(selfOffer(), 402)
+          if (path === '/offers/attested-run') {
+            // Money-event seam: a structured 402 OFFER was served at the
+            // boundary (the offer, not a settlement — no billing exists here).
+            emitMeter(env.METERING, request, 'offerAttestedRun', 'metered-offer', 'money')
+            return json(selfOffer(), 402)
+          }
 
           // Brand assets. These MUST be matched before DOMAIN_ROUTE: that regex
           // accepts any single dotted segment, so `/favicon.ico` would otherwise
@@ -776,6 +839,7 @@ export function createApp(
 
           const domain = path === '/self' ? 'api.qa' : DOMAIN_ROUTE.exec(path)?.[1]
           if (domain) {
+            emitMeter(env.METERING, request, 'report', 'anon-sandbox')
             const isSelf = domain === 'api.qa'
             const bypass = isSelf // loopback self-verification is never cached / gated
 
@@ -816,6 +880,7 @@ export function createApp(
         }
 
         if (request.method === 'POST' && path === '/verify') {
+          emitMeter(env.METERING, request, 'verify', 'anon-sandbox')
           const body = (await request.json().catch(() => undefined)) as
             | {
                 target?: string
