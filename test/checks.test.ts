@@ -4,6 +4,7 @@ import { observeTarget } from '../src/discovery.js'
 import { runChecks } from '../src/checks.js'
 import { axScoreOf, gradeOf } from '../src/grade.js'
 import { GOOD, goodTargetRoutes, makeFetcher, withOverrides, withoutRoutes, type Routes } from './helpers.js'
+import { axpReferenceRoutes, urlAwareFetcher } from './axp-fixture.js'
 
 async function judge(routes: Routes = goodTargetRoutes(), seed = 42) {
   const observer = new Observer({ fetcher: makeFetcher(routes), delayMs: 0 })
@@ -304,5 +305,70 @@ describe('keyless-flow sampler — robust against keyed-door-heavy cards', () =>
     const { bundle, checks } = await judge(keyedHeavyRoutes({ keyed: 4, keyless: [], hintKeyless: false }))
     expect(checks.find((x) => x.id === 'keyless-flow')?.verdict).toBe('fail')
     expect(keylessProbesOf(bundle)).toHaveLength(4) // every candidate walked, all refused
+  })
+})
+
+// ---------------------------------------------------------------------------
+// offers-402 is CONDITIONAL on the OBSERVED pricing model (AXP 0.9.0 /
+// apis-ax-axp@2.6.0): a free property with nothing purchasable has no 402
+// boundary to prove — the check passes VACUOUSLY. The metered half is not
+// weakened, an undetermined model earns no leniency, and anything a card
+// DECLARES is still judged strictly.
+// ---------------------------------------------------------------------------
+
+describe('offers-402 is conditional on the observed pricing model', () => {
+  const judgeAxp = async (
+    pricing: Record<string, unknown>,
+    mutateCard?: (card: Record<string, any>) => void,
+    overrides: Routes = {},
+  ) => {
+    const routes = withOverrides(axpReferenceRoutes(pricing, mutateCard), overrides)
+    const observer = new Observer({ fetcher: urlAwareFetcher(routes), delayMs: 0 })
+    const bundle = await observeTarget(GOOD, observer, 42)
+    return runChecks(bundle)
+  }
+  const offers = (checks: Awaited<ReturnType<typeof judgeAxp>>) => checks.find((c) => c.id === 'offers-402')!
+
+  it('FREE model + no purchasable surface → passes VACUOUSLY (the no-ask zone is satisfied trivially)', async () => {
+    const checks = await judgeAxp({ model: 'free' }, (card) => { delete card.monetization })
+    const c = offers(checks)
+    expect(c.verdict, c.detail).toBe('pass')
+    expect(c.detail).toContain('"model": "free"')
+    expect(c.detail).toContain('satisfied vacuously')
+    // The vacuous pass counts the AX point: a free property can reach 10/10.
+    expect(axScoreOf(checks).items.find((i) => i.id === 'offers-402')?.verdict).toBe('pass')
+  })
+
+  it('METERED model without monetization.offers still FAILS — the metered half is not weakened', async () => {
+    const checks = await judgeAxp({ model: 'metered', hardCeiling: 100 }, (card) => { delete card.monetization })
+    const c = offers(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('no monetization.offers declared')
+  })
+
+  it('an UNDETERMINED pricing model earns no vacuous pass (fail closed)', async () => {
+    // The pricing surface answers markup, so no model is observed.
+    const checks = await judgeAxp({ model: 'free' }, (card) => { delete card.monetization }, {
+      'GET /pricing': () => ({ status: 200, contentType: 'text/html', body: '<html>pricing page</html>' }),
+    })
+    const c = offers(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('observed pricing model: undetermined')
+  })
+
+  it('a FREE card that DECLARES a monetization surface is judged strictly, never excused', async () => {
+    // The reference card declares offers + a monetization.probe; break the
+    // boundary and the check must FAIL despite the observed free model.
+    const checks = await judgeAxp({ model: 'free' }, undefined, {
+      'GET /offers/upgrade': () => ({ status: 200, contentType: 'text/html', body: '<html>call sales</html>' }),
+    })
+    expect(offers(checks).verdict).toBe('fail')
+  })
+
+  it('a FREE card declaring a probe WITHOUT offers is a defective declaration and FAILS', async () => {
+    const checks = await judgeAxp({ model: 'free' }, (card) => { delete card.monetization.offers })
+    const c = offers(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('monetization.probe is declared without offers')
   })
 })

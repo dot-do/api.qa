@@ -165,13 +165,28 @@ describe('the optional-declared-interface registry', () => {
     }
   })
 
-  it('binds each check to exactly ONE card path, and no two checks share a path', () => {
-    const paths = Object.values(OPTIONAL_DECLARED_INTERFACES)
-    expect(new Set(paths).size, paths.join(', ')).toBe(paths.length)
+  it('binds each check to exactly ONE card path — keyed by CHECK, and one key MAY arm several checks (A.8)', () => {
+    // The registry is a plain object keyed by check id, so a check appears at
+    // most once by construction. Shared card paths are DELIBERATE since
+    // apis-ax-axp@2.5.0: interfaces.testSuite arms BOTH published-test-suite
+    // (the suite is kept, A.8.5) and capability-coverage (it reaches
+    // everything else the card declares, A.8.7) — one declaration, two
+    // strictly judged facets. This is the EXACT registry; a row moving is a
+    // deliberate re-ratification, never a fix.
+    expect(OPTIONAL_DECLARED_INTERFACES).toEqual({
+      'digital-link-resolver': 'interfaces.digitalLink',
+      'published-test-suite': 'interfaces.testSuite',
+      'capability-coverage': 'interfaces.testSuite',
+    })
   })
 
   it('registers digital-link-resolver against interfaces.digitalLink — the retrofit that makes it pinnable', () => {
     expect(OPTIONAL_DECLARED_INTERFACES['digital-link-resolver']).toBe('interfaces.digitalLink')
+  })
+
+  it('registers capability-coverage against interfaces.testSuite — the same key as the suite pin', () => {
+    expect(OPTIONAL_DECLARED_INTERFACES['capability-coverage']).toBe('interfaces.testSuite')
+    expect(OPTIONAL_DECLARED_INTERFACES['published-test-suite']).toBe('interfaces.testSuite')
   })
 
   /**

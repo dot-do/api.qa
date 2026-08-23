@@ -573,3 +573,112 @@ describe('the optional-interface registry', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// capability-coverage (AXP A.8.7) — the SECOND judgment armed by the SAME
+// interfaces.testSuite key: over the one published-suite run, every capability
+// the card declares must be covered by at least one PASSING row/test.
+// ---------------------------------------------------------------------------
+
+describe('capability-coverage (A.8.7) — one declaration, two judged facets', () => {
+  const cov = (checks: CheckResult[]) => checks.find((c) => c.id === 'capability-coverage')!
+
+  /** The good target's whole A.8.7.1 domain: three contract operations
+   *  (no operationIds ⇒ method-path identifiers) plus the declared MCP tool.
+   *  The interfaces.http entries resolve to contract operations and add no
+   *  identifiers of their own. */
+  const DOMAIN = ['mcp:list_widgets', 'openapi:GET /api/status', 'openapi:GET /api/widgets', 'openapi:GET /api/widgets/{id}']
+
+  /** A suite + explicit A.8.7.2 coverage map reaching the whole domain. */
+  const coveringSuite = () =>
+    validSuite({
+      requirements: [
+        ...(validSuite().requirements as unknown[]),
+        { id: 'widget-by-id', kind: 'endpoint', method: 'GET', path: '/api/widgets/w1', expect: { status: 200 } },
+      ],
+      coverage: {
+        'openapi:GET /api/status': ['status-ok'],
+        'openapi:GET /api/widgets': ['widgets-list'],
+        'openapi:GET /api/widgets/{id}': ['widget-by-id'],
+        'mcp:list_widgets': ['status-ok'],
+      },
+    })
+  const widgetRoute: Routes = {
+    'GET /api/widgets/w1': () => ({ status: 200, contentType: 'application/json', body: '{"id":"w1"}' }),
+  }
+
+  it('UNDECLARED: skips — nothing is claimed, so nothing is judged', async () => {
+    const { checks } = await judge(routesFor({ declaration: OMIT }))
+    const c = cov(checks)
+    expect(c.verdict).toBe('skip')
+    expect(c.detail).toContain('interfaces.testSuite` absent')
+    expect(c.detail).toContain('fails closed')
+  })
+
+  it('DECLARED with a coverage map reaching the whole domain: a REAL judged pass, over the one run', async () => {
+    const { checks } = await judge(routesFor({ suite: coveringSuite(), extraRoutes: widgetRoute }))
+    expect(ts(checks).verdict).toBe('pass')
+    const c = cov(checks)
+    expect(c.verdict, c.detail).toBe('pass')
+    expect(c.detail).toContain(`${DOMAIN.length}/${DOMAIN.length} declared capabilities covered`)
+    expect(c.detail).toContain('one run, two judgments')
+    expect(c.detail).toContain('NOT judged: rigour')
+  })
+
+  it('DECLARED but the suite reaches only part of the domain: FAILS naming every uncovered identifier', async () => {
+    // validSuite alone: no coverage member, no tags ⇒ nothing is covered.
+    const { checks } = await judge(routesFor())
+    expect(ts(checks).verdict).toBe('pass') // the suite is KEPT —
+    const c = cov(checks) //                    — but it does not REACH the card.
+    expect(c.verdict).toBe('fail')
+    for (const id of DOMAIN) expect(c.detail).toContain(`"${id}" is not covered`)
+    expect(c.detail).toContain('declared-but-untested is inadmissible')
+  })
+
+  it('a coverage key naming an UNDECLARED capability fails (presence-when-true applies to coverage claims)', async () => {
+    const suite = validSuite({
+      coverage: {
+        'openapi:GET /api/status': ['status-ok'],
+        'openapi:deleteEverything': ['status-ok'],
+      },
+    })
+    const { checks } = await judge(routesFor({ suite }))
+    const c = cov(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('coverage key "openapi:deleteEverything" names no declared capability')
+  })
+
+  it('a DANGLING test reference fails — a claim about a row this run never had', async () => {
+    const suite = validSuite({
+      coverage: { 'openapi:GET /api/status': ['no-such-row'] },
+    })
+    const { checks } = await judge(routesFor({ suite }))
+    const c = cov(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('references "no-such-row", which names no row and no registered test')
+  })
+
+  it('a run that did not complete honestly fails by the NAMED reason suite-run-failed (A.8.7.3)', async () => {
+    const { checks } = await judge(routesFor({ suite: coveringSuite(), digest: `sha256:${'0'.repeat(64)}`, extraRoutes: widgetRoute }))
+    expect(ts(checks).verdict).toBe('fail')
+    const c = cov(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('suite-run-failed')
+  })
+
+  it('a FAILING bound row covers nothing — declared-and-tested-but-failing is the uncovered case too', async () => {
+    // widget-by-id 404s (no route), so openapi:GET /api/widgets/{id} has a
+    // bound row that did not pass; published-test-suite fails the run-level
+    // violation and coverage independently names the uncovered identifier.
+    const { checks } = await judge(routesFor({ suite: coveringSuite() }))
+    const c = cov(checks)
+    expect(c.verdict).toBe('fail')
+    expect(c.detail).toContain('"openapi:GET /api/widgets/{id}" is not covered')
+  })
+
+  it('moves no AX point and is judged over the SAME single fetch of the artifact (no second fetch)', async () => {
+    const { checks, calls } = await judge(routesFor({ suite: coveringSuite(), extraRoutes: widgetRoute }))
+    expect(cov(checks).axItem).toBeUndefined()
+    expect(calls.filter((u) => u.includes(SUITE_PATH)).length).toBe(1)
+  })
+})

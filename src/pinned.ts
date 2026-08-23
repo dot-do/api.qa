@@ -117,16 +117,23 @@ export interface VerifyPinnedOpts extends ObserverOpts {
 }
 
 /**
- * THE RATIFIED ADMISSION CONTRACT — `apis-ax-axp@2.4.0`.
+ * THE RATIFIED ADMISSION CONTRACT — `apis-ax-axp@2.6.0`.
  *
- * The coordinated 2.3.0 → 2.4.0 bump (AXP 0.7.0, 2026-08-08): 22 → 23
- * requirements, retiring digest 9063cb3e… . The ONE added row is
- * `check-published-test-suite` (kind: check, must: pass,
- * appliesWhen: { cardDeclares: "interfaces.testSuite" }) — declaration-armed,
- * so a card that omits the interface gains one not-applicable result and no
- * new way to fail, and a card that declares a suite and does not keep it
- * loses admission. The same release ratifies the executable dialect
- * `api.qa/vitest@1` (Appendix A.8.6) this verifier implements in src/exec/.
+ * The coordinated 2.5.0 → 2.6.0 bump (AXP 0.9.0, 2026-08-23): the FIRST
+ * ratification that moves the digest without moving a requirement row — the
+ * admission set holds at 24 (retiring digest e4d10d4f…), because what was
+ * ratified is check semantics this verifier implements: the `offers-402`
+ * VACUOUS-SATISFACTION rule (Clause 5 / A.5). A surface whose OBSERVED
+ * Pricing Document declares "model": "free" and whose card declares no
+ * purchasable surface (no monetization.offers, no monetization.probe)
+ * passes the check vacuously — no 402 boundary exists to prove — while an
+ * undetermined model fails closed and every declared monetization member is
+ * judged strictly; the metered half is unweakened. 2.5.0 (AXP 0.8.0) had
+ * added the 24th row, `check-capability-coverage` (declaration-armed on
+ * interfaces.testSuite — the SAME key as `check-published-test-suite`: one
+ * declaration, two judged facets), which this verifier implements in
+ * checks.ts (`capability-coverage`) with its registry row in
+ * optional-interfaces.ts.
  *
  * The digest is sha256 over the exact bytes of the spec's
  * `apis-ax-standard.spec.json` (axp.org.ai `spec/conformance/`), and it is
@@ -135,8 +142,8 @@ export interface VerifyPinnedOpts extends ObserverOpts {
  */
 export const AXP_PINNED_SPEC = {
   name: 'apis-ax-axp',
-  version: '2.4.0',
-  digest: 'dd3e59417e2acacd0946e14c845c2e156a437ef55724ff06a52c053885e321bf',
+  version: '2.6.0',
+  digest: 'a9a1197c439d708b4db54f606f07c9a2d019c7f2989fbcd9b599de2fcc028e0d',
 } as const
 
 export function parsePinnedSpec(text: string): PinnedSpec {
