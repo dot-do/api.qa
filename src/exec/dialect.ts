@@ -522,9 +522,36 @@ let localRunCounter = 0
  * form — the subset names are installed as globals (A.8.6.2); everything is
  * restored in a finally.
  */
+/**
+ * The platform's fetch, captured ONCE at module load — before any run swaps
+ * `globalThis.fetch` for a gated fetch and before any host (the CLI, an
+ * observer) installs a wrapper that itself delegates to `globalThis.fetch`.
+ * Resolving the ambient fetch at run start instead can pick up such a
+ * wrapper and recurse gate → wrapper → gate until the stack blows.
+ */
+const PLATFORM_FETCH: ((url: string, init?: RequestInit) => Promise<Response>) | undefined =
+  typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined
+
+/**
+ * Runs are SERIALIZED: the local runner swaps process-wide state
+ * (`globalThis.fetch`, `Math.random`, the document-form globals) for the
+ * duration of a run, so two overlapping runs would see each other's harness
+ * (one registers into the other's globals; the first to finish deletes the
+ * globals the second is still importing against). A.8.6.4 wants sequential
+ * execution anyway; the queue makes it a property of the runner.
+ */
+let runQueue: Promise<unknown> = Promise.resolve()
+
 export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit) => Promise<Response> } = {}): ExecSuiteRunner {
   return {
-    async run(req: ExecRunRequest, io: ExecRunIo = {}): Promise<ExecRunOutcome> {
+    run(req: ExecRunRequest, io: ExecRunIo = {}): Promise<ExecRunOutcome> {
+      const turn = runQueue.then(() => runExclusive(req, io))
+      runQueue = turn.catch(() => undefined)
+      return turn
+    },
+  }
+
+  async function runExclusive(req: ExecRunRequest, io: ExecRunIo): Promise<ExecRunOutcome> {
       const wallMs = req.limits?.wallMs ?? EXEC_WALL_MS
       const cpuMs = req.limits?.cpuMs ?? EXEC_CPU_MS
       const appliedLimits = { wallMs, cpuMs }
@@ -551,9 +578,9 @@ export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit
       // the gated fetch itself once the swap lands — every egress recursing
       // gate→global→gate until the stack blows. The CLI verb (which injects
       // no io.fetch) rides this default.
-      const ambientFetch = fetch.bind(globalThis) as (url: string, init?: RequestInit) => Promise<Response>
+      const platformFetch = PLATFORM_FETCH ?? (fetch.bind(globalThis) as (url: string, init?: RequestInit) => Promise<Response>)
       const gatedFetch = createGatedFetch({
-        realFetch: io.fetch ?? opts.fetch ?? ambientFetch,
+        realFetch: io.fetch ?? opts.fetch ?? platformFetch,
         sandbox: req.sandbox,
         violations,
       })
@@ -655,6 +682,5 @@ export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit
         }
         delete registry()[runId]
       }
-    },
   }
 }
