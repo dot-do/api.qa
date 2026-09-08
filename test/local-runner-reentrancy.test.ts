@@ -66,3 +66,14 @@ describe('localExecRunner reentrancy', () => {
     })
   })
 })
+
+describe('Observer default transport as the gate\'s real fetch (the discovery wiring)', () => {
+  it('does not recurse when the run swaps globalThis.fetch', async () => {
+    const { Observer } = await import('../src/http.js')
+    const observer = new Observer({ delayMs: 0 })
+    const out = await localExecRunner().run({ ...req(11), origin: 'https://unreachable.invalid' }, { fetch: observer.transportFetcher })
+    expect(out.status).toBe('ran')
+    if (out.status !== 'ran') return
+    for (const r of out.results) expect(String(r.reason ?? '')).not.toMatch(/call stack/i)
+  })
+})

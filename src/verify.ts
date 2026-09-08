@@ -36,7 +36,7 @@ import type { VerificationReport } from './types.js'
 // non-declaring target. That is the correct direction of failure — loud, never
 // a silent pass — but it is an outage, and it is why a spec must not pin a
 // declaration-armed requirement until 0.3.0 is deployed.
-export const VERIFIER_VERSION = '0.4.3'
+export const VERIFIER_VERSION = '0.4.4'
 
 export interface VerifyTargetOpts extends ObserverOpts {
   /**

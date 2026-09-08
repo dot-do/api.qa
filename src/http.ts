@@ -9,6 +9,17 @@
 import type { Evidence } from './types.js'
 
 /** fetch-compatible seam. Tests and self-verification inject their own. */
+/**
+ * The platform's fetch, bound ONCE at module load. The default transport must
+ * never resolve `globalThis.fetch` lazily: the executable-suite runner swaps
+ * the global for its gated fetch during a run and hands THIS transport to the
+ * gate as its real fetch (discovery → `observer.transportFetcher`) — a lazy
+ * lookup would recurse gate → transport → gate until the stack blew (seen as
+ * "Maximum call stack size exceeded" on every suite test from the CLI).
+ */
+const PLATFORM_FETCH: Fetcher = (url, init) => platformFetch(url, init)
+const platformFetch: typeof globalThis.fetch = globalThis.fetch.bind(globalThis)
+
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>
 
 /**
@@ -63,7 +74,7 @@ export class Observer {
 
   constructor(opts: ObserverOpts = {}) {
     this.opts = {
-      fetcher: opts.fetcher ?? ((url, init) => fetch(url, init)),
+      fetcher: opts.fetcher ?? PLATFORM_FETCH,
       // 32 (was 24): the AXP Clause 3 conneg plan added up to 7 fixed probes
       // (3 root client-class profiles, ≤3 Link-advertised face addresses, the
       // card-declared pricing document). The bump preserves the starvation-fix
