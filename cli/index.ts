@@ -208,6 +208,8 @@ async function main(): Promise<number> {
       seed,
       expectedDigest: flags.get('expect-digest'),
       delayMs: isLocalTarget(target) ? 0 : 150,
+      // A card-declared executable suite runs here too (never runner-unavailable from the CLI).
+      execRunner: localExecRunner(),
     })
     return emit(report, pinnedMarkdown(report), flags)
   }
@@ -462,7 +464,7 @@ async function main(): Promise<number> {
     } else {
       target = await loadHandler(entry)
     }
-    const gradeOpts = { seed, delayMs: 0, allowPrivate }
+    const gradeOpts = { seed, delayMs: 0, allowPrivate, execRunner: localExecRunner() }
     if (specFile) {
       const specText = readFileSync(specFile, 'utf8')
       const report = await gradePinned(target, specText, {
@@ -529,7 +531,12 @@ async function main(): Promise<number> {
       'only grade F exits non-zero. Do NOT gate CI on this command. ' +
       'CI gates must use `verify` / `suite` / `suite --iteration-data` (see docs/ci.md).',
   )
-  const report = await verifyTarget(target, { mode: 'local', seed, delayMs: isLocalTarget(target) ? 0 : 150 })
+  const report = await verifyTarget(target, {
+    mode: 'local',
+    seed,
+    delayMs: isLocalTarget(target) ? 0 : 150,
+    execRunner: localExecRunner(),
+  })
   return emit(report, reportMarkdown(report), flags)
 }
 
