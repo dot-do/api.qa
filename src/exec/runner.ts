@@ -327,6 +327,7 @@ export interface OutboundGatewayLike {
 export function entrySource(req: ExecRunRequest): string {
   const hasModule = req.artifactKind === 'document' && typeof req.moduleSource === 'string'
   return `import { createHarness, seededRandom, SUBSET_GLOBALS } from './harness.mjs'
+import * as SHIM from 'vitest'
 
 const SEED = ${JSON.stringify(req.seed)}
 const SANDBOX = ${JSON.stringify(req.sandbox)}
@@ -412,9 +413,15 @@ export default {
       }
     }
     try {
-      if (DOCUMENT) for (const n of SUBSET_GLOBALS) globalThis[n] = harness.api[n]
+      // Globals go through the shim (call-time delegation to THIS run's
+      // harness + top-level recording), never the harness api directly: a
+      // warm isolate re-uses the evaluated suite module, so registrations
+      // must be replayable.
+      if (DOCUMENT) for (const n of SUBSET_GLOBALS) globalThis[n] = SHIM[n]
+      const warm = SHIM.__beginRun()
       if (HAS_MODULE) await import('./suite-module-impl.mjs')
       const ns = await import('./suite-tests.mjs')
+      if (warm) SHIM.__replay()
       if (EXPORT_NAME !== null) {
         const fn = ns[EXPORT_NAME]
         if (typeof fn !== 'function') throw new Error('the card names export "' + EXPORT_NAME + '", but the pinned module has no such function export')

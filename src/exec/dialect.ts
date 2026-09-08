@@ -351,7 +351,8 @@ function registry(): Record<string, RunRegistryEntry> {
 
 /** `data:` module URL for a source (utf-8, no base64 — unicode-safe). */
 function dataModuleUrl(source: string): string {
-  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
+  // encodeURIComponent leaves quotes unescaped; these URLs are embedded inside quoted import specifiers.
+  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source).replace(/'/g, '%27').replace(/"/g, '%22')}`
 }
 
 /** Rewrite the closed specifiers to concrete module URLs (local path). */
@@ -371,10 +372,41 @@ const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
  * `data:` module graph and the hosted isolate's module map.
  */
 export function vitestShimSource(runId: string): string {
+  // Every export resolves the CURRENT run's harness at call time, and
+  // top-level registrations are recorded so a warm isolate can replay them:
+  // an ES module evaluates once per isolate, so on a second run of the same
+  // bytes `import('./suite-tests.mjs')` re-registers nothing — the harness is
+  // new, the suite's describe/it calls are not. `__replay()` (the entry calls
+  // it on a warm run) re-issues exactly the top-level calls of the first
+  // evaluation; nested registrations re-happen inside the replayed describe
+  // bodies and are not recorded again (depth > 0).
   return (
-    `const h = globalThis[${JSON.stringify(RUN_REGISTRY_KEY)}][${JSON.stringify(runId)}].api\n` +
-    `export const describe = h.describe\nexport const it = h.it\nexport const test = h.test\n` +
-    `export const expect = h.expect\nexport const vi = h.vi\nexport default h\n`
+    // Resolved at CALL time: the entry replaces the registry object per run.
+    `const cur = () => globalThis[${JSON.stringify(RUN_REGISTRY_KEY)}][${JSON.stringify(runId)}].api\n` +
+    `const recorded = []\n` +
+    `let depth = 0\n` +
+    `let served = 0\n` +
+    // The warmth signal lives in THIS module instance (one per module graph =
+    // one per isolate), never on globalThis, which a test host shares.
+    `export const __beginRun = () => served++ > 0\n` +
+    `const wrap = (name, nests) => (...args) => {\n` +
+    `  if (depth === 0) recorded.push([name, args])\n` +
+    `  if (!nests) return cur()[name](...args)\n` +
+    `  depth += 1\n` +
+    `  try { return cur()[name](...args) } finally { depth -= 1 }\n` +
+    `}\n` +
+    `export const describe = wrap('describe', true)\n` +
+    `export const it = wrap('it', false)\n` +
+    `export const test = wrap('test', false)\n` +
+    `export const expect = (...args) => cur().expect(...args)\n` +
+    `export const vi = new Proxy({}, { get: (_t, prop) => cur().vi[prop] })\n` +
+    `export const __replay = () => {\n` +
+    `  for (const [name, args] of recorded.slice()) {\n` +
+    `    depth += 1\n` +
+    `    try { cur()[name](...args) } finally { depth -= 1 }\n` +
+    `  }\n` +
+    `}\n` +
+    `export default { describe, it, test, expect, vi }\n`
   )
 }
 
