@@ -90,6 +90,51 @@ full recipe (GitHub + GitLab) in [docs/ci.md](./docs/ci.md).
 > exits `0` for any grade A–D (only grade `F` is non-zero), so it must never be
 > the exit code a pipeline gates on — see [docs/ci.md](./docs/ci.md#the-one-property-that-matters-exit-codes).
 
+## Vitest — Node projects and the Cloudflare Workers pool
+
+Two entry points run the same digest-pinned gate in-process against a Worker
+handler (probes dispatched in memory, no socket) or a dev URL:
+
+- `autonomous-qa/assert` — plain async functions, **no vitest import**:
+  `await assertConforms(worker, spec, { expectedDigest })` throws with the
+  per-requirement detail on failure. Loads anywhere the core loads, including
+  inside workerd.
+- `autonomous-qa/vitest` — the `toConform` / `toGradeAtLeast` matchers plus
+  `describeConformance(...)`, which expands every pinned requirement into its
+  own `it` case (one grading pass in `beforeAll`, digest checked before any
+  probe fires).
+
+```ts
+import { describeConformance } from 'autonomous-qa/vitest'
+import worker from '../src/worker'
+import spec from '../spec/apis-ax-axp-2.6.0.spec.json?raw'
+
+describeConformance({ target: worker, spec, expectedDigest: '<pin>' })
+```
+
+**Inside `@cloudflare/vitest-pool-workers`** test files run in workerd and
+node_modules are externalized, so a package that imports `expect` from
+`'vitest'` at load time cannot link there. `autonomous-qa/vitest` therefore
+has no such import: it takes the vitest API from an explicit argument or from
+`test.globals: true`. In a Workers-pool project either enable globals, or pass
+the API:
+
+```ts
+import { describe, it, beforeAll, expect } from 'vitest'
+import { SELF } from 'cloudflare:test'
+import { describeConformance, registerConformanceMatchers } from 'autonomous-qa/vitest'
+
+registerConformanceMatchers(expect)   // enables await expect(target).toConform(spec)
+describeConformance(
+  { target: { fetch: (req) => SELF.fetch(req) }, spec, expectedDigest: '<pin>', baseOrigin: 'https://your.host' },
+  { describe, it, beforeAll, expect },
+)
+```
+
+In a plain Node vitest project `import 'autonomous-qa/vitest'` still registers
+the matchers on load (a lazy `import('vitest')` that is caught where it cannot
+resolve). `assertConforms` needs none of this.
+
 ## Development
 
 ```sh
