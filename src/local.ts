@@ -27,6 +27,8 @@
  * entirely unaffected — a remote target string can never flip the allowance on.
  */
 
+import { localExecRunner, type ExecSuiteRunner } from './exec/dialect.js'
+import { unavailableExecRunner } from './exec/runner.js'
 import { verifyTarget, type VerifyTargetOpts } from './verify.js'
 import { verifyPinnedSpec, type PinnedReport, type VerifyPinnedOpts } from './pinned.js'
 import type { Fetcher } from './http.js'
@@ -75,6 +77,16 @@ export interface GradeOpts {
    * for handler targets — they dispatch in-memory and never touch the network.
    */
   allowPrivate?: boolean
+  /**
+   * Runner for a card-declared executable suite (`interfaces.testSuite`,
+   * runner `api.qa/vitest@1`). Default: in Node, `localExecRunner` with the
+   * target's own fetch (in-memory for handler targets); anywhere `data:`
+   * module imports cannot resolve (workerd — the Cloudflare Vitest pool),
+   * `unavailableExecRunner`, so a declared suite is judged
+   * `runner-unavailable` by name instead of silently passing. Pass
+   * `workerLoaderExecRunner(env.SUITE_LOADER, { outbound })` there.
+   */
+  execRunner?: ExecSuiteRunner
 }
 
 export interface GradePinnedOpts extends GradeOpts {
@@ -156,6 +168,20 @@ interface ResolvedTarget {
  * A remote URL string with no opt-in therefore keeps the private-host block,
  * exactly as the deployed grader does.
  */
+/** True inside workerd (Cloudflare Workers / the Vitest Workers pool), where `data:` module imports do not resolve. */
+const inWorkerd = (): boolean =>
+  typeof navigator !== 'undefined' && (navigator as { userAgent?: string }).userAgent === 'Cloudflare-Workers'
+
+/** The runner a local grade uses when none is given: see GradeOpts.execRunner. */
+export function defaultExecRunner(fetch?: (url: string, init?: RequestInit) => Promise<Response>): ExecSuiteRunner {
+  if (inWorkerd()) return unavailableExecRunner(RUNNER_UNAVAILABLE_WORKERD)
+  return localExecRunner(fetch ? { fetch } : {})
+}
+
+export const RUNNER_UNAVAILABLE_WORKERD =
+  'runner-unavailable: no exec runner in workerd — the local runner loads the harness via data: imports, which workerd cannot resolve; ' +
+  'pass execRunner: workerLoaderExecRunner(env.SUITE_LOADER, { outbound: createOutboundGateway(fetch) })'
+
 function resolveTarget(target: GradeTarget, opts: GradeOpts): ResolvedTarget {
   const base: VerifyTargetOpts = {
     mode: 'local',
@@ -176,6 +202,7 @@ function resolveTarget(target: GradeTarget, opts: GradeOpts): ResolvedTarget {
         ...base,
         allowPrivateTargets: allowPrivate,
         delayMs: opts.delayMs ?? (allowPrivate ? 0 : 150),
+        execRunner: opts.execRunner ?? defaultExecRunner(),
       },
     }
   }
@@ -187,6 +214,7 @@ function resolveTarget(target: GradeTarget, opts: GradeOpts): ResolvedTarget {
     )
   }
   const origin = normalizeBaseOrigin(opts.baseOrigin)
+  const fetcher = handlerToFetcher(fetchFn, opts.env, opts.ctx)
   return {
     url: origin,
     observerOpts: {
@@ -194,8 +222,10 @@ function resolveTarget(target: GradeTarget, opts: GradeOpts): ResolvedTarget {
       // In-memory dispatch to a public-looking synthetic origin: no allowance
       // needed, and none granted. The SSRF backstop is fully intact.
       allowPrivateTargets: false,
-      fetcher: handlerToFetcher(fetchFn, opts.env, opts.ctx),
+      fetcher,
       delayMs: opts.delayMs ?? 0,
+      // A declared suite's egress to the target rides the same in-memory fetcher.
+      execRunner: opts.execRunner ?? defaultExecRunner((url, init) => fetcher(url, init)),
     },
   }
 }

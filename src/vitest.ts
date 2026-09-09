@@ -1,6 +1,6 @@
 /**
- * The vitest matcher — run api.qa's conformance gate INSIDE a vitest suite,
- * in-process, against a Worker-style handler or a URL:
+ * The vitest integration — run api.qa's conformance gate INSIDE a vitest
+ * suite, in-process, against a Worker-style handler or a URL.
  *
  *   import 'autonomous-qa/vitest'            // registers the matchers (side-effect)
  *   import worker from '../src/worker.js'
@@ -9,99 +9,72 @@
  *   it('conforms to the pinned contract', async () => {
  *     await expect(worker).toConform(spec)   // gradePinned() must pass
  *   })
- *   it('grades at least B', async () => {
- *     await expect(worker).toGradeAtLeast('B')
- *   })
  *
- * ⚠️  BOTH MATCHERS ARE ASYNC — YOU MUST `await` THE ASSERTION. ⚠️
+ * Or expand every pinned requirement into its own test case:
  *
- *   await expect(worker).toConform(spec)        // correct
- *   await expect(worker).toGradeAtLeast('B')    // correct
- *   expect(worker).toConform(spec)              // WRONG — silently ignored!
+ *   describeConformance({ target: worker, spec, expectedDigest })
  *
- * `expect(...).toConform(...)` / `.toGradeAtLeast(...)` each return a Promise.
- * If the test function does not `await` (or `return`) that promise, vitest
- * moves on immediately: the test is recorded as PASSED before the grading
- * even finishes, and a LATER rejection (the assertion actually failing) can
- * surface only as an unhandled-rejection warning — attributed to nothing, or
- * to the wrong test, and easy to miss in CI output. A forgotten `await` is
- * therefore a SILENT FALSE-GREEN: a real conformance failure reports as a
- * passing test. There is no way for the matcher itself to detect a missing
- * `await` (a synchronous matcher can throw immediately; an async one cannot
- * force the caller to wait on it) — the safe pattern is on YOU: always
- * `await` (or `return`) the `expect(...)` call, and prefer the `assertConforms`
- * / `assertGradeAtLeast` helpers below when you want a shape that makes a
- * missing `await` obvious (they return `Promise<void>` and are useless
- * un-awaited, rather than a fluent `expect(...)` chain that reads fine either
- * way).
+ * ⚠️  THE MATCHERS ARE ASYNC — ALWAYS `await` THE ASSERTION. ⚠️  An un-awaited
+ * `expect(worker).toConform(spec)` is a silent false-green: vitest records the
+ * test as passed before grading finishes. Prefer `assertConforms` (from
+ * `autonomous-qa/assert`, re-exported here) when you want the missing-`await`
+ * footgun to be visible: it resolves to void and is useless un-awaited.
  *
- * They dispatch every probe to the handler IN MEMORY (no socket), so the gate
- * the deployed api.qa runs against your PUBLIC origin also runs against your
- * worker pre-deploy.
+ * ## Where this module loads
+ *
+ * This module has NO top-level import of 'vitest'. That is deliberate:
+ * @cloudflare/vitest-pool-workers runs test files inside workerd and
+ * externalizes node_modules, so a package that does
+ * `import { expect } from 'vitest'` fails to link there
+ * ("The requested module 'vitest' does not provide an export named 'expect'").
+ * The matchers and `describeConformance` instead take the vitest API from,
+ * in order:
+ *   1. an explicit argument — `registerConformanceMatchers(expect)`,
+ *      `describeConformance(opts, { describe, it, expect, beforeAll })`;
+ *   2. vitest globals (`test.globals: true`) on `globalThis`;
+ *   3. for matcher registration only, a lazy `import('vitest')` at module
+ *      load — works in Node, is caught and ignored where it cannot resolve.
+ *
+ * So `import 'autonomous-qa/vitest'` keeps registering the matchers in a Node
+ * vitest project, and in the Workers pool you either enable globals or pass
+ * the API explicitly. `assertConforms` needs none of this.
  *
  * SSRF: these matchers grade a handler in-memory (`allowPrivate` stays false) or
  * a URL you explicitly pass with `{ allowPrivate: true }` for a local dev
  * server. A remote URL target is graded exactly as the deployed grader would —
  * private/metadata hosts stay blocked. See src/local.ts.
  */
-
-import { expect } from 'vitest'
-import { grade, gradePinned, type GradeTarget, type GradeOpts, type GradePinnedOpts } from './local.js'
-import { gradeRank } from './grade.js'
+import type { ExpectStatic } from 'vitest'
+import type { GradeTarget, GradeOpts, GradePinnedOpts } from './local.js'
+import { gradePinned } from './local.js'
+import { parsePinnedSpec } from './pinned.js'
 import type { Grade } from './types.js'
+import {
+  conformance,
+  gradeAtLeast,
+  specDigest,
+  specText,
+  type ConformSpec,
+  type ConformanceOutcome,
+} from './assert.js'
 
-/** A spec argument: the pinned-spec TEXT, or `{ spec, expectedDigest }`. */
-export type ConformSpec = string | { spec: string; expectedDigest?: string }
+export { assertConforms, assertGradeAtLeast, conformance, gradeAtLeast } from './assert.js'
+export type { ConformSpec, ConformanceOutcome } from './assert.js'
 
 interface MatcherResult {
   pass: boolean
   message: () => string
 }
 
-function specText(spec: ConformSpec): string {
-  return typeof spec === 'string' ? spec : spec.spec
-}
+const asMatcher = (o: ConformanceOutcome): MatcherResult => ({ pass: o.pass, message: o.message })
 
-function specDigest(spec: ConformSpec): string | undefined {
-  return typeof spec === 'string' ? undefined : spec.expectedDigest
-}
-
-/**
- * `expect(target).toConform(spec?)`.
- *   - WITH a pinned spec → gradePinned(); passes iff every requirement passed.
- *   - WITHOUT a spec     → grade(); passes iff no check actively FAILED (the
- *     surface never lies/violates). Use `toGradeAtLeast` for a threshold.
- */
+/** `expect(target).toConform(spec?)` — see `conformance()` for the rule. */
 async function toConform(
   received: GradeTarget,
   spec?: ConformSpec,
   opts: GradePinnedOpts = {},
 ): Promise<MatcherResult> {
-  if (spec !== undefined) {
-    const report = await gradePinned(received, specText(spec), {
-      ...opts,
-      expectedDigest: specDigest(spec) ?? opts.expectedDigest,
-    })
-    const failed = report.requirements.filter((r) => r.verdict === 'fail')
-    return {
-      pass: report.passed,
-      message: () =>
-        report.passed
-          ? `expected target NOT to conform to pinned spec "${report.spec.name}@${report.spec.version}", but it did`
-          : `expected target to conform to pinned spec "${report.spec.name}@${report.spec.version}", but ${failed.length} requirement(s) failed:\n` +
-            failed.map((r) => `  ✗ ${r.id}: ${r.detail}`).join('\n'),
-    }
-  }
-  const report = await grade(received, opts)
-  const failed = report.checks.filter((c) => c.verdict === 'fail')
-  return {
-    pass: failed.length === 0,
-    message: () =>
-      failed.length === 0
-        ? `expected target NOT to conform, but no check failed (grade ${report.grade}, ${report.axScore.points}/${report.axScore.max})`
-        : `expected target to conform, but ${failed.length} check(s) failed (grade ${report.grade}):\n` +
-          failed.map((c) => `  ✗ ${c.id}: ${c.detail}`).join('\n'),
-  }
+  return asMatcher(await conformance(received, spec, opts))
 }
 
 /** `expect(target).toGradeAtLeast('B')` — passes iff grade >= the given grade. */
@@ -110,58 +83,151 @@ async function toGradeAtLeast(
   minimum: Grade,
   opts: GradeOpts = {},
 ): Promise<MatcherResult> {
-  const report = await grade(received, opts)
-  const got = gradeRank(report.grade)
-  const want = gradeRank(minimum)
-  const pass = got >= want
-  return {
-    pass,
-    message: () =>
-      pass
-        ? `expected target NOT to grade at least ${minimum}, but it graded ${report.grade} (${report.axScore.points}/${report.axScore.max})`
-        : `expected target to grade at least ${minimum}, but it graded ${report.grade} (${report.axScore.points}/${report.axScore.max})`,
+  return asMatcher(await gradeAtLeast(received, minimum, opts))
+}
+
+/** The matcher implementations, for hosts that register them themselves. */
+export const conformanceMatchers = { toConform, toGradeAtLeast }
+
+type ExpectLike = Pick<ExpectStatic, 'extend'>
+
+const REGISTERED = Symbol.for('autonomous-qa.matchers')
+
+const globalExpect = (): ExpectLike | undefined => {
+  const e = (globalThis as { expect?: unknown }).expect
+  return e && typeof (e as ExpectLike).extend === 'function' ? (e as ExpectLike) : undefined
+}
+
+/**
+ * Register `toConform` / `toGradeAtLeast` on a vitest `expect`. Idempotent.
+ * Pass `expect` explicitly inside the Cloudflare Workers pool (or enable
+ * `test.globals`); in Node the module-load side effect below already did it.
+ * Returns true when registration happened (now or earlier), false when no
+ * `expect` was available.
+ */
+export function registerConformanceMatchers(expect?: ExpectLike): boolean {
+  const target = expect ?? globalExpect()
+  if (!target) return false
+  const marked = target as ExpectLike & { [REGISTERED]?: true }
+  if (marked[REGISTERED]) return true
+  target.extend(conformanceMatchers)
+  marked[REGISTERED] = true
+  return true
+}
+
+/**
+ * Resolves once the module-load registration attempt has settled. Await it in
+ * a `beforeAll` if a test could conceivably run before the lazy import lands
+ * (in practice vitest collects every file before running any test).
+ */
+export const matchersReady: Promise<boolean> = (async () => {
+  if (registerConformanceMatchers()) return true
+  try {
+    // Dynamic so the specifier is never linked at module load: in Node vitest
+    // this resolves the running vitest; in workerd it rejects and we fall
+    // through to explicit registration or globals.
+    const mod = (await import('vitest')) as { expect?: ExpectLike }
+    return registerConformanceMatchers(mod.expect)
+  } catch {
+    return false
   }
+})()
+
+// --- describeConformance -----------------------------------------------------
+
+/** The slice of the vitest API `describeConformance` needs. */
+export interface VitestApi {
+  describe: (name: string, fn: () => void) => unknown
+  it: (name: string, fn: () => unknown | Promise<unknown>, timeout?: number) => unknown
+  beforeAll: (fn: () => unknown | Promise<unknown>, timeout?: number) => unknown
+  expect: ExpectLike & ((actual: unknown) => { toBe(expected: unknown): unknown })
+}
+
+export interface DescribeConformanceOpts extends GradePinnedOpts {
+  /** A Worker module / handler (graded in memory) or a URL (with `allowPrivate` for dev). */
+  target: GradeTarget
+  /** Pinned-spec text, or `{ spec, expectedDigest }`. */
+  spec: ConformSpec
+  /** Suite title. Default: `AXP conformance — <name>@<version>`. */
+  name?: string
+  /** Timeout for the single grading pass, ms. Default 60_000. */
+  timeout?: number
+}
+
+const globalApi = (): VitestApi | undefined => {
+  const g = globalThis as Partial<VitestApi>
+  return g.describe && g.it && g.beforeAll && g.expect
+    ? ({ describe: g.describe, it: g.it, beforeAll: g.beforeAll, expect: g.expect } as VitestApi)
+    : undefined
 }
 
 /**
- * `await assertConforms(target, spec?, opts?)` — an AWAIT-ONLY alternative to
- * `expect(target).toConform(spec)` for callers who want the missing-`await`
- * footgun documented above to be as hard as possible to trip over: this is a
- * plain async function that resolves to `void` and THROWS on a failing
- * conformance check (same failure detail as the matcher's message). It has no
- * other use un-awaited — there is no fluent chain to read past, no `pass`
- * value to accidentally ignore — so a reviewer (or the "floating promise"
- * lint many projects already run) has an obvious, single thing to check:
- * is this call awaited.
+ * Expand every requirement of a pinned spec into its own vitest case:
  *
- *   await assertConforms(worker, spec)   // throws with a detailed message on failure
+ *   describeConformance({ target: worker, spec, expectedDigest })
  *
- * Runs the exact same gate as `toConform` (in fact, delegates to it).
+ * One grading pass runs in `beforeAll` (the digest is checked BEFORE any probe
+ * fires — a drifted spec fails the whole block); then one `it` per pinned
+ * requirement reports pass / fail / not-applicable individually, plus a final
+ * `it` asserting the report as a whole passed. Requirement ids are stable
+ * across the digest pin, so a CI history reads per requirement.
+ *
+ * The vitest API comes from the explicit `api` argument, else from vitest
+ * globals; without either this throws immediately with the fix.
  */
-export async function assertConforms(
-  received: GradeTarget,
-  spec?: ConformSpec,
-  opts: GradePinnedOpts = {},
-): Promise<void> {
-  const result = await toConform(received, spec, opts)
-  if (!result.pass) throw new Error(result.message())
-}
+export function describeConformance(opts: DescribeConformanceOpts, api?: VitestApi): void {
+  const vt = api ?? globalApi()
+  if (!vt) {
+    throw new Error(
+      "describeConformance: no vitest API available — pass { describe, it, beforeAll, expect } from 'vitest' as the second argument, or enable test.globals",
+    )
+  }
+  const { target, spec, name, timeout = 60_000, ...gradeOpts } = opts
+  const text = specText(spec)
+  const pinned = parsePinnedSpec(text) // sync, so requirement ids are known at collection time
+  const expectedDigest = specDigest(spec) ?? gradeOpts.expectedDigest
+  const title = name ?? `AXP conformance — ${pinned.name}@${pinned.version}`
 
-/**
- * `await assertGradeAtLeast(target, minimum, opts?)` — the `assertConforms`
- * counterpart for the grade-threshold check. See `assertConforms` for why this
- * shape exists alongside `expect(target).toGradeAtLeast(minimum)`.
- */
-export async function assertGradeAtLeast(
-  received: GradeTarget,
-  minimum: Grade,
-  opts: GradeOpts = {},
-): Promise<void> {
-  const result = await toGradeAtLeast(received, minimum, opts)
-  if (!result.pass) throw new Error(result.message())
-}
+  vt.describe(title, () => {
+    let report: Awaited<ReturnType<typeof gradePinned>> | undefined
+    let failure: unknown
+    vt.beforeAll(async () => {
+      try {
+        report = await gradePinned(target, text, { ...gradeOpts, expectedDigest })
+      } catch (err) {
+        failure = err
+      }
+    }, timeout)
 
-expect.extend({ toConform, toGradeAtLeast })
+    const ready = () => {
+      if (failure) throw failure instanceof Error ? failure : new Error(String(failure))
+      if (!report) throw new Error('describeConformance: grading did not run')
+      return report
+    }
+
+    if (expectedDigest) {
+      vt.it(`spec digest is pinned at ${expectedDigest.slice(0, 12)}…`, () => {
+        vt.expect(ready().spec.digest).toBe(expectedDigest)
+      })
+    }
+
+    for (const req of pinned.requirements) {
+      const label = req.kind === 'check' ? `${req.id} (${req.check})` : req.kind === 'surface' ? `${req.id} (${req.surface})` : req.id
+      vt.it(label, () => {
+        const r = ready().requirements.find((x) => x.id === req.id)
+        if (!r) throw new Error(`requirement ${req.id} produced no verdict`)
+        if (r.verdict === 'fail') throw new Error(`${r.id}: ${r.detail}`)
+      })
+    }
+
+    vt.it('every pinned requirement passes', () => {
+      const r = ready()
+      const failed = r.requirements.filter((x) => x.verdict === 'fail').map((x) => `${x.id}: ${x.detail}`)
+      vt.expect(failed).toBe(failed.length === 0 ? failed : `no failures, got:\n${failed.join('\n')}`)
+      vt.expect(r.passed).toBe(true)
+    })
+  })
+}
 
 // --- TS augmentation so `.toConform` / `.toGradeAtLeast` type-check ----------
 interface ApiQaMatchers<R = unknown> {
@@ -175,5 +241,3 @@ declare module 'vitest' {
   interface AsymmetricMatchersContaining extends ApiQaMatchers {}
   /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-empty-object-type */
 }
-
-export {}

@@ -351,7 +351,8 @@ function registry(): Record<string, RunRegistryEntry> {
 
 /** `data:` module URL for a source (utf-8, no base64 — unicode-safe). */
 function dataModuleUrl(source: string): string {
-  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
+  // encodeURIComponent leaves quotes unescaped; these URLs are embedded inside quoted import specifiers.
+  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source).replace(/'/g, '%27').replace(/"/g, '%22')}`
 }
 
 /** Rewrite the closed specifiers to concrete module URLs (local path). */
@@ -371,10 +372,41 @@ const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
  * `data:` module graph and the hosted isolate's module map.
  */
 export function vitestShimSource(runId: string): string {
+  // Every export resolves the CURRENT run's harness at call time, and
+  // top-level registrations are recorded so a warm isolate can replay them:
+  // an ES module evaluates once per isolate, so on a second run of the same
+  // bytes `import('./suite-tests.mjs')` re-registers nothing — the harness is
+  // new, the suite's describe/it calls are not. `__replay()` (the entry calls
+  // it on a warm run) re-issues exactly the top-level calls of the first
+  // evaluation; nested registrations re-happen inside the replayed describe
+  // bodies and are not recorded again (depth > 0).
   return (
-    `const h = globalThis[${JSON.stringify(RUN_REGISTRY_KEY)}][${JSON.stringify(runId)}].api\n` +
-    `export const describe = h.describe\nexport const it = h.it\nexport const test = h.test\n` +
-    `export const expect = h.expect\nexport const vi = h.vi\nexport default h\n`
+    // Resolved at CALL time: the entry replaces the registry object per run.
+    `const cur = () => globalThis[${JSON.stringify(RUN_REGISTRY_KEY)}][${JSON.stringify(runId)}].api\n` +
+    `const recorded = []\n` +
+    `let depth = 0\n` +
+    `let served = 0\n` +
+    // The warmth signal lives in THIS module instance (one per module graph =
+    // one per isolate), never on globalThis, which a test host shares.
+    `export const __beginRun = () => served++ > 0\n` +
+    `const wrap = (name, nests) => (...args) => {\n` +
+    `  if (depth === 0) recorded.push([name, args])\n` +
+    `  if (!nests) return cur()[name](...args)\n` +
+    `  depth += 1\n` +
+    `  try { return cur()[name](...args) } finally { depth -= 1 }\n` +
+    `}\n` +
+    `export const describe = wrap('describe', true)\n` +
+    `export const it = wrap('it', false)\n` +
+    `export const test = wrap('test', false)\n` +
+    `export const expect = (...args) => cur().expect(...args)\n` +
+    `export const vi = new Proxy({}, { get: (_t, prop) => cur().vi[prop] })\n` +
+    `export const __replay = () => {\n` +
+    `  for (const [name, args] of recorded.slice()) {\n` +
+    `    depth += 1\n` +
+    `    try { cur()[name](...args) } finally { depth -= 1 }\n` +
+    `  }\n` +
+    `}\n` +
+    `export default { describe, it, test, expect, vi }\n`
   )
 }
 
@@ -490,9 +522,36 @@ let localRunCounter = 0
  * form — the subset names are installed as globals (A.8.6.2); everything is
  * restored in a finally.
  */
+/**
+ * The platform's fetch, captured ONCE at module load — before any run swaps
+ * `globalThis.fetch` for a gated fetch and before any host (the CLI, an
+ * observer) installs a wrapper that itself delegates to `globalThis.fetch`.
+ * Resolving the ambient fetch at run start instead can pick up such a
+ * wrapper and recurse gate → wrapper → gate until the stack blows.
+ */
+const PLATFORM_FETCH: ((url: string, init?: RequestInit) => Promise<Response>) | undefined =
+  typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined
+
+/**
+ * Runs are SERIALIZED: the local runner swaps process-wide state
+ * (`globalThis.fetch`, `Math.random`, the document-form globals) for the
+ * duration of a run, so two overlapping runs would see each other's harness
+ * (one registers into the other's globals; the first to finish deletes the
+ * globals the second is still importing against). A.8.6.4 wants sequential
+ * execution anyway; the queue makes it a property of the runner.
+ */
+let runQueue: Promise<unknown> = Promise.resolve()
+
 export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit) => Promise<Response> } = {}): ExecSuiteRunner {
   return {
-    async run(req: ExecRunRequest, io: ExecRunIo = {}): Promise<ExecRunOutcome> {
+    run(req: ExecRunRequest, io: ExecRunIo = {}): Promise<ExecRunOutcome> {
+      const turn = runQueue.then(() => runExclusive(req, io))
+      runQueue = turn.catch(() => undefined)
+      return turn
+    },
+  }
+
+  async function runExclusive(req: ExecRunRequest, io: ExecRunIo): Promise<ExecRunOutcome> {
       const wallMs = req.limits?.wallMs ?? EXEC_WALL_MS
       const cpuMs = req.limits?.cpuMs ?? EXEC_CPU_MS
       const appliedLimits = { wallMs, cpuMs }
@@ -519,9 +578,9 @@ export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit
       // the gated fetch itself once the swap lands — every egress recursing
       // gate→global→gate until the stack blows. The CLI verb (which injects
       // no io.fetch) rides this default.
-      const ambientFetch = fetch.bind(globalThis) as (url: string, init?: RequestInit) => Promise<Response>
+      const platformFetch = PLATFORM_FETCH ?? (fetch.bind(globalThis) as (url: string, init?: RequestInit) => Promise<Response>)
       const gatedFetch = createGatedFetch({
-        realFetch: io.fetch ?? opts.fetch ?? ambientFetch,
+        realFetch: io.fetch ?? opts.fetch ?? platformFetch,
         sandbox: req.sandbox,
         violations,
       })
@@ -623,6 +682,5 @@ export function localExecRunner(opts: { fetch?: (url: string, init?: RequestInit
         }
         delete registry()[runId]
       }
-    },
   }
 }

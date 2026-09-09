@@ -31,7 +31,7 @@ Generate the quartet from one manifest — never hand-roll the faces one by one.
 
 ## How to verify (one suite, two runners)
 
-- **Local**: `autonomous-qa/vitest` exports `toConform` / `assertConforms` (and `describeConformance({ baseUrl })` expanding every pinned requirement into individual vitest cases). Wire into your build as a fail-closed digest-pinned gate (`--expect-digest`).
+- **Local**: `autonomous-qa/assert` exports `assertConforms` (no vitest import, so it links inside workerd); `autonomous-qa/vitest` adds the `toConform` / `toGradeAtLeast` matchers and `describeConformance({ target, spec, expectedDigest })`, which expands every pinned requirement into its own vitest case. Inside `@cloudflare/vitest-pool-workers` (real Durable Objects, real bindings) enable `test.globals` or pass `{ describe, it, beforeAll, expect }` explicitly: the pool externalizes node_modules, so no package may import `expect` from `'vitest'` at load time. Wire into your build as a fail-closed digest-pinned gate (`--expect-digest`).
 - **Hosted**: the deployed api.qa runs the **same digest-locked requirement implementations** — local green and hosted verdict cannot diverge by construction. The public verdict page at `https://api.qa/<domain>` is the receipt; the card links it.
 - Every property also publishes its own **`verify` export** (e.g. `https://your-api.example/verify`): the public-contract unit/integration/e2e suites, runnable by anyone against the live doors, documented on a "Run our tests" page.
 
